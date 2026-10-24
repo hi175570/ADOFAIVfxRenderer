@@ -31,6 +31,7 @@ public static class BuildWorker
         PlayerSettings.runInBackground = true;
         PlayerSettings.resizableWindow = false;
         PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
+        PlayerSettings.SplashScreen.show = false;
         PlayerSettings.SetScriptingBackend(NamedBuildTarget.Standalone, ScriptingImplementation.Mono2x);
 
         var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions

@@ -23,16 +23,23 @@ $log = Join-Path $projectRoot "artifacts\unity-build.log"
 New-Item -ItemType Directory -Path (Split-Path $log) -Force | Out-Null
 $env:ADOFAI_VFX_WORKER_OUTPUT = $output
 
-& $UnityPath `
-    -batchmode `
-    -nographics `
-    -quit `
-    -projectPath $unityProject `
-    -executeMethod ADOFAIVfxWorker.Editor.BuildWorker.BuildFromCommandLine `
-    -logFile $log
+$unityArguments = @(
+    "-batchmode",
+    "-nographics",
+    "-quit",
+    "-projectPath", "`"$unityProject`"",
+    "-executeMethod", "ADOFAIVfxWorker.Editor.BuildWorker.BuildFromCommandLine",
+    "-logFile", "`"$log`""
+)
+$unityProcess = Start-Process `
+    -FilePath $UnityPath `
+    -ArgumentList $unityArguments `
+    -WindowStyle Hidden `
+    -Wait `
+    -PassThru
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Unity Worker build failed with exit code $LASTEXITCODE. See $log"
+if ($unityProcess.ExitCode -ne 0) {
+    throw "Unity Worker build failed with exit code $($unityProcess.ExitCode). See $log"
 }
 
 dotnet build (Join-Path $projectRoot "ADOFAIVfxRenderer.slnx") -c $Configuration

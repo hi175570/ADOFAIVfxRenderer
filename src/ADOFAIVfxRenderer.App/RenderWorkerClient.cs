@@ -57,6 +57,8 @@ internal sealed class RenderWorkerClient : IDisposable
                 "ADOFAI VFX Worker.exe");
         }
 
+        ValidateStandaloneWorker(workerExecutable, installation.RootDirectory);
+
         var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
         var chartDirectory = Path.GetDirectoryName(chart.Path)!;
         var outputDirectory = Path.Combine(chartDirectory, "ADOFAIVfxRenderer Output", timestamp);
@@ -93,6 +95,7 @@ internal sealed class RenderWorkerClient : IDisposable
         File.WriteAllText(jobPath, JsonSerializer.Serialize(job, JsonOptions));
         _lastStatusJson = null;
 
+        var workerLogPath = Path.Combine(outputDirectory, "worker.log");
         var startInfo = new ProcessStartInfo
         {
             FileName = workerExecutable,
@@ -100,7 +103,10 @@ internal sealed class RenderWorkerClient : IDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
-            Arguments = $"--job \"{jobPath}\" -screen-fullscreen 0 -screen-width {variant.Resolution.Width} -screen-height {variant.Resolution.Height}",
+            // Unity's normal player mode can create a visible top-level window even when
+            // ProcessWindowStyle.Hidden is requested. Batch mode keeps the render device
+            // available (unlike -nographics) without opening a second game-like window.
+            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\" -screen-fullscreen 0 -screen-width {variant.Resolution.Width} -screen-height {variant.Resolution.Height}",
         };
         _workerProcess = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动独立 Unity Worker。");
         _timer.Start();
@@ -200,6 +206,38 @@ internal sealed class RenderWorkerClient : IDisposable
             "..", "..", "..", "..", "..",
             "artifacts", "UnityWorker", "ADOFAI VFX Worker.exe"));
         return File.Exists(development) ? development : null;
+    }
+
+    private static void ValidateStandaloneWorker(string workerExecutable, string gameRootDirectory)
+    {
+        var workerPath = Path.GetFullPath(workerExecutable);
+        var gameRoot = Path.GetFullPath(gameRootDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+
+        if (workerPath.StartsWith(gameRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("拒绝启动：渲染 Worker 位于游戏目录内，无法证明它不是游戏本体。");
+        }
+
+        var workerDirectory = Path.GetDirectoryName(workerPath)
+            ?? throw new InvalidOperationException("无法确定独立 Worker 的目录。");
+        var workerName = Path.GetFileNameWithoutExtension(workerPath);
+        var managedDirectory = Path.Combine(workerDirectory, $"{workerName}_Data", "Managed");
+        var workerAssembly = Path.Combine(managedDirectory, "ADOFAIVfxWorker.Runtime.dll");
+        var gameAssembly = Path.Combine(managedDirectory, "Assembly-CSharp.dll");
+
+        if (!File.Exists(workerAssembly))
+        {
+            throw new InvalidOperationException(
+                "拒绝启动：目标 Player 不包含 ADOFAIVfxWorker.Runtime.dll，不是本项目构建的独立 Worker。");
+        }
+
+        if (File.Exists(gameAssembly))
+        {
+            throw new InvalidOperationException(
+                "拒绝启动：目标 Player 含有游戏 Assembly-CSharp.dll；正式渲染器绝不会运行游戏 Player。");
+        }
     }
 }
 
