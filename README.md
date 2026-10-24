@@ -18,12 +18,13 @@ The current implementation milestone includes:
 - shared highest-resolution render-pass planning;
 - a dark WPF configuration interface with a large live preview, virtualized task queue, progress, frame counters, FPS and seconds-per-frame;
 - an independently built Unity worker process with direct RenderTexture capture and raw-frame FFmpeg encoding;
-- offline `AddDecoration`, `MoveDecorations`, and `MoveCamera` prototype support;
+- offline `AddDecoration`, `MoveDecorations`, `MoveCamera`, `CustomBackground`, and beat-based `RepeatEvents` support;
+- v13-compatible tile units, decoration parallax, camera-relative placement, opening-countdown timing, easing, and per-floor BPM timing;
 - selectable render content (background/foreground decorations, track, planets, and effects) with UI always excluded;
 - quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.
 
-The worker is intentionally not described as pixel-accurate yet. The current clean-room v13-v19 event adapter is incomplete: advanced easing, repeats, masks, particles, objects, track/planet rendering, filters, and exact legacy camera semantics still need verified adapters. Video VFX is the only enabled end-to-end test profile.
+The worker is intentionally not described as pixel-accurate yet. The current clean-room v13-v19 event adapter is incomplete: the full easing set, floor-based repeats, masks, particles, objects, track/planet rendering, filters, and exact legacy camera semantics still need verified adapters. Video VFX is the only enabled end-to-end test profile.
 
 ## Build and test
 

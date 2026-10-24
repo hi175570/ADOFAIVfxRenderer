@@ -15,21 +15,28 @@ namespace ADOFAIVfxWorker
 {
 public sealed class WorkerRuntime : MonoBehaviour
 {
+    private const float TileSize = 1.5f;
+    private const float DefaultCameraOrthoSize = 5f;
     private readonly Dictionary<string, Texture2D> _textures = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<DecorationState> _decorations = new();
     private readonly List<MoveEvent> _moves = new();
     private readonly List<MoveEvent> _activeMoves = new();
     private readonly List<CameraEvent> _cameraEvents = new();
     private readonly List<CameraEvent> _activeCameraEvents = new();
+    private readonly List<BackgroundEvent> _backgroundEvents = new();
     private WorkerJob _job = null!;
     private WorkerStatus _status = null!;
     private Camera _camera = null!;
     private Process? _ffmpeg;
     private int _nextMove;
     private int _nextCameraEvent;
+    private int _nextBackgroundEvent;
     private float[] _floorTimes = Array.Empty<float>();
+    private float[] _floorBpms = Array.Empty<float>();
     private Vector2[] _floorPositions = Array.Empty<Vector2>();
     private string _chartDirectory = "";
+    private float _pitch = 1f;
+    private SpriteRenderer? _backgroundRenderer;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Boot()
@@ -83,16 +90,31 @@ public sealed class WorkerRuntime : MonoBehaviour
         _chartDirectory = Path.GetDirectoryName(_job.chartPath)!;
         var settings = (JObject?)chart["settings"] ?? new JObject();
         var bpm = settings.Value<float?>("bpm") ?? 100f;
-        BuildFloorTimeline((JArray?)chart["angleData"], (JArray?)chart["actions"], bpm);
+        _pitch = Math.Max(0.01f, (settings.Value<float?>("pitch") ?? 100f) / 100f);
+        BuildFloorTimeline(
+            (JArray?)chart["angleData"],
+            (JArray?)chart["actions"],
+            bpm,
+            settings.Value<int?>("countdownTicks") ?? 4);
 
         var cameraObject = new GameObject("Render Camera");
         _camera = cameraObject.AddComponent<Camera>();
         _camera.orthographic = true;
-        _camera.orthographicSize = 5f * 100f / Math.Max(1f, settings.Value<float?>("zoom") ?? 100f);
-        _camera.transform.position = new Vector3(0f, 0f, -10f);
+        _camera.orthographicSize = DefaultCameraOrthoSize * Math.Max(0.01f, (settings.Value<float?>("zoom") ?? 100f) / 100f);
+        var initialCameraOffset = ReadVector2(settings["position"], Vector2.zero) * TileSize;
+        var initialCameraBase = (settings.Value<string>("relativeTo") ?? "Player") == "Tile"
+            ? _floorPositions[0]
+            : Vector2.zero;
+        _camera.transform.position = new Vector3(initialCameraBase.x + initialCameraOffset.x, initialCameraBase.y + initialCameraOffset.y, -10f);
+        _camera.transform.rotation = Quaternion.Euler(0f, 0f, settings.Value<float?>("rotation") ?? 0f);
         _camera.clearFlags = CameraClearFlags.SolidColor;
         _camera.backgroundColor = ParseColor(settings.Value<string>("backgroundColor") ?? "000000ff");
         _camera.aspect = _job.width / (float)_job.height;
+
+        var backgroundObject = new GameObject("Custom Background");
+        _backgroundRenderer = backgroundObject.AddComponent<SpriteRenderer>();
+        _backgroundRenderer.sortingOrder = short.MinValue;
+        _backgroundRenderer.enabled = false;
 
         foreach (var token in (JArray?)chart["decorations"] ?? new JArray())
         {
@@ -102,7 +124,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             }
         }
 
-        foreach (var token in (JArray?)chart["actions"] ?? new JArray())
+        var actions = (JArray?)chart["actions"] ?? new JArray();
+        var repeatRules = BuildRepeatRules(actions);
+        foreach (var token in actions)
         {
             if (token is not JObject action)
             {
@@ -110,41 +134,46 @@ public sealed class WorkerRuntime : MonoBehaviour
             }
 
             var eventType = action.Value<string>("eventType");
-            if (eventType == "MoveDecorations")
+            foreach (var repeatedAngleOffset in GetRepeatedAngleOffsets(action, repeatRules))
             {
-                AddMoveEvent(action, bpm);
-            }
-            else if (eventType == "MoveCamera")
-            {
-                AddCameraEvent(action, bpm);
-            }
-            else if (eventType == "CustomBackground" && action.Value<string>("color") is { } color)
-            {
-                _camera.backgroundColor = ParseColor(color);
+                if (eventType == "MoveDecorations")
+                {
+                    AddMoveEvent(action, repeatedAngleOffset);
+                }
+                else if (eventType == "MoveCamera")
+                {
+                    AddCameraEvent(action, repeatedAngleOffset);
+                }
+                else if (eventType == "CustomBackground")
+                {
+                    AddBackgroundEvent(action, repeatedAngleOffset);
+                }
             }
         }
 
         _moves.Sort(static (left, right) => left.Start.CompareTo(right.Start));
         _cameraEvents.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+        _backgroundEvents.Sort(static (left, right) => left.Start.CompareTo(right.Start));
         ApplyTimeline(0f);
     }
 
-    private void BuildFloorTimeline(JArray? angles, JArray? actions, float initialBpm)
+    private void BuildFloorTimeline(JArray? angles, JArray? actions, float initialBpm, int countdownTicks)
     {
         var count = Math.Max(1, angles?.Count ?? 1);
         _floorTimes = new float[count];
+        _floorBpms = new float[count];
         _floorPositions = new Vector2[count];
-        var bpmByFloor = new Dictionary<int, List<JObject>>();
+        var actionsByFloor = new Dictionary<int, List<JObject>>();
         if (actions != null)
         {
             foreach (var action in actions.OfType<JObject>())
             {
-                if (action.Value<string>("eventType") is "SetSpeed" or "Pause")
+                if (action.Value<string>("eventType") is "SetSpeed" or "Pause" or "Twirl" or "MultiPlanet")
                 {
                     var floor = action.Value<int?>("floor") ?? 0;
-                    if (!bpmByFloor.TryGetValue(floor, out var list))
+                    if (!actionsByFloor.TryGetValue(floor, out var list))
                     {
-                        bpmByFloor[floor] = list = new List<JObject>();
+                        actionsByFloor[floor] = list = new List<JObject>();
                     }
                     list.Add(action);
                 }
@@ -152,37 +181,66 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
 
         var bpm = initialBpm;
-        var previousAngle = 0f;
-        for (var floor = 1; floor < count; floor++)
+        var twirled = false;
+        var threePlanets = false;
+        for (var floor = 0; floor < count; floor++)
         {
-            if (bpmByFloor.TryGetValue(floor - 1, out var changes))
+            var pauseBeats = 0f;
+            if (actionsByFloor.TryGetValue(floor, out var changes))
             {
                 foreach (var change in changes)
                 {
-                    if (change.Value<string>("eventType") == "SetSpeed")
+                    switch (change.Value<string>("eventType"))
                     {
+                    case "SetSpeed":
                         bpm = change.Value<string>("speedType") == "Multiplier"
                             ? bpm * (change.Value<float?>("bpmMultiplier") ?? 1f)
                             : change.Value<float?>("beatsPerMinute") ?? bpm;
-                    }
-                    else
-                    {
-                        _floorTimes[floor - 1] += (change.Value<float?>("duration") ?? 0f) * 60f / bpm;
+                        break;
+                    case "Pause":
+                        pauseBeats += change.Value<float?>("duration") ?? 0f;
+                        break;
+                    case "Twirl":
+                        twirled = !twirled;
+                        break;
+                    case "MultiPlanet":
+                        threePlanets = change.Value<string>("planets") == "ThreePlanets";
+                        break;
                     }
                 }
             }
 
-            var angle = angles?[floor - 1]?.Value<float>() ?? 0f;
-            if (Mathf.Approximately(angle, 999f))
+            _floorBpms[floor] = Math.Max(1f, bpm);
+            if (floor >= count - 1)
             {
-                angle = previousAngle;
+                break;
             }
-            var turn = Mathf.Repeat(180f - (angle - previousAngle), 360f);
+
+            var currentAngle = angles?[floor]?.Value<float>() ?? 0f;
+            var nextIndex = floor + 1;
+            var nextAngle = angles?[nextIndex]?.Value<float>() ?? currentAngle;
+            var nextIsMidspin = Mathf.Approximately(nextAngle, 999f);
+            if (nextIsMidspin && nextIndex + 1 < count)
+            {
+                nextAngle = angles?[nextIndex + 1]?.Value<float>() ?? currentAngle;
+            }
+
+            var turn = Mathf.Repeat(nextAngle - currentAngle + (nextIsMidspin ? 360f : 540f), 360f);
+            if (twirled) turn = 360f - turn;
             if (turn < 0.001f) turn = 360f;
-            _floorTimes[floor] = _floorTimes[floor - 1] + turn / 180f * 60f / Math.Max(1f, bpm);
-            var radians = angle * Mathf.Deg2Rad;
-            _floorPositions[floor] = _floorPositions[floor - 1] + new Vector2(Mathf.Cos(radians), Mathf.Sin(radians));
-            previousAngle = angle;
+            turn += pauseBeats * 180f;
+            if (threePlanets && !nextIsMidspin) turn = turn > 60f ? turn - 60f : turn + 300f;
+            var seconds = turn / 180f * 60f / (_floorBpms[floor] * _pitch);
+            if (floor == 0)
+            {
+                seconds += Math.Max(0, countdownTicks - 1) * 60f / (Math.Max(1f, initialBpm) * _pitch);
+            }
+            _floorTimes[floor + 1] = _floorTimes[floor] + seconds;
+
+            var positionAngle = Mathf.Approximately(currentAngle, 999f) ? 0f : currentAngle;
+            var radians = positionAngle * Mathf.Deg2Rad;
+            _floorPositions[floor + 1] = _floorPositions[floor] +
+                new Vector2(Mathf.Cos(radians), Mathf.Sin(radians)) * TileSize;
         }
     }
 
@@ -200,18 +258,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             return;
         }
 
-        if (!_textures.TryGetValue(imagePath, out var texture))
-        {
-            texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-            if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(imagePath), markNonReadable: true))
-            {
-                Destroy(texture);
-                return;
-            }
-            texture.wrapMode = TextureWrapMode.Clamp;
-            texture.filterMode = FilterMode.Bilinear;
-            _textures[imagePath] = texture;
-        }
+        var texture = GetTexture(imagePath);
+        if (texture == null) return;
 
         var gameObject = new GameObject(imageName);
         var renderer = gameObject.AddComponent<SpriteRenderer>();
@@ -219,35 +267,133 @@ public sealed class WorkerRuntime : MonoBehaviour
         var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorPositions.Length - 1);
         var localPosition = ReadVector2(data["position"], Vector2.zero);
         var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
-        var basePosition = relativeTo is "Tile" or "LastPosition" ? _floorPositions[floor] : Vector2.zero;
-        gameObject.transform.position = basePosition + localPosition;
-        gameObject.transform.rotation = Quaternion.Euler(0f, 0f, -(data.Value<float?>("rotation") ?? 0f));
+        var startPosition = relativeTo switch
+        {
+            "Tile" => _floorPositions[floor] + localPosition * TileSize,
+            "RedPlanet" or "BluePlanet" or "GreenPlanet" => _floorPositions[floor] + localPosition * TileSize,
+            "Camera" or "CameraAspect" => localPosition,
+            _ => localPosition * TileSize,
+        };
+        var rotation = data.Value<float?>("rotation") ?? 0f;
         var scale = ReadVector2(data["scale"], new Vector2(100f, 100f)) / 100f;
-        gameObject.transform.localScale = new Vector3(scale.x, scale.y, 1f);
         var color = ParseColor(data.Value<string>("color") ?? "ffffffff");
-        color.a *= (data.Value<float?>("opacity") ?? 100f) / 100f;
-        renderer.color = color;
+        var opacity = (data.Value<float?>("opacity") ?? 100f) / 100f;
         var depth = data.Value<int?>("depth") ?? 0;
-        renderer.sortingOrder = Math.Clamp(-depth * 10, short.MinValue, short.MaxValue);
+        renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
+        renderer.enabled = data.Value<bool?>("visible") ?? true;
 
         var tags = SplitTags(data.Value<string>("tag"));
-        _decorations.Add(new DecorationState(gameObject.transform, renderer, tags, basePosition));
+        var parallax = ReadVector2(data["parallax"], Vector2.zero) / 100f;
+        var pivotOffset = ReadVector2(data["pivotOffset"], Vector2.zero) *
+                          (relativeTo is "Camera" or "CameraAspect" ? 1f : TileSize);
+        var parallaxOffset = ReadVector2(data["parallaxOffset"], Vector2.zero) * TileSize;
+        var state = new DecorationState(
+            gameObject.transform,
+            renderer,
+            tags,
+            relativeTo,
+            startPosition,
+            pivotOffset,
+            parallax,
+            parallaxOffset,
+            rotation,
+            scale,
+            color,
+            opacity,
+            data.Value<bool?>("lockRotation") ?? false,
+            data.Value<bool?>("lockScale") ?? false,
+            depth);
+        state.ApplyVisual(_camera);
+        _decorations.Add(state);
     }
 
-    private void AddMoveEvent(JObject data, float bpm)
+    private Texture2D? GetTexture(string imagePath)
+    {
+        if (_textures.TryGetValue(imagePath, out var existing)) return existing;
+        var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+        if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(imagePath), markNonReadable: true))
+        {
+            Destroy(texture);
+            return null;
+        }
+        texture.wrapMode = TextureWrapMode.Clamp;
+        texture.filterMode = FilterMode.Bilinear;
+        _textures[imagePath] = texture;
+        return texture;
+    }
+
+    private static Dictionary<int, Dictionary<string, RepeatRule>> BuildRepeatRules(JArray actions)
+    {
+        var result = new Dictionary<int, Dictionary<string, RepeatRule>>();
+        foreach (var repeat in actions.OfType<JObject>().Where(static action =>
+                     action.Value<string>("eventType") == "RepeatEvents"))
+        {
+            if ((repeat.Value<string>("repeatType") ?? "Beat") != "Beat") continue;
+            var floor = repeat.Value<int?>("floor") ?? 0;
+            if (!result.TryGetValue(floor, out var byTag)) result[floor] = byTag = new(StringComparer.Ordinal);
+            var rule = new RepeatRule(
+                Math.Max(0, repeat.Value<int?>("repetitions") ?? 0),
+                Math.Max(0f, repeat.Value<float?>("interval") ?? 0f));
+            foreach (var tag in SplitTags(repeat.Value<string>("tag"))) byTag[tag] = rule;
+        }
+        return result;
+    }
+
+    private static IEnumerable<float> GetRepeatedAngleOffsets(
+        JObject action,
+        Dictionary<int, Dictionary<string, RepeatRule>> rules)
+    {
+        var baseOffset = action.Value<float?>("angleOffset") ?? 0f;
+        var floor = action.Value<int?>("floor") ?? 0;
+        if (!rules.TryGetValue(floor, out var byTag) || string.IsNullOrWhiteSpace(action.Value<string>("eventTag")))
+        {
+            yield return baseOffset;
+            yield break;
+        }
+
+        RepeatRule? matched = null;
+        foreach (var tag in SplitTags(action.Value<string>("eventTag")))
+        {
+            if (byTag.TryGetValue(tag, out matched)) break;
+        }
+        if (matched == null)
+        {
+            yield return baseOffset;
+            yield break;
+        }
+
+        for (var repetition = 0; repetition <= matched.Repetitions; repetition++)
+        {
+            yield return baseOffset + matched.IntervalBeats * repetition * 180f;
+        }
+    }
+
+    private void AddMoveEvent(JObject data, float angleOffset)
     {
         var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorTimes.Length - 1);
-        var start = _floorTimes[floor] + AngleOffsetSeconds(data.Value<float?>("angleOffset") ?? 0f, bpm);
-        var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / bpm);
+        var bpm = _floorBpms[floor];
+        var start = _floorTimes[floor] + AngleOffsetSeconds(angleOffset, bpm, _pitch);
+        var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
         _moves.Add(new MoveEvent(start, duration, SplitTags(data.Value<string>("tag")), data));
     }
 
-    private void AddCameraEvent(JObject data, float bpm)
+    private void AddCameraEvent(JObject data, float angleOffset)
     {
         var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorTimes.Length - 1);
-        var start = _floorTimes[floor] + AngleOffsetSeconds(data.Value<float?>("angleOffset") ?? 0f, bpm);
-        var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / bpm);
-        _cameraEvents.Add(new CameraEvent(start, duration, data));
+        var bpm = _floorBpms[floor];
+        var start = _floorTimes[floor] + AngleOffsetSeconds(angleOffset, bpm, _pitch);
+        var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
+        _cameraEvents.Add(new CameraEvent(start, duration, data, _floorPositions[floor]));
+    }
+
+    private void AddBackgroundEvent(JObject data, float angleOffset)
+    {
+        var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorTimes.Length - 1);
+        var start = _floorTimes[floor] + AngleOffsetSeconds(
+            angleOffset,
+            _floorBpms[floor],
+            _pitch);
+        _backgroundEvents.Add(new BackgroundEvent(start, data));
     }
 
     private IEnumerator RenderFrames()
@@ -350,25 +496,92 @@ public sealed class WorkerRuntime : MonoBehaviour
     {
         while (_nextMove < _moves.Count && _moves[_nextMove].Start <= time)
         {
+            AdvanceMoves(_moves[_nextMove].Start);
             var move = _moves[_nextMove++];
             move.Capture(_decorations);
-            _activeMoves.Add(move);
+            if (!move.Apply(move.Start)) _activeMoves.Add(move);
         }
+        AdvanceMoves(time);
+
+        while (_nextCameraEvent < _cameraEvents.Count && _cameraEvents[_nextCameraEvent].Start <= time)
+        {
+            AdvanceCamera(_cameraEvents[_nextCameraEvent].Start);
+            var cameraEvent = _cameraEvents[_nextCameraEvent++];
+            cameraEvent.Capture(_camera);
+            if (!cameraEvent.Apply(_camera, cameraEvent.Start)) _activeCameraEvents.Add(cameraEvent);
+        }
+        AdvanceCamera(time);
+
+        while (_nextBackgroundEvent < _backgroundEvents.Count && _backgroundEvents[_nextBackgroundEvent].Start <= time)
+        {
+            ApplyBackground(_backgroundEvents[_nextBackgroundEvent++].Data);
+        }
+
+        foreach (var decoration in _decorations) decoration.ApplyVisual(_camera);
+        UpdateBackgroundTransform();
+    }
+
+    private void AdvanceMoves(float time)
+    {
         for (var index = _activeMoves.Count - 1; index >= 0; index--)
         {
             if (_activeMoves[index].Apply(time)) _activeMoves.RemoveAt(index);
         }
+    }
 
-        while (_nextCameraEvent < _cameraEvents.Count && _cameraEvents[_nextCameraEvent].Start <= time)
-        {
-            var cameraEvent = _cameraEvents[_nextCameraEvent++];
-            cameraEvent.Capture(_camera);
-            _activeCameraEvents.Add(cameraEvent);
-        }
+    private void AdvanceCamera(float time)
+    {
         for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
         {
             if (_activeCameraEvents[index].Apply(_camera, time)) _activeCameraEvents.RemoveAt(index);
         }
+    }
+
+    private void ApplyBackground(JObject data)
+    {
+        if (data.Value<string>("color") is { } color)
+        {
+            _camera.backgroundColor = ParseColor(color);
+        }
+
+        if (_backgroundRenderer == null) return;
+        var imageName = data.Value<string>("bgImage");
+        if (string.IsNullOrWhiteSpace(imageName))
+        {
+            _backgroundRenderer.enabled = false;
+            _backgroundRenderer.sprite = null;
+            return;
+        }
+
+        var path = Path.Combine(_chartDirectory, imageName);
+        if (!File.Exists(path))
+        {
+            _backgroundRenderer.enabled = false;
+            return;
+        }
+
+        var texture = GetTexture(path);
+        if (texture == null) return;
+        _backgroundRenderer.sprite = Sprite.Create(
+            texture,
+            new Rect(0f, 0f, texture.width, texture.height),
+            new Vector2(0.5f, 0.5f),
+            100f);
+        _backgroundRenderer.color = ParseColor(data.Value<string>("imageColor") ?? "ffffffff");
+        _backgroundRenderer.enabled = true;
+    }
+
+    private void UpdateBackgroundTransform()
+    {
+        if (_backgroundRenderer == null || !_backgroundRenderer.enabled || _backgroundRenderer.sprite == null) return;
+        var transform = _backgroundRenderer.transform;
+        transform.position = new Vector3(_camera.transform.position.x, _camera.transform.position.y, 1f);
+        transform.rotation = _camera.transform.rotation;
+        var spriteSize = _backgroundRenderer.sprite.bounds.size;
+        var screenHeight = _camera.orthographicSize * 2f;
+        var screenWidth = screenHeight * _camera.aspect;
+        var fit = Math.Min(screenWidth / Math.Max(0.001f, spriteSize.x), screenHeight / Math.Max(0.001f, spriteSize.y));
+        transform.localScale = new Vector3(fit, fit, 1f);
     }
 
     private void StartEncoder()
@@ -433,7 +646,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         return Path.GetFullPath(Path.Combine(Application.dataPath, "..", "render-job.json"));
     }
 
-    private static float AngleOffsetSeconds(float angleOffset, float bpm) => angleOffset / 180f * 60f / Math.Max(1f, bpm);
+    private static float AngleOffsetSeconds(float angleOffset, float bpm, float pitch) =>
+        angleOffset / 180f * 60f / (Math.Max(1f, bpm) * Math.Max(0.01f, pitch));
 
     private static Vector2 ReadVector2(JToken? token, Vector2 fallback)
     {
@@ -447,7 +661,34 @@ public sealed class WorkerRuntime : MonoBehaviour
             : token.Value<float>();
 
     private static HashSet<string> SplitTags(string? tags) =>
-        new((tags ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries), StringComparer.Ordinal);
+        new((string.IsNullOrWhiteSpace(tags) ? "NO TAG" : tags)
+            .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries), StringComparer.Ordinal);
+
+    private static bool HasValue(JObject data, string key) =>
+        data.TryGetValue(key, out var token) && token.Type is not (JTokenType.Null or JTokenType.Undefined);
+
+    private static float EaseAmount(float amount, string? ease)
+    {
+        amount = Mathf.Clamp01(amount);
+        return ease switch
+        {
+            "InSine" => 1f - Mathf.Cos(amount * Mathf.PI * 0.5f),
+            "OutSine" => Mathf.Sin(amount * Mathf.PI * 0.5f),
+            "InOutSine" => -(Mathf.Cos(Mathf.PI * amount) - 1f) * 0.5f,
+            "InQuad" => amount * amount,
+            "OutQuad" => 1f - (1f - amount) * (1f - amount),
+            "InOutQuad" => amount < 0.5f ? 2f * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 2f) * 0.5f,
+            "InCubic" => amount * amount * amount,
+            "OutCubic" => 1f - Mathf.Pow(1f - amount, 3f),
+            "InOutCubic" => amount < 0.5f ? 4f * amount * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 3f) * 0.5f,
+            "InCirc" => 1f - Mathf.Sqrt(1f - amount * amount),
+            "OutCirc" => Mathf.Sqrt(1f - Mathf.Pow(amount - 1f, 2f)),
+            "InOutCirc" => amount < 0.5f
+                ? (1f - Mathf.Sqrt(1f - Mathf.Pow(2f * amount, 2f))) * 0.5f
+                : (Mathf.Sqrt(1f - Mathf.Pow(-2f * amount + 2f, 2f)) + 1f) * 0.5f,
+            _ => amount,
+        };
+    }
 
     private static Color ParseColor(string hex)
     {
@@ -501,17 +742,85 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private sealed class DecorationState
     {
-        public DecorationState(Transform transform, SpriteRenderer renderer, HashSet<string> tags, Vector2 basePosition)
+        public DecorationState(
+            Transform transform,
+            SpriteRenderer renderer,
+            HashSet<string> tags,
+            string relativeTo,
+            Vector2 startPosition,
+            Vector2 pivotOffset,
+            Vector2 parallax,
+            Vector2 parallaxOffset,
+            float startRotation,
+            Vector2 scale,
+            Color color,
+            float opacity,
+            bool lockRotation,
+            bool lockScale,
+            int depth)
         {
             Transform = transform;
             Renderer = renderer;
             Tags = tags;
-            BasePosition = basePosition;
+            RelativeTo = relativeTo;
+            StartPosition = startPosition;
+            PivotPosition = startPosition;
+            PivotOffset = pivotOffset;
+            Parallax = parallax;
+            ParallaxOffset = parallaxOffset;
+            StartRotation = startRotation;
+            Scale = scale;
+            Color = color;
+            Opacity = opacity;
+            LockRotation = lockRotation;
+            LockScale = lockScale;
+            Depth = depth;
         }
         public Transform Transform { get; }
         public SpriteRenderer Renderer { get; }
         public HashSet<string> Tags { get; }
-        public Vector2 BasePosition { get; }
+        public string RelativeTo { get; set; }
+        public Vector2 StartPosition { get; set; }
+        public Vector2 PivotPosition { get; set; }
+        public Vector2 PivotOffset { get; set; }
+        public Vector2 Parallax { get; set; }
+        public Vector2 ParallaxOffset { get; set; }
+        public float StartRotation { get; }
+        public float RotationOffset { get; set; }
+        public Vector2 Scale { get; set; }
+        public Color Color { get; set; }
+        public float Opacity { get; set; }
+        public bool LockRotation { get; }
+        public bool LockScale { get; }
+        public int Depth { get; set; }
+
+        public void ApplyVisual(Camera camera)
+        {
+            Vector2 worldPosition;
+            if (RelativeTo is "Camera" or "CameraAspect")
+            {
+                var screenPosition = PivotPosition + PivotOffset;
+                if (RelativeTo == "CameraAspect") screenPosition.x /= Math.Max(0.001f, camera.aspect);
+                var viewport = screenPosition / 20f + new Vector2(0.5f, 0.5f);
+                worldPosition = camera.ViewportToWorldPoint(new Vector3(viewport.x, viewport.y, 10f));
+            }
+            else
+            {
+                var cameraPosition = (Vector2)camera.transform.position;
+                worldPosition = Vector2.Scale(cameraPosition - PivotPosition, Parallax) + PivotPosition + ParallaxOffset;
+                var angle = StartRotation + RotationOffset + (LockRotation ? camera.transform.eulerAngles.z : 0f);
+                worldPosition += (Vector2)(Quaternion.Euler(0f, 0f, angle) * PivotOffset);
+            }
+
+            Transform.position = new Vector3(worldPosition.x, worldPosition.y, 0f);
+            Transform.rotation = Quaternion.Euler(0f, 0f,
+                StartRotation + RotationOffset + (LockRotation ? camera.transform.eulerAngles.z : 0f));
+            Transform.localScale = new Vector3(Scale.x, Scale.y, 1f);
+            var renderColor = Color;
+            renderColor.a *= Opacity;
+            Renderer.color = renderColor;
+            Renderer.sortingOrder = Math.Clamp(-Depth, short.MinValue + 1, short.MaxValue);
+        }
     }
 
     private sealed class MoveEvent
@@ -532,47 +841,90 @@ public sealed class WorkerRuntime : MonoBehaviour
         {
             foreach (var decoration in decorations)
             {
-                if (_tags.Count > 0 && !_tags.Overlaps(decoration.Tags)) continue;
-                _targets.Add(new Snapshot(decoration, decoration.Transform.localPosition, decoration.Transform.localScale,
-                    decoration.Transform.localEulerAngles.z, decoration.Renderer.color));
+                if (!_tags.Overlaps(decoration.Tags)) continue;
+                _targets.Add(new Snapshot(decoration));
             }
         }
         public bool Apply(float time)
         {
-            var amount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
+            var rawAmount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
+            var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
             foreach (var target in _targets)
             {
-                var position = ReadVector2(_data["positionOffset"] ?? _data["position"], new Vector2(float.NaN, float.NaN));
-                if (!float.IsNaN(position.x)) target.State.Transform.localPosition = Vector2.Lerp(target.Position, position, amount);
-                var scale = ReadVector2(_data["scale"], new Vector2(float.NaN, float.NaN));
-                if (!float.IsNaN(scale.x)) target.State.Transform.localScale = Vector3.Lerp(target.Scale, new Vector3(scale.x / 100f, scale.y / 100f, 1f), amount);
-                if (_data["rotationOffset"]?.Type is not (JTokenType.Null or JTokenType.None))
+                if (HasValue(_data, "positionOffset"))
                 {
-                    var rotation = _data.Value<float?>("rotationOffset") ?? _data.Value<float?>("rotation") ?? target.Rotation;
-                    target.State.Transform.localRotation = Quaternion.Euler(0f, 0f, Mathf.LerpAngle(target.Rotation, -rotation, amount));
+                    var offset = ReadVector2(_data["positionOffset"], new Vector2(float.NaN, float.NaN)) * TileSize;
+                    var basePosition = (_data.Value<string>("relativeTo") ?? "LastPosition") == "LastPosition"
+                        ? target.PivotPosition
+                        : target.State.StartPosition;
+                    var destination = target.PivotPosition;
+                    if (!float.IsNaN(offset.x)) destination.x = basePosition.x + offset.x;
+                    if (!float.IsNaN(offset.y)) destination.y = basePosition.y + offset.y;
+                    target.State.PivotPosition = Vector2.Lerp(target.PivotPosition, destination, amount);
                 }
-                var color = target.Color;
-                if (_data.Value<string>("color") is { } colorHex) color = Color.Lerp(target.Color, ParseColor(colorHex), amount);
-                if (_data.Value<float?>("opacity") is { } opacity) color.a = Mathf.Lerp(target.Color.a, opacity / 100f, amount);
-                target.State.Renderer.color = color;
+                if (HasValue(_data, "pivotOffset"))
+                {
+                    var pivot = ReadVector2(_data["pivotOffset"], new Vector2(float.NaN, float.NaN)) * TileSize;
+                    var destination = target.PivotOffset;
+                    if (!float.IsNaN(pivot.x)) destination.x = pivot.x;
+                    if (!float.IsNaN(pivot.y)) destination.y = pivot.y;
+                    target.State.PivotOffset = Vector2.Lerp(target.PivotOffset, destination, amount);
+                }
+                if (HasValue(_data, "scale"))
+                {
+                    var scale = ReadVector2(_data["scale"], new Vector2(float.NaN, float.NaN)) / 100f;
+                    var destination = target.Scale;
+                    if (!float.IsNaN(scale.x)) destination.x = scale.x;
+                    if (!float.IsNaN(scale.y)) destination.y = scale.y;
+                    target.State.Scale = Vector2.Lerp(target.Scale, destination, amount);
+                }
+                if (HasValue(_data, "rotationOffset"))
+                {
+                    var rotation = _data.Value<float>("rotationOffset");
+                    target.State.RotationOffset = Mathf.LerpUnclamped(target.RotationOffset, rotation, amount);
+                }
+                if (_data.Value<string>("color") is { } colorHex)
+                    target.State.Color = Color.Lerp(target.Color, ParseColor(colorHex), amount);
+                if (_data.Value<float?>("opacity") is { } opacity)
+                    target.State.Opacity = Mathf.Lerp(target.Opacity, opacity / 100f, amount);
+                if (HasValue(_data, "parallax"))
+                {
+                    var parallax = ReadVector2(_data["parallax"], target.Parallax * 100f) / 100f;
+                    target.State.Parallax = Vector2.Lerp(target.Parallax, parallax, amount);
+                }
+                if (HasValue(_data, "parallaxOffset"))
+                {
+                    var parallaxOffset = ReadVector2(_data["parallaxOffset"], target.ParallaxOffset / TileSize) * TileSize;
+                    target.State.ParallaxOffset = Vector2.Lerp(target.ParallaxOffset, parallaxOffset, amount);
+                }
+                if (HasValue(_data, "depth")) target.State.Depth = _data.Value<int>("depth");
+                if (HasValue(_data, "visible")) target.State.Renderer.enabled = _data.Value<bool>("visible");
             }
-            return amount >= 1f;
+            return rawAmount >= 1f;
         }
         private sealed class Snapshot
         {
-            public Snapshot(DecorationState state, Vector3 position, Vector3 scale, float rotation, Color color)
+            public Snapshot(DecorationState state)
             {
                 State = state;
-                Position = position;
-                Scale = scale;
-                Rotation = rotation;
-                Color = color;
+                PivotPosition = state.PivotPosition;
+                PivotOffset = state.PivotOffset;
+                Scale = state.Scale;
+                RotationOffset = state.RotationOffset;
+                Color = state.Color;
+                Opacity = state.Opacity;
+                Parallax = state.Parallax;
+                ParallaxOffset = state.ParallaxOffset;
             }
             public DecorationState State { get; }
-            public Vector3 Position { get; }
-            public Vector3 Scale { get; }
-            public float Rotation { get; }
+            public Vector2 PivotPosition { get; }
+            public Vector2 PivotOffset { get; }
+            public Vector2 Scale { get; }
+            public float RotationOffset { get; }
             public Color Color { get; }
+            public float Opacity { get; }
+            public Vector2 Parallax { get; }
+            public Vector2 ParallaxOffset { get; }
         }
     }
 
@@ -582,19 +934,61 @@ public sealed class WorkerRuntime : MonoBehaviour
         private Vector3 _position;
         private float _rotation;
         private float _size;
-        public CameraEvent(float start, float duration, JObject data) { Start = start; Duration = duration; _data = data; }
+        private readonly Vector2 _floorPosition;
+        public CameraEvent(float start, float duration, JObject data, Vector2 floorPosition)
+        {
+            Start = start;
+            Duration = duration;
+            _data = data;
+            _floorPosition = floorPosition;
+        }
         public float Start { get; }
         private float Duration { get; }
         public void Capture(Camera camera) { _position = camera.transform.position; _rotation = camera.transform.eulerAngles.z; _size = camera.orthographicSize; }
         public bool Apply(Camera camera, float time)
         {
-            var amount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
-            var position = ReadVector2(_data["position"], new Vector2(_position.x, _position.y));
-            camera.transform.position = Vector3.Lerp(_position, new Vector3(position.x, position.y, -10f), amount);
-            if (_data.Value<float?>("rotation") is { } rotation) camera.transform.rotation = Quaternion.Euler(0f, 0f, Mathf.LerpAngle(_rotation, -rotation, amount));
-            if (_data.Value<float?>("zoom") is { } zoom) camera.orthographicSize = Mathf.Lerp(_size, 5f * 100f / Math.Max(1f, zoom), amount);
-            return amount >= 1f;
+            var rawAmount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
+            var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
+            if (HasValue(_data, "position"))
+            {
+                var offset = ReadVector2(_data["position"], Vector2.zero) * TileSize;
+                var target = (_data.Value<string>("relativeTo") ?? "LastPosition") switch
+                {
+                    "Tile" => _floorPosition + offset,
+                    "Global" => offset,
+                    "Player" => _floorPosition + offset,
+                    _ => new Vector2(_position.x, _position.y) + offset,
+                };
+                camera.transform.position = Vector3.Lerp(_position, new Vector3(target.x, target.y, -10f), amount);
+            }
+            if (_data.Value<float?>("rotation") is { } rotation)
+                camera.transform.rotation = Quaternion.Euler(0f, 0f, Mathf.LerpAngle(_rotation, rotation, amount));
+            if (_data.Value<float?>("zoom") is { } zoom)
+                camera.orthographicSize = Mathf.Lerp(_size, DefaultCameraOrthoSize * Math.Max(0.01f, zoom / 100f), amount);
+            return rawAmount >= 1f;
         }
+    }
+
+    private sealed class BackgroundEvent
+    {
+        public BackgroundEvent(float start, JObject data)
+        {
+            Start = start;
+            Data = data;
+        }
+        public float Start { get; }
+        public JObject Data { get; }
+    }
+
+    private sealed class RepeatRule
+    {
+        public RepeatRule(int repetitions, float intervalBeats)
+        {
+            Repetitions = repetitions;
+            IntervalBeats = intervalBeats;
+        }
+        public int Repetitions { get; }
+        public float IntervalBeats { get; }
     }
 }
 }
