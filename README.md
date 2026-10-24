@@ -30,6 +30,7 @@ The worker is intentionally not described as pixel-accurate yet. The current cle
 
 ```powershell
 pwsh -File .\scripts\Build-UnityWorker.ps1
+pwsh -File .\scripts\Publish-TestPackage.ps1
 dotnet build .\ADOFAIVfxRenderer.slnx
 dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core.Tests.csproj
 ```
