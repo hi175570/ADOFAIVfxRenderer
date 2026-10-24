@@ -1,0 +1,11 @@
+{
+  "name": "ADOFAIVfxWorker.Editor",
+  "rootNamespace": "ADOFAIVfxWorker.Editor",
+  "references": [
+    "ADOFAIVfxWorker.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

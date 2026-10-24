@@ -2,11 +2,11 @@
 
 ADOFAI VFX Renderer is a Windows offline rendering tool for producing Video, Video Pro, Video VFX, and Video VFX Pro chart packages without manually playing or recording the chart in real time.
 
-The renderer is designed to use an existing A Dance of Fire and Ice installation at runtime. It does not redistribute the game's managed assemblies, shaders, or assets. Users select the directory containing `A Dance of Fire and Ice.exe`; the application resolves the Unity data and `Managed` paths automatically.
+The renderer uses its own Unity 6000.3.10f1 player and never launches `A Dance of Fire and Ice.exe`. An existing game directory is selected only for build compatibility checks and permitted runtime dependencies such as FFmpeg and, in later adapters, original managed filter implementations. The project does not redistribute game code or assets.
 
 ## Current state
 
-The first implementation milestone includes:
+The current implementation milestone includes:
 
 - game-directory discovery and verified-build capability probing;
 - `.adofai` format-version inspection;
@@ -16,21 +16,26 @@ The first implementation milestone includes:
 - synchronized tail-duration seconds and frame counts;
 - exact multi-FPS timeline-union planning;
 - shared highest-resolution render-pass planning;
-- a runnable WPF configuration interface;
+- a dark WPF configuration interface with a large live preview, virtualized task queue, progress, frame counters, FPS and seconds-per-frame;
+- an independently built Unity worker process with direct RenderTexture capture and raw-frame FFmpeg encoding;
+- offline `AddDecoration`, `MoveDecorations`, and `MoveCamera` prototype support;
+- selectable render content (background/foreground decorations, track, planets, and effects) with UI always excluded;
+- quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.
 
-The Unity render worker and video encoder are not connected yet. The UI does not present a fake Render button while that path is unavailable.
+The worker is intentionally not described as pixel-accurate yet. The current clean-room v13-v19 event adapter is incomplete: advanced easing, repeats, masks, particles, objects, track/planet rendering, filters, and exact legacy camera semantics still need verified adapters. Video VFX is the only enabled end-to-end test profile.
 
 ## Build and test
 
 ```powershell
-dotnet build .\src\ADOFAIVfxRenderer.App\ADOFAIVfxRenderer.App.csproj
+pwsh -File .\scripts\Build-UnityWorker.ps1
+dotnet build .\ADOFAIVfxRenderer.slnx
 dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core.Tests.csproj
 ```
 
 ## Compatibility policy
 
-A chart is renderable only when the selected game installation contains the required original event, camera, track, decoration, and filter components and has a verified renderer adapter. Unknown binary builds are detected but rejected until their behavior is validated.
+A chart is renderable only when the selected game installation has a verified adapter. Unknown binary builds are detected but rejected until their semantics are validated. The independent worker must never fall back to starting, copying, renaming, or hard-linking the game executable.
 
 ## License
 

@@ -31,6 +31,44 @@ public enum VideoQualityPreset
     Custom,
 }
 
+public static class VideoBitrateCalculator
+{
+    public static int GetKilobitsPerSecond(
+        VideoResolution resolution,
+        int framesPerSecond,
+        VideoQualityPreset quality,
+        int? customKilobitsPerSecond = null)
+    {
+        if (quality == VideoQualityPreset.Custom)
+        {
+            if (customKilobitsPerSecond is null or <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(customKilobitsPerSecond), "自定义码率必须大于零。");
+            }
+
+            return customKilobitsPerSecond.Value;
+        }
+
+        var bitsPerPixelPerFrame = quality switch
+        {
+            VideoQualityPreset.SmallerFile => 0.04m,
+            VideoQualityPreset.Balanced => 0.08m,
+            VideoQualityPreset.HighQuality => 0.14m,
+            _ => throw new ArgumentOutOfRangeException(nameof(quality)),
+        };
+        var calculated = decimal.Ceiling(
+            resolution.PixelCount * framesPerSecond * bitsPerPixelPerFrame / 1000m);
+        var minimum = quality switch
+        {
+            VideoQualityPreset.SmallerFile => 96,
+            VideoQualityPreset.Balanced => 160,
+            VideoQualityPreset.HighQuality => 256,
+            _ => 96,
+        };
+        return Math.Max(minimum, checked((int)calculated));
+    }
+}
+
 public enum ResolutionRenderStrategy
 {
     SharedHighestResolution,

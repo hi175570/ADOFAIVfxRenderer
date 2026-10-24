@@ -19,7 +19,7 @@
                 <TextBlock Text="ADOFAI VFX Renderer" FontSize="26" FontWeight="SemiBold" />
                 <TextBlock Margin="0,4,0,18"
                            Foreground="{StaticResource TextSecondary}"
-                           Text="原版运行时驱动的离线 Video / Video Pro / Video VFX 渲染器" />
+                           Text="独立 Unity Worker 驱动的离线 Video / Video Pro / Video VFX 渲染器" />
 
                 <GroupBox Header="游戏安装">
                     <StackPanel>
@@ -68,6 +68,26 @@
                     <WrapPanel x:Name="ProfilesPanel" />
                 </GroupBox>
 
+                <GroupBox Header="渲染内容（高级）">
+                    <StackPanel>
+                        <CheckBox x:Name="UseProfileContentCheckBox"
+                                  IsChecked="True"
+                                  Click="UseProfileContent_Click"
+                                  Content="使用版本预设（推荐）" />
+                        <WrapPanel x:Name="ContentChecksPanel" Margin="0,9,0,0">
+                            <CheckBox x:Name="BackgroundDecorationsCheckBox" Content="背景装饰" />
+                            <CheckBox x:Name="ForegroundDecorationsCheckBox" Content="前景装饰" />
+                            <CheckBox x:Name="TrackCheckBox" Content="轨道" />
+                            <CheckBox x:Name="PlanetsCheckBox" Content="星球" />
+                            <CheckBox x:Name="EffectsCheckBox" Content="特效/滤镜" />
+                        </WrapPanel>
+                        <TextBlock Margin="0,8,0,0"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   TextWrapping="Wrap"
+                                   Text="UI 永远不会进入视频。取消版本预设后可自由组合；源谱面不会被修改。" />
+                    </StackPanel>
+                </GroupBox>
+
                 <GroupBox Header="分辨率（可多选）">
                     <WrapPanel x:Name="ResolutionsPanel" />
                 </GroupBox>
@@ -108,7 +128,14 @@
                         <TextBlock Text="分辨率策略" />
                         <ComboBox x:Name="ResolutionStrategyBox" Margin="0,6,0,10" />
                         <TextBlock Text="视频质量" />
-                        <ComboBox x:Name="QualityBox" Margin="0,6,0,0" />
+                        <ComboBox x:Name="QualityBox"
+                                  Margin="0,6,0,10"
+                                  SelectionChanged="QualityBox_SelectionChanged" />
+                        <TextBlock Text="自定义码率（kbps）" />
+                        <TextBox x:Name="BitrateBox"
+                                 Margin="0,6,0,0"
+                                 Text="4000"
+                                 IsEnabled="False" />
                     </StackPanel>
                 </GroupBox>
 
@@ -118,19 +145,43 @@
                         Foreground="#07111E"
                         Click="BuildPlan_Click"
                         Content="生成批量渲染计划" />
+                <Grid Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="10" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="StartRenderButton"
+                            Padding="18,11"
+                            FontWeight="SemiBold"
+                            Background="#5BCB82"
+                            Foreground="#07110A"
+                            Click="StartRender_Click"
+                            Content="开始离线渲染（首测 Video VFX）" />
+                    <Button x:Name="CancelRenderButton"
+                            Grid.Column="2"
+                            Padding="16,11"
+                            IsEnabled="False"
+                            Click="CancelRender_Click"
+                            Content="取消" />
+                </Grid>
             </StackPanel>
         </ScrollViewer>
 
         <Grid Grid.Column="2">
             <Grid.RowDefinitions>
-                <RowDefinition Height="280" />
+                <RowDefinition Height="*" MinHeight="400" />
                 <RowDefinition Height="14" />
-                <RowDefinition Height="*" />
+                <RowDefinition Height="220" MinHeight="160" />
             </Grid.RowDefinitions>
 
             <Border Background="#090B10" BorderBrush="{StaticResource PanelBorder}" BorderThickness="1" CornerRadius="8">
                 <Grid>
-                    <TextBlock HorizontalAlignment="Center"
+                    <Image x:Name="PreviewImage"
+                           Stretch="Uniform"
+                           RenderOptions.BitmapScalingMode="HighQuality" />
+                    <TextBlock x:Name="PreviewPlaceholder"
+                               HorizontalAlignment="Center"
                                VerticalAlignment="Center"
                                TextAlignment="Center"
                                Foreground="{StaticResource TextSecondary}"
@@ -141,7 +192,7 @@
                             Padding="9,5"
                             CornerRadius="4"
                             Background="#B012151B">
-                        <TextBlock Text="Worker 尚未启动" />
+                        <TextBlock x:Name="WorkerStateText" Text="Worker 尚未启动" />
                     </Border>
                 </Grid>
             </Border>
@@ -156,6 +207,10 @@
                 <TextBlock Text="输出矩阵" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,10" />
                 <ListView x:Name="OutputList"
                           Grid.Row="1"
+                          ScrollViewer.VerticalScrollBarVisibility="Auto"
+                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                          VirtualizingPanel.IsVirtualizing="True"
+                          VirtualizingPanel.VirtualizationMode="Recycling"
                           Background="{StaticResource PanelBackground}"
                           Foreground="{StaticResource TextPrimary}"
                           BorderBrush="{StaticResource PanelBorder}">
@@ -175,10 +230,30 @@
                         BorderBrush="{StaticResource PanelBorder}"
                         BorderThickness="1"
                         CornerRadius="6">
-                    <TextBlock x:Name="SummaryText"
-                               TextWrapping="Wrap"
-                               Foreground="{StaticResource TextSecondary}"
-                               Text="选择输出版本、分辨率和 FPS 后生成计划。相同时间轴与高分辨率母帧会自动共享。" />
+                    <StackPanel>
+                        <ProgressBar x:Name="RenderProgressBar"
+                                     Height="8"
+                                     Minimum="0"
+                                     Maximum="100"
+                                     Value="0" />
+                        <Grid Margin="0,9,0,10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="WorkerProgressText"
+                                       Foreground="{StaticResource TextPrimary}"
+                                       Text="0 / 0 帧 · 0%" />
+                            <TextBlock x:Name="WorkerSpeedText"
+                                       Grid.Column="1"
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Text="尚未开始" />
+                        </Grid>
+                        <TextBlock x:Name="SummaryText"
+                                   TextWrapping="Wrap"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   Text="选择输出版本、分辨率和 FPS 后生成计划。相同时间轴与高分辨率母帧会自动共享。" />
+                    </StackPanel>
                 </Border>
             </Grid>
         </Grid>

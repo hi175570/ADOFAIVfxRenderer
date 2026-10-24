@@ -5,10 +5,19 @@ public sealed record RenderVariant(
     VideoResolution Resolution,
     int FramesPerSecond,
     VideoQualityPreset Quality,
-    bool IncludePlanets = true)
+    RenderContent? ContentOverride = null,
+    int? CustomBitrateKbps = null)
 {
+    public RenderContent Content => ContentOverride ?? OutputProfiles.Get(Profile).VideoContent;
+
+    public int BitrateKbps => VideoBitrateCalculator.GetKilobitsPerSecond(
+        Resolution,
+        FramesPerSecond,
+        Quality,
+        CustomBitrateKbps);
+
     public string DisplayName =>
-        $"{OutputProfiles.Get(Profile).DisplayName} · {Resolution.Name} · {FramesPerSecond} FPS · {Quality}";
+        $"{OutputProfiles.Get(Profile).DisplayName} · {Resolution.Name} · {FramesPerSecond} FPS · {BitrateKbps} kbps · {Content}";
 }
 
 public sealed record RenderBatchRequest(
@@ -19,7 +28,7 @@ public sealed record RenderBatchRequest(
 
 public sealed record RenderPassPlan(
     OutputProfile Profile,
-    bool IncludePlanets,
+    RenderContent Content,
     VideoResolution MasterResolution,
     IReadOnlyList<int> FrameRates,
     IReadOnlyList<RenderVariant> Outputs,
@@ -74,9 +83,9 @@ public static class RenderBatchPlanner
         IEnumerable<IGrouping<object, RenderVariant>> grouped = request.ResolutionStrategy switch
         {
             ResolutionRenderStrategy.SharedHighestResolution => variants.GroupBy(
-                static variant => (object)new SharedPassKey(variant.Profile, variant.IncludePlanets)),
+                static variant => (object)new SharedPassKey(variant.Profile, variant.Content)),
             ResolutionRenderStrategy.NativePerResolution => variants.GroupBy(
-                static variant => (object)new NativePassKey(variant.Profile, variant.IncludePlanets, variant.Resolution)),
+                static variant => (object)new NativePassKey(variant.Profile, variant.Content, variant.Resolution)),
             _ => throw new ArgumentOutOfRangeException(nameof(request)),
         };
 
@@ -88,7 +97,7 @@ public static class RenderBatchPlanner
                 var masterResolution = outputs.OrderByDescending(static output => output.Resolution.PixelCount).First().Resolution;
                 return new RenderPassPlan(
                     outputs[0].Profile,
-                    outputs[0].IncludePlanets,
+                    outputs[0].Content,
                     masterResolution,
                     frameRates,
                     outputs,
@@ -194,7 +203,7 @@ public static class RenderBatchPlanner
         return Math.Abs(left);
     }
 
-    private sealed record SharedPassKey(OutputProfile Profile, bool IncludePlanets);
+    private sealed record SharedPassKey(OutputProfile Profile, RenderContent Content);
 
-    private sealed record NativePassKey(OutputProfile Profile, bool IncludePlanets, VideoResolution Resolution);
+    private sealed record NativePassKey(OutputProfile Profile, RenderContent Content, VideoResolution Resolution);
 }

@@ -10,6 +10,7 @@ var tests = new (string Name, Action Run)[]
     ("120 and 144 FPS union is exact", Fps120And144Union),
     ("Variant matrix", VariantMatrix),
     ("Output profile ownership", OutputProfileOwnership),
+    ("Bitrate presets", BitratePresets),
     ("Render progress", RenderProgress),
     ("Invalid game path", InvalidGamePath),
     ("Selected chart version", SelectedChartVersion),
@@ -130,6 +131,16 @@ static void OutputProfileOwnership()
     Equal(
         RenderContent.BackgroundDecorations,
         OutputProfiles.Get(OutputProfile.VideoVfxPro).VideoContent);
+    False(new RenderVariant(
+        OutputProfile.VideoVfx,
+        VideoPresets.P144,
+        15,
+        VideoQualityPreset.Balanced).Content.HasFlag(RenderContent.Planets));
+    True(new RenderVariant(
+        OutputProfile.VideoPro,
+        VideoPresets.P144,
+        15,
+        VideoQualityPreset.Balanced).Content.HasFlag(RenderContent.Planets));
 }
 
 static void RenderProgress()
@@ -139,6 +150,19 @@ static void RenderProgress()
     Equal(0.5d, progress.RenderedFramesPerSecond);
     Equal(2d, progress.SecondsPerFrame);
     Equal(TimeSpan.FromSeconds(150), progress.EstimatedRemaining);
+}
+
+static void BitratePresets()
+{
+    Equal(96, VideoBitrateCalculator.GetKilobitsPerSecond(
+        VideoPresets.P144,
+        15,
+        VideoQualityPreset.SmallerFile));
+    Equal(1234, VideoBitrateCalculator.GetKilobitsPerSecond(
+        VideoPresets.P1080,
+        60,
+        VideoQualityPreset.Custom,
+        1234));
 }
 
 static void InvalidGamePath()

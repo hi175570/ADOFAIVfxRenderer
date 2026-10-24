@@ -5,6 +5,11 @@ obj/
 *.suo
 *.nupkg
 artifacts/
+src/ADOFAIVfxRenderer.UnityWorker/Library/
+src/ADOFAIVfxRenderer.UnityWorker/Temp/
+src/ADOFAIVfxRenderer.UnityWorker/Logs/
+src/ADOFAIVfxRenderer.UnityWorker/UserSettings/
+src/ADOFAIVfxRenderer.UnityWorker/Build/
 render-output/
 *.mp4
 *.mov

@@ -1,0 +1,8 @@
+{
+  "name": "ADOFAIVfxWorker.Runtime",
+  "rootNamespace": "ADOFAIVfxWorker",
+  "references": [
+    "Unity.Newtonsoft.Json"
+  ],
+  "autoReferenced": true
+}

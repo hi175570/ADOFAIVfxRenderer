@@ -1,7 +1,10 @@
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
+using System.Windows.Media.Imaging;
 using ADOFAIVfxRenderer.Core;
 using Microsoft.Win32;
 
@@ -12,19 +15,113 @@ public partial class MainWindow : Window
     private readonly List<CheckBox> _profileChecks = [];
     private readonly List<CheckBox> _resolutionChecks = [];
     private readonly List<CheckBox> _frameRateChecks = [];
+    private readonly RenderWorkerClient _worker = new();
     private GameInstallation? _installation;
     private ChartMetadata? _chart;
     private bool _updatingTail;
     private bool _tailFramesWereEdited;
     private bool _viewReady;
+    private decimal? _durationLimitSeconds;
 
     public MainWindow()
     {
+        SourceInitialized += ApplyDarkTitleBar;
         InitializeComponent();
+        _worker.StatusChanged += Worker_StatusChanged;
         _viewReady = true;
         PopulateOptions();
         PopulateDetectedGames();
         RecalculateTailFrames();
+        Loaded += ApplyCommandLineSmokeTest;
+    }
+
+    private void ApplyCommandLineSmokeTest(object sender, RoutedEventArgs e)
+    {
+        Loaded -= ApplyCommandLineSmokeTest;
+        var arguments = Environment.GetCommandLineArgs();
+        var chartPath = GetArgumentValue(arguments, "--smoke-chart");
+        if (chartPath is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var gamePath = GetArgumentValue(arguments, "--game-path") ?? GamePathBox.Text;
+            GamePathBox.Text = gamePath;
+            InspectGame();
+
+            ChartPathBox.Text = chartPath;
+            _chart = ChartMetadataReader.Read(chartPath);
+            UpdateChartCompatibilityText();
+
+            var fps = int.TryParse(GetArgumentValue(arguments, "--fps"), out var parsedFps) ? parsedFps : 15;
+            var resolutionName = GetArgumentValue(arguments, "--resolution") ?? "144p";
+            foreach (var check in _profileChecks)
+            {
+                check.IsChecked = (OutputProfile)check.Tag == OutputProfile.VideoVfx;
+            }
+
+            foreach (var check in _resolutionChecks)
+            {
+                check.IsChecked = ((VideoResolution)check.Tag).Name.Equals(resolutionName, StringComparison.OrdinalIgnoreCase);
+            }
+
+            foreach (var check in _frameRateChecks)
+            {
+                check.IsChecked = (int)check.Tag == fps;
+            }
+
+            TailSecondsBox.Text = GetArgumentValue(arguments, "--tail-seconds") ?? "0";
+            _durationLimitSeconds = TryParseNonNegativeDecimal(
+                GetArgumentValue(arguments, "--duration-limit") ?? "",
+                out var durationLimit)
+                ? durationLimit
+                : null;
+            QualityBox.SelectedIndex = (GetArgumentValue(arguments, "--quality") ?? "")
+                .Equals("smaller", StringComparison.OrdinalIgnoreCase)
+                ? 2
+                : 0;
+            StartRender_Click(this, new RoutedEventArgs());
+        }
+        catch (Exception exception) when (exception is IOException or InvalidDataException or InvalidOperationException)
+        {
+            MessageBox.Show(this, exception.Message, "冒烟测试无法启动", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private static string? GetArgumentValue(string[] arguments, string name)
+    {
+        for (var index = 0; index < arguments.Length - 1; index++)
+        {
+            if (arguments[index].Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                return arguments[index + 1];
+            }
+        }
+
+        return null;
+    }
+
+    private void ApplyDarkTitleBar(object? sender, EventArgs e)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var handle = new WindowInteropHelper(this).Handle;
+        var enabled = 1;
+        if (DwmSetWindowAttribute(handle, 20, ref enabled, sizeof(int)) != 0)
+        {
+            _ = DwmSetWindowAttribute(handle, 19, ref enabled, sizeof(int));
+        }
+
+        // Windows 11 caption colors use COLORREF (0x00BBGGRR).
+        var captionColor = 0x001A1411;
+        var textColor = 0x00FAF5F2;
+        _ = DwmSetWindowAttribute(handle, 35, ref captionColor, sizeof(int));
+        _ = DwmSetWindowAttribute(handle, 36, ref textColor, sizeof(int));
     }
 
     private void PopulateOptions()
@@ -88,6 +185,7 @@ public partial class MainWindow : Window
             new Choice<VideoQualityPreset>("自定义", VideoQualityPreset.Custom),
         };
         QualityBox.SelectedIndex = 0;
+        RefreshContentChoices();
     }
 
     private void PopulateDetectedGames()
@@ -190,6 +288,60 @@ public partial class MainWindow : Window
     {
         OutputList.ItemsSource = null;
         SummaryText.Text = "选择已改变，请重新生成批量渲染计划。";
+        RefreshContentChoices();
+    }
+
+    private void UseProfileContent_Click(object sender, RoutedEventArgs e) => RefreshContentChoices();
+
+    private void QualityBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_viewReady || QualityBox.SelectedItem is not Choice<VideoQualityPreset> selected)
+        {
+            return;
+        }
+
+        BitrateBox.IsEnabled = selected.Value == VideoQualityPreset.Custom;
+    }
+
+    private void RefreshContentChoices()
+    {
+        if (!_viewReady)
+        {
+            return;
+        }
+
+        var usePreset = UseProfileContentCheckBox.IsChecked == true;
+        ContentChecksPanel.IsEnabled = !usePreset;
+        if (!usePreset)
+        {
+            return;
+        }
+
+        var content = _profileChecks
+            .Where(static check => check.IsChecked == true)
+            .Select(static check => OutputProfiles.Get((OutputProfile)check.Tag).VideoContent)
+            .Aggregate(RenderContent.None, static (combined, item) => combined | item);
+        BackgroundDecorationsCheckBox.IsChecked = content.HasFlag(RenderContent.BackgroundDecorations);
+        ForegroundDecorationsCheckBox.IsChecked = content.HasFlag(RenderContent.ForegroundDecorations);
+        TrackCheckBox.IsChecked = content.HasFlag(RenderContent.Track);
+        PlanetsCheckBox.IsChecked = content.HasFlag(RenderContent.Planets);
+        EffectsCheckBox.IsChecked = content.HasFlag(RenderContent.Effects);
+    }
+
+    private RenderContent? GetContentOverride()
+    {
+        if (UseProfileContentCheckBox.IsChecked == true)
+        {
+            return null;
+        }
+
+        var content = RenderContent.None;
+        if (BackgroundDecorationsCheckBox.IsChecked == true) content |= RenderContent.BackgroundDecorations;
+        if (ForegroundDecorationsCheckBox.IsChecked == true) content |= RenderContent.ForegroundDecorations;
+        if (TrackCheckBox.IsChecked == true) content |= RenderContent.Track;
+        if (PlanetsCheckBox.IsChecked == true) content |= RenderContent.Planets;
+        if (EffectsCheckBox.IsChecked == true) content |= RenderContent.Effects;
+        return content;
     }
 
     private void FrameRateSelectionChanged(object sender, RoutedEventArgs e)
@@ -304,8 +456,27 @@ public partial class MainWindow : Window
         }
 
         var quality = ((Choice<VideoQualityPreset>)QualityBox.SelectedItem).Value;
+        int? customBitrate;
+        try
+        {
+            customBitrate = GetCustomBitrate(quality);
+        }
+        catch (InvalidOperationException exception)
+        {
+            MessageBox.Show(this, exception.Message, "无法生成计划", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
         var strategy = ((Choice<ResolutionRenderStrategy>)ResolutionStrategyBox.SelectedItem).Value;
         var variants = RenderBatchPlanner.BuildVariants(profiles, resolutions, frameRates, quality);
+        if (customBitrate.HasValue)
+        {
+            variants = variants.Select(variant => variant with { CustomBitrateKbps = customBitrate }).ToArray();
+        }
+        var contentOverride = GetContentOverride();
+        if (contentOverride.HasValue)
+        {
+            variants = variants.Select(variant => variant with { ContentOverride = contentOverride }).ToArray();
+        }
 
         // 第一阶段尚未连接原版 Worker 来计算整张谱的自然时长；用一秒窗口精确计算共享时间点密度。
         var oneSecondPlan = RenderBatchPlanner.Create(new RenderBatchRequest(
@@ -321,11 +492,145 @@ public partial class MainWindow : Window
             $"结束后继续 {tailSeconds:0.######} 秒；不同 FPS 自动换算各自尾帧。";
     }
 
+    private void StartRender_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_installation is null || !_installation.CanRender)
+            {
+                throw new InvalidOperationException("请先选择游戏目录并通过兼容性检测。");
+            }
+
+            if (_chart is null)
+            {
+                throw new InvalidOperationException("请先选择要渲染的 .adofai 谱面。");
+            }
+
+            var profiles = _profileChecks.Where(static check => check.IsChecked == true).ToArray();
+            var resolutions = _resolutionChecks.Where(static check => check.IsChecked == true).ToArray();
+            var frameRates = _frameRateChecks.Where(static check => check.IsChecked == true).ToArray();
+            if (profiles.Length != 1 || resolutions.Length != 1 || frameRates.Length != 1)
+            {
+                throw new InvalidOperationException("首个实机测试请只选择一个版本、一个分辨率和一个 FPS。");
+            }
+
+            var profile = (OutputProfile)profiles[0].Tag;
+            if (profile != OutputProfile.VideoVfx)
+            {
+                throw new NotSupportedException("当前可实测的是 Video VFX；另外三种会在这个渲染链稳定后接入。");
+            }
+
+            if (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var tailSeconds))
+            {
+                throw new InvalidOperationException("结束延长秒数无效。");
+            }
+
+            var quality = ((Choice<VideoQualityPreset>)QualityBox.SelectedItem).Value;
+            var customBitrate = GetCustomBitrate(quality);
+            var variant = new RenderVariant(
+                profile,
+                (VideoResolution)resolutions[0].Tag,
+                (int)frameRates[0].Tag,
+                quality,
+                GetContentOverride(),
+                customBitrate);
+            var outputPath = _worker.Start(
+                _installation,
+                _chart,
+                variant,
+                TailExtension.FromSeconds(tailSeconds),
+                _durationLimitSeconds);
+
+            StartRenderButton.IsEnabled = false;
+            CancelRenderButton.IsEnabled = true;
+            RenderProgressBar.Value = 0;
+            WorkerProgressText.Text = "0 / ? 帧 · 0%";
+            WorkerSpeedText.Text = "正在启动";
+            SummaryText.Text = $"输出文件：{outputPath}";
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            MessageBox.Show(this, exception.Message, "无法开始渲染", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void CancelRender_Click(object sender, RoutedEventArgs e) => _worker.Cancel();
+
+    private void Worker_StatusChanged(WorkerStatus status)
+    {
+        WorkerStateText.Text = status.Message;
+        RenderProgressBar.Value = Math.Clamp(status.Percent, 0f, 100f);
+        WorkerProgressText.Text = $"{status.CurrentFrame:N0} / {status.TotalFrames:N0} 帧 · {status.Percent:0.0}%";
+        WorkerSpeedText.Text = status.RenderedFramesPerSecond > 0
+            ? $"{status.RenderedFramesPerSecond:0.00} 帧/秒 · {status.SecondsPerFrame:0.000} 秒/帧"
+            : status.State;
+
+        if (!string.IsNullOrWhiteSpace(status.OutputPath))
+        {
+            SummaryText.Text = status.State == "failed"
+                ? $"渲染失败：{status.Error}\n输出位置：{status.OutputPath}"
+                : $"输出文件：{status.OutputPath}";
+        }
+
+        if (!string.IsNullOrWhiteSpace(status.PreviewPath) && File.Exists(status.PreviewPath))
+        {
+            try
+            {
+                using var stream = new FileStream(status.PreviewPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var image = new BitmapImage();
+                image.BeginInit();
+                image.CacheOption = BitmapCacheOption.OnLoad;
+                image.StreamSource = stream;
+                image.EndInit();
+                image.Freeze();
+                PreviewImage.Source = image;
+                PreviewPlaceholder.Visibility = Visibility.Collapsed;
+            }
+            catch (IOException)
+            {
+                // Worker is replacing one of the alternating preview files; the next status will retry.
+            }
+        }
+
+        if (status.State is "complete" or "failed" or "cancelled")
+        {
+            StartRenderButton.IsEnabled = true;
+            CancelRenderButton.IsEnabled = false;
+        }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _worker.StatusChanged -= Worker_StatusChanged;
+        if (_worker.IsRunning)
+        {
+            _worker.Cancel();
+        }
+
+        _worker.Dispose();
+        base.OnClosed(e);
+    }
+
     private int GetReferenceFrameRate() =>
         _frameRateChecks.Where(static check => check.IsChecked == true)
             .Select(static check => (int)check.Tag)
             .DefaultIfEmpty(60)
             .Max();
+
+    private int? GetCustomBitrate(VideoQualityPreset quality)
+    {
+        if (quality != VideoQualityPreset.Custom)
+        {
+            return null;
+        }
+
+        if (!int.TryParse(BitrateBox.Text, NumberStyles.Integer, CultureInfo.CurrentCulture, out var bitrate) || bitrate <= 0)
+        {
+            throw new InvalidOperationException("自定义码率必须是大于零的 kbps 整数。");
+        }
+
+        return bitrate;
+    }
 
     private static bool TryParseNonNegativeDecimal(string text, out decimal value)
     {
@@ -338,4 +643,7 @@ public partial class MainWindow : Window
     {
         public override string ToString() => Label;
     }
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int valueSize);
 }
