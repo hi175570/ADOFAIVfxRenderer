@@ -19,6 +19,7 @@ var tests = new (string Name, Action Run)[]
     ("Derived chart video offset", DerivedChartVideoOffset),
     ("Video sync follows first playable floor", VideoSyncFollowsFirstPlayableFloor),
     ("Timeline handles midspins and tempo", TimelineHandlesMidspinsAndTempo),
+    ("Floor geometry uses ADOFAI axis convention", FloorGeometryUsesAdoAxisConvention),
     ("Current target timeline when present", CurrentTargetTimeline),
     ("Derived Video VFX ownership", DerivedVideoVfxOwnership),
     ("Derived Video VFX Pro ownership", DerivedVideoVfxProOwnership),
@@ -267,6 +268,17 @@ static void TimelineHandlesMidspinsAndTempo()
     Equal(5, result.FloorTimesSeconds.Length);
     Equal(999d, result.RotationAngles[1]);
     Near(2d, result.DurationSeconds, 0.000001d);
+}
+
+static void FloorGeometryUsesAdoAxisConvention()
+{
+    var positions = AdoGeometryCalculator.BuildFloorPositions([0d, 90d, 999d], 1.5d);
+    Near(1.5d, positions[1].X, 0.000001d);
+    Near(0d, positions[1].Y, 0.000001d);
+    Near(1.5d, positions[2].X, 0.000001d);
+    Near(1.5d, positions[2].Y, 0.000001d);
+    Near(1.5d, positions[3].X, 0.000001d);
+    Near(0d, positions[3].Y, 0.000001d);
 }
 
 static void CurrentTargetTimeline()

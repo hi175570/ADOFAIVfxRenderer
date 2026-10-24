@@ -202,17 +202,9 @@ public sealed class WorkerRuntime : MonoBehaviour
         _timeline = AdoTimelineCalculator.Calculate(angles, timelineActions, initialBpm, _pitch);
         _floorTimes = _timeline.FloorTimesSeconds.Select(static value => (float)value).ToArray();
         _floorBpms = _timeline.FloorBpms.Select(static value => (float)value).ToArray();
-        _floorPositions = new Vector2[angles.Count + 1];
-        var entryAngle = -Mathf.PI * 0.5f;
-        for (var floor = 0; floor < angles.Count; floor++)
-        {
-            var radians = Mathf.Approximately((float)angles[floor], 999f)
-                ? entryAngle
-                : (90f - (float)angles[floor]) * Mathf.Deg2Rad;
-            _floorPositions[floor + 1] = _floorPositions[floor] +
-                new Vector2(Mathf.Cos(radians), Mathf.Sin(radians)) * TileSize;
-            entryAngle = Mathf.Repeat(radians + Mathf.PI, Mathf.PI * 2f);
-        }
+        _floorPositions = AdoGeometryCalculator.BuildFloorPositions(angles, TileSize)
+            .Select(static position => new Vector2((float)position.X, (float)position.Y))
+            .ToArray();
         BuildPlayerFollowTimeline();
     }
 
@@ -283,10 +275,12 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
 
         var gameObject = new GameObject(imageName);
-        var renderer = gameObject.AddComponent<SpriteRenderer>();
+        var childObject = new GameObject($"{imageName} Sprite");
+        childObject.transform.SetParent(gameObject.transform, false);
+        var renderer = childObject.AddComponent<SpriteRenderer>();
         renderer.sprite = sprite;
         var maskingType = data.Value<string>("maskingType") ?? "None";
-        var spriteMask = gameObject.AddComponent<SpriteMask>();
+        var spriteMask = childObject.AddComponent<SpriteMask>();
         spriteMask.sprite = renderer.sprite;
         spriteMask.alphaCutoff = 0.001f;
         spriteMask.enabled = false;
@@ -322,10 +316,18 @@ public sealed class WorkerRuntime : MonoBehaviour
         var parallax = ReadVector2(data["parallax"], Vector2.zero) / 100f;
         var pivotOffset = ReadVector2(data["pivotOffset"], Vector2.zero) *
                           (relativeTo is "Camera" or "CameraAspect" ? 1f : TileSize);
-        var parallaxOffset = ReadVector2(data["parallaxOffset"], Vector2.zero) * TileSize;
+        var parallaxOffset = parallax == Vector2.zero
+            ? Vector2.zero
+            : ReadVector2(data["parallaxOffset"], Vector2.zero) * TileSize;
+        var scaleMultiplier = data.Value<float?>("scaleMultiplier") ?? 1f;
+        var originalSize = ReadVector2(data["originalSize"], Vector2.zero);
+        var textureScaleMultiplier = sprite != null && originalSize.x != 0f && originalSize.y != 0f
+            ? new Vector2(originalSize.x / sprite.texture.width, originalSize.y / sprite.texture.height)
+            : Vector2.one;
         var state = new DecorationState(
             sourceIndex,
             gameObject.transform,
+            childObject.transform,
             renderer,
             tags,
             relativeTo,
@@ -339,6 +341,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             opacity,
             data.Value<bool?>("lockRotation") ?? false,
             data.Value<bool?>("lockScale") ?? false,
+            scaleMultiplier,
+            textureScaleMultiplier,
             depth,
             spriteMask,
             maskingType,
@@ -1002,6 +1006,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public DecorationState(
             int sourceIndex,
             Transform transform,
+            Transform childTransform,
             SpriteRenderer renderer,
             HashSet<string> tags,
             string relativeTo,
@@ -1015,6 +1020,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             float opacity,
             bool lockRotation,
             bool lockScale,
+            float scaleMultiplier,
+            Vector2 textureScaleMultiplier,
             int depth,
             SpriteMask? spriteMask,
             string maskingType,
@@ -1027,6 +1034,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         {
             SourceIndex = sourceIndex;
             Transform = transform;
+            ChildTransform = childTransform;
             Renderer = renderer;
             Tags = tags;
             RelativeTo = relativeTo;
@@ -1041,6 +1049,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             Opacity = opacity;
             LockRotation = lockRotation;
             LockScale = lockScale;
+            ScaleMultiplier = scaleMultiplier;
+            TextureScaleMultiplier = textureScaleMultiplier;
             Depth = depth;
             SpriteMask = spriteMask;
             MaskingType = maskingType;
@@ -1054,6 +1064,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
         public int SourceIndex { get; }
         public Transform Transform { get; }
+        public Transform ChildTransform { get; }
         public SpriteRenderer Renderer { get; }
         public HashSet<string> Tags { get; }
         public string RelativeTo { get; set; }
@@ -1069,6 +1080,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         public float Opacity { get; set; }
         public bool LockRotation { get; }
         public bool LockScale { get; }
+        public float ScaleMultiplier { get; }
+        public Vector2 TextureScaleMultiplier { get; private set; }
         public int Depth { get; set; }
         public SpriteMask? SpriteMask { get; }
         public string MaskingType { get; private set; }
@@ -1134,6 +1147,15 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (SpriteMask != null) SpriteMask.sprite = sprite;
         }
 
+        public void SetOriginalSize(Vector2 originalSize)
+        {
+            var sprite = Renderer.sprite;
+            if (sprite == null || originalSize.x == 0f || originalSize.y == 0f) return;
+            TextureScaleMultiplier = new Vector2(
+                originalSize.x / sprite.texture.width,
+                originalSize.y / sprite.texture.height);
+        }
+
         private void RefreshMaskRange()
         {
             if (SpriteMask == null) return;
@@ -1146,6 +1168,11 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         public void ApplyVisual(Camera camera)
         {
+            var cameraScaleRatio = LockScale
+                ? camera.orthographicSize / (DefaultCameraOrthoSize * InitialZoomRatio)
+                : 1f;
+            var trueScaleMultiplier = ScaleMultiplier * TextureScaleMultiplier;
+            var cameraScaleMultiplier = cameraScaleRatio * trueScaleMultiplier;
             Vector2 worldPosition;
             if (RelativeTo is "Camera" or "CameraAspect")
             {
@@ -1157,18 +1184,29 @@ public sealed class WorkerRuntime : MonoBehaviour
             else
             {
                 var cameraPosition = (Vector2)camera.transform.position;
-                worldPosition = Vector2.Scale(cameraPosition - PivotPosition, Parallax) + PivotPosition + ParallaxOffset;
-                var angle = StartRotation + RotationOffset + (LockRotation ? camera.transform.eulerAngles.z : 0f);
-                worldPosition += (Vector2)(Quaternion.Euler(0f, 0f, angle) * PivotOffset);
+                var safeTextureScale = new Vector2(
+                    Math.Abs(TextureScaleMultiplier.x) < 0.000001f ? 1f : TextureScaleMultiplier.x,
+                    Math.Abs(TextureScaleMultiplier.y) < 0.000001f ? 1f : TextureScaleMultiplier.y);
+                var scaledParallaxOffset = Vector2.Scale(
+                    ParallaxOffset,
+                    new Vector2(
+                        cameraScaleMultiplier.x / safeTextureScale.x,
+                        cameraScaleMultiplier.y / safeTextureScale.y));
+                worldPosition = Vector2.Scale(cameraPosition - PivotPosition, Parallax) +
+                                PivotPosition + scaledParallaxOffset;
             }
 
             Transform.position = new Vector3(worldPosition.x, worldPosition.y, 0f);
             Transform.rotation = Quaternion.Euler(0f, 0f,
                 StartRotation + RotationOffset + (LockRotation ? camera.transform.eulerAngles.z : 0f));
-            var cameraScale = LockScale
-                ? camera.orthographicSize / (DefaultCameraOrthoSize * InitialZoomRatio)
-                : 1f;
-            Transform.localScale = new Vector3(Scale.x * cameraScale, Scale.y * cameraScale, 1f);
+            Transform.localScale = new Vector3(
+                Scale.x * cameraScaleMultiplier.x,
+                Scale.y * cameraScaleMultiplier.y,
+                1f);
+            ChildTransform.localPosition = new Vector3(
+                PivotOffset.x / (Math.Abs(trueScaleMultiplier.x) < 0.000001f ? 1f : trueScaleMultiplier.x),
+                PivotOffset.y / (Math.Abs(trueScaleMultiplier.y) < 0.000001f ? 1f : trueScaleMultiplier.y),
+                0f);
             var renderColor = Color;
             renderColor.a *= Opacity;
             Renderer.color = renderColor;
@@ -1264,6 +1302,8 @@ public sealed class WorkerRuntime : MonoBehaviour
                     decoration.SetSprite(_replacementSprite);
                     if (_replacementFailed) _markUnbaked(decoration.SourceIndex);
                 }
+                if (HasValue(_data, "originalSize"))
+                    decoration.SetOriginalSize(ReadVector2(_data["originalSize"], Vector2.zero));
                 if (HasValue(_data, "maskingType") || HasValue(_data, "useMaskingDepth") ||
                     HasValue(_data, "maskingFrontDepth") || HasValue(_data, "maskingBackDepth"))
                 {

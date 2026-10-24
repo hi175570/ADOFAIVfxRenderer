@@ -17,6 +17,53 @@ public sealed class TimelineActionData
     public string Planets = "";
 }
 
+public readonly struct AdoFloorPosition
+{
+    public AdoFloorPosition(double x, double y)
+    {
+        X = x;
+        Y = y;
+    }
+
+    public double X { get; }
+    public double Y { get; }
+}
+
+public static class AdoGeometryCalculator
+{
+    public static AdoFloorPosition[] BuildFloorPositions(
+        IReadOnlyList<double> angles,
+        double tileSize)
+    {
+        if (angles == null) throw new ArgumentNullException(nameof(angles));
+        if (tileSize <= 0d) throw new ArgumentOutOfRangeException(nameof(tileSize));
+
+        var result = new AdoFloorPosition[angles.Count + 1];
+        var x = 0d;
+        var y = 0d;
+        var entryAngle = -Math.PI * 0.5d;
+        for (var floor = 0; floor < angles.Count; floor++)
+        {
+            var radians = Math.Abs(angles[floor] - 999d) < 0.000001d
+                ? entryAngle
+                : (90d - angles[floor]) * Math.PI / 180d;
+            // ADOFAI intentionally uses (sin, cos), not the conventional (cos, sin).
+            // Keeping this in shared/tested code prevents transposing the entire chart.
+            x += Math.Sin(radians) * tileSize;
+            y += Math.Cos(radians) * tileSize;
+            result[floor + 1] = new AdoFloorPosition(x, y);
+            entryAngle = PositiveModulo(radians + Math.PI, Math.PI * 2d);
+        }
+        return result;
+    }
+
+    private static double PositiveModulo(double value, double modulus)
+    {
+        var result = value % modulus;
+        return result < 0d ? result + modulus : result;
+    }
+}
+
 public sealed class AdoTimelineResult
 {
     private readonly double _pitch;
