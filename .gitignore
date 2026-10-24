@@ -1,0 +1,16 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.nupkg
+artifacts/
+render-output/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.png
+*.exr
+*.tmp
+*.log

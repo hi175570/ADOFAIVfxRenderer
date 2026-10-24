@@ -1,0 +1,186 @@
+<Window x:Class="ADOFAIVfxRenderer.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ADOFAI VFX Renderer"
+        Width="1180"
+        Height="820"
+        MinWidth="980"
+        MinHeight="680"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="20" Background="{StaticResource WindowBackground}">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="430" />
+            <ColumnDefinition Width="16" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <TextBlock Text="ADOFAI VFX Renderer" FontSize="26" FontWeight="SemiBold" />
+                <TextBlock Margin="0,4,0,18"
+                           Foreground="{StaticResource TextSecondary}"
+                           Text="原版运行时驱动的离线 Video / Video Pro / Video VFX 渲染器" />
+
+                <GroupBox Header="游戏安装">
+                    <StackPanel>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="GamePathBox" VerticalContentAlignment="Center" />
+                            <Button Grid.Column="1" Margin="8,0,0,0" Click="BrowseGame_Click" Content="选择目录" />
+                        </Grid>
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                            <Button Click="DetectGame_Click" Content="检测兼容性" />
+                            <ComboBox x:Name="DetectedGamesBox"
+                                      Width="235"
+                                      Margin="8,0,0,0"
+                                      SelectionChanged="DetectedGamesBox_SelectionChanged" />
+                        </StackPanel>
+                        <TextBlock x:Name="GameStatusText"
+                                   Margin="0,10,0,0"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   TextWrapping="Wrap"
+                                   Text="尚未检测。用户只需选择游戏目录，无需寻找 Managed。" />
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="谱面">
+                    <StackPanel>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="ChartPathBox" VerticalContentAlignment="Center" />
+                            <Button Grid.Column="1" Margin="8,0,0,0" Click="BrowseChart_Click" Content="选择谱面" />
+                        </Grid>
+                        <TextBlock x:Name="ChartStatusText"
+                                   Margin="0,10,0,0"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   TextWrapping="Wrap"
+                                   Text="尚未选择 .adofai。" />
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="输出版本（可多选）">
+                    <WrapPanel x:Name="ProfilesPanel" />
+                </GroupBox>
+
+                <GroupBox Header="分辨率（可多选）">
+                    <WrapPanel x:Name="ResolutionsPanel" />
+                </GroupBox>
+
+                <GroupBox Header="输出 FPS（可多选）">
+                    <WrapPanel x:Name="FrameRatesPanel" />
+                </GroupBox>
+
+                <GroupBox Header="结束后继续渲染">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBox x:Name="TailSecondsBox"
+                                     Width="90"
+                                     Text="5"
+                                     TextChanged="TailSecondsBox_TextChanged" />
+                            <TextBlock Margin="8,0,14,0" Text="秒" />
+                            <TextBox x:Name="TailFramesBox"
+                                     Width="100"
+                                     Text="300"
+                                     TextChanged="TailFramesBox_TextChanged" />
+                            <TextBlock Margin="8,0,0,0" Text="帧" />
+                        </StackPanel>
+                        <TextBlock x:Name="TailReferenceText"
+                                   Margin="0,8,0,0"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   Text="帧数按当前最高输出 FPS 换算。" />
+                        <WrapPanel Margin="0,10,0,0">
+                            <Button Margin="0,0,8,0" Click="TailPreset_Click" Tag="1" Content="1 秒" />
+                            <Button Margin="0,0,8,0" Click="TailPreset_Click" Tag="3" Content="3 秒" />
+                            <Button Margin="0,0,8,0" Click="TailPreset_Click" Tag="5" Content="5 秒" />
+                            <Button Click="TailPreset_Click" Tag="10" Content="10 秒" />
+                        </WrapPanel>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="批量优化">
+                    <StackPanel>
+                        <TextBlock Text="分辨率策略" />
+                        <ComboBox x:Name="ResolutionStrategyBox" Margin="0,6,0,10" />
+                        <TextBlock Text="视频质量" />
+                        <ComboBox x:Name="QualityBox" Margin="0,6,0,0" />
+                    </StackPanel>
+                </GroupBox>
+
+                <Button Padding="18,11"
+                        FontWeight="SemiBold"
+                        Background="{StaticResource Accent}"
+                        Foreground="#07111E"
+                        Click="BuildPlan_Click"
+                        Content="生成批量渲染计划" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <Grid Grid.Column="2">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="280" />
+                <RowDefinition Height="14" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Border Background="#090B10" BorderBrush="{StaticResource PanelBorder}" BorderThickness="1" CornerRadius="8">
+                <Grid>
+                    <TextBlock HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               TextAlignment="Center"
+                               Foreground="{StaticResource TextSecondary}"
+                               Text="离屏渲染预览&#x0a;这里将始终显示最新完成并送入编码器的帧" />
+                    <Border HorizontalAlignment="Left"
+                            VerticalAlignment="Bottom"
+                            Margin="14"
+                            Padding="9,5"
+                            CornerRadius="4"
+                            Background="#B012151B">
+                        <TextBlock Text="Worker 尚未启动" />
+                    </Border>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Text="输出矩阵" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,10" />
+                <ListView x:Name="OutputList"
+                          Grid.Row="1"
+                          Background="{StaticResource PanelBackground}"
+                          Foreground="{StaticResource TextPrimary}"
+                          BorderBrush="{StaticResource PanelBorder}">
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="Background" Value="Transparent" />
+                            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+                            <Setter Property="Padding" Value="8,5" />
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                </ListView>
+                <Border Grid.Row="2"
+                        Margin="0,12,0,0"
+                        Padding="14"
+                        Background="{StaticResource PanelBackground}"
+                        BorderBrush="{StaticResource PanelBorder}"
+                        BorderThickness="1"
+                        CornerRadius="6">
+                    <TextBlock x:Name="SummaryText"
+                               TextWrapping="Wrap"
+                               Foreground="{StaticResource TextSecondary}"
+                               Text="选择输出版本、分辨率和 FPS 后生成计划。相同时间轴与高分辨率母帧会自动共享。" />
+                </Border>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

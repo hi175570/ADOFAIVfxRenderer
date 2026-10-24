@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ADOFAIVfxRenderer.App/ADOFAIVfxRenderer.App.csproj" />
+    <Project Path="src/ADOFAIVfxRenderer.Core/ADOFAIVfxRenderer.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ADOFAIVfxRenderer.Core.Tests/ADOFAIVfxRenderer.Core.Tests.csproj" />
+  </Folder>
+</Solution>
