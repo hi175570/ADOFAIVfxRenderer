@@ -17,6 +17,7 @@ internal sealed class RenderWorkerClient : IDisposable
     private OutputProfile _activeProfile;
     private decimal _activeRenderStartSeconds;
     private IReadOnlySet<int> _activeRetainedDecorationIndices = new HashSet<int>();
+    private IReadOnlySet<string> _activeDisabledFilterKeys = new HashSet<string>();
     private bool _derivedExportAttempted;
 
     public RenderWorkerClient()
@@ -44,6 +45,8 @@ internal sealed class RenderWorkerClient : IDisposable
         TailExtension tail,
         decimal? durationLimitSeconds = null,
         IReadOnlySet<int>? retainedDecorationIndices = null,
+        IReadOnlySet<string>? bakedFilterKeys = null,
+        IReadOnlySet<string>? disabledFilterKeys = null,
         RenderBackend renderBackend = RenderBackend.Automatic)
     {
         if (!installation.CanRender || installation.RootDirectory is null)
@@ -99,7 +102,8 @@ internal sealed class RenderWorkerClient : IDisposable
             TailSeconds = (float)tail.Seconds,
             IncludeTrack = variant.Content.HasFlag(RenderContent.Track),
             IncludePlanets = variant.Content.HasFlag(RenderContent.Planets),
-            IncludeEffects = variant.Content.HasFlag(RenderContent.Effects),
+            IncludeEffects = variant.Content.HasFlag(RenderContent.Effects) || bakedFilterKeys?.Count > 0,
+            BakedFilterKeys = bakedFilterKeys?.OrderBy(static key => key, StringComparer.Ordinal).ToArray() ?? [],
             IncludeBackgroundDecorations = variant.Content.HasFlag(RenderContent.BackgroundDecorations),
             IncludeForegroundDecorations = variant.Content.HasFlag(RenderContent.ForegroundDecorations),
             RetainedDecorationIndices = retainedDecorationIndices?.OrderBy(static index => index).ToArray() ?? [],
@@ -119,6 +123,9 @@ internal sealed class RenderWorkerClient : IDisposable
         _activeRetainedDecorationIndices = retainedDecorationIndices is null
             ? new HashSet<int>()
             : new HashSet<int>(retainedDecorationIndices);
+        _activeDisabledFilterKeys = disabledFilterKeys is null
+            ? new HashSet<string>()
+            : new HashSet<string>(disabledFilterKeys, StringComparer.Ordinal);
         _derivedExportAttempted = false;
 
         var workerLogPath = Path.Combine(outputDirectory, "worker.log");
@@ -197,12 +204,14 @@ internal sealed class RenderWorkerClient : IDisposable
                                     status.OutputPath,
                                     _activeProfile,
                                     _activeRenderStartSeconds,
-                                    retainedDecorationIndices);
+                                    retainedDecorationIndices,
+                                    _activeDisabledFilterKeys);
                                 status.DerivedChartPath = derived.ChartPath;
                                 status.VideoOffsetMilliseconds = derived.VideoOffsetMilliseconds;
                                 status.Message =
                                     $"视频与派生谱面已完成；视频偏移 {derived.VideoOffsetMilliseconds} ms；" +
-                                    $"自动保留 {status.UnbakedDecorationIndices.Length} 个未成功烘焙的装饰。";
+                                    $"自动保留 {status.UnbakedDecorationIndices.Length} 个未成功烘焙的装饰；" +
+                                    $"关闭 {derived.DisabledFilterEvents} 个已烤入或忽略的滤镜事件。";
                             }
                             catch (Exception exception) when (exception is IOException or JsonException or InvalidDataException)
                             {
@@ -394,6 +403,9 @@ internal sealed class WorkerJob
 
     [JsonPropertyName("includeEffects")]
     public bool IncludeEffects { get; init; }
+
+    [JsonPropertyName("bakedFilterKeys")]
+    public string[] BakedFilterKeys { get; init; } = [];
 
     [JsonPropertyName("includeBackgroundDecorations")]
     public bool IncludeBackgroundDecorations { get; init; }

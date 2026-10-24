@@ -9,7 +9,8 @@ public sealed record DerivedChartExportResult(
     string VideoRelativePath,
     int VideoOffsetMilliseconds,
     int RemovedDecorations,
-    int RemovedBackgroundEvents);
+    int RemovedBackgroundEvents,
+    int DisabledFilterEvents = 0);
 
 public static class DerivedChartExporter
 {
@@ -23,7 +24,8 @@ public static class DerivedChartExporter
         string renderedVideoPath,
         OutputProfile profile,
         decimal renderStartSeconds = 0m,
-        IReadOnlySet<int>? retainedDecorationIndices = null)
+        IReadOnlySet<int>? retainedDecorationIndices = null,
+        IReadOnlySet<string>? disabledFilterKeys = null)
     {
         if (profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
         {
@@ -52,6 +54,7 @@ public static class DerivedChartExporter
 
         var removedDecorations = RemoveBakedDecorations(root, profile, retainedDecorationIndices);
         var removedBackgroundEvents = RemoveBakedBackgroundEvents(root);
+        var disabledFilterEvents = DisableSelectedFilters(root, disabledFilterKeys);
 
         var outputFolderName = Path.GetFileName(Path.GetDirectoryName(renderedVideoPath));
         var sourceName = Path.GetFileNameWithoutExtension(sourceChartPath);
@@ -65,7 +68,8 @@ public static class DerivedChartExporter
             relativeVideoPath,
             videoOffset,
             removedDecorations,
-            removedBackgroundEvents);
+            removedBackgroundEvents,
+            disabledFilterEvents);
     }
 
     public static int CalculateVideoOffsetMilliseconds(JsonObject chartOrSettings, decimal renderStartSeconds = 0m)
@@ -125,6 +129,36 @@ public static class DerivedChartExporter
             }
         }
         return removed;
+    }
+
+    private static int DisableSelectedFilters(JsonObject root, IReadOnlySet<string>? disabledFilterKeys)
+    {
+        if (disabledFilterKeys is null || disabledFilterKeys.Count == 0 || root["actions"] is not JsonArray actions)
+            return 0;
+
+        var changed = 0;
+        foreach (var action in actions.OfType<JsonObject>())
+        {
+            var key = FilterCatalogReader.CreateKey(action);
+            if (key is null || !disabledFilterKeys.Contains(key)) continue;
+            switch (action["eventType"]?.GetValue<string>())
+            {
+                case "SetFilter":
+                case "SetFilterAdvanced":
+                case "Bloom":
+                case "HallOfMirrors":
+                    action["enabled"] = false;
+                    break;
+                case "ScreenTile":
+                    action["tile"] = new JsonArray(1, 1);
+                    break;
+                case "ScreenScroll":
+                    action["scroll"] = new JsonArray(0, 0);
+                    break;
+            }
+            changed++;
+        }
+        return changed;
     }
 
     private static string GetUniquePath(string preferredPath)

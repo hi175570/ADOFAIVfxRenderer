@@ -25,6 +25,8 @@ var tests = new (string Name, Action Run)[]
     ("Derived Video VFX Pro ownership", DerivedVideoVfxProOwnership),
     ("Derived chart retains selected decoration", DerivedChartRetainsSelectedDecoration),
     ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
+    ("Filter catalog groups by target", FilterCatalogGroupsByTarget),
+    ("Derived chart disables selected filters", DerivedChartDisablesSelectedFilters),
 };
 
 var failures = new List<string>();
@@ -397,6 +399,84 @@ static void DecorationCatalogUsesFirstInvocation()
         var shown = items.Single(item => item.Tag == "shown");
         Equal(0, shown.ReferenceFloor);
         Near(0d, shown.TimeSeconds, 0.000001d);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void FilterCatalogGroupsByTarget()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-filters-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 4, "eventType": "SetFilter", "filter": "Blur"},
+            {"floor": 8, "eventType": "SetFilter", "filter": "Blur"},
+            {"floor": 3, "eventType": "SetFilterAdvanced", "plane": "Foreground", "filter": "CameraFilterPack_Glow_Glow", "targetType": "Decoration", "targetTag": "mask-a"},
+            {"floor": 5, "eventType": "SetFilterAdvanced", "plane": "Foreground", "filter": "CameraFilterPack_Glow_Glow", "targetType": "Decoration", "targetTag": "mask-b"},
+            {"floor": 6, "eventType": "HallOfMirrors", "enabled": true},
+            {"floor": 0, "eventType": "SetFilterAdvanced", "plane": "Foreground", "filter": "Unused", "enabled": false}
+          ],
+          "decorations": []
+        }
+        """);
+
+        var items = FilterCatalogReader.Read(chartPath);
+        Equal(4, items.Count);
+        var blur = items.Single(item => item.Key == "basic:Blur");
+        Equal(2, blur.InvocationCount);
+        Equal(4, blur.FirstFloor);
+        True(items.Any(item => item.Key.EndsWith(":Decoration:mask-a", StringComparison.Ordinal)));
+        True(items.Any(item => item.Key.EndsWith(":Decoration:mask-b", StringComparison.Ordinal)));
+        False(items.Any(item => item.DisplayName == "Unused"));
+        False(items.Single(item => item.Key.EndsWith(":Decoration:mask-a", StringComparison.Ordinal)).OfflineSupported);
+        False(items.Single(item => item.Key == "builtin:HallOfMirrors").OfflineSupported);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void DerivedChartDisablesSelectedFilters()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-filter-export-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var videoPath = Path.Combine(root, "render.mp4");
+        File.WriteAllBytes(videoPath, [1]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 0, "eventType": "SetFilter", "filter": "Blur", "enabled": true},
+            {"floor": 0, "eventType": "SetFilter", "filter": "Sepia", "enabled": true},
+            {"floor": 0, "eventType": "ScreenTile", "tile": [3, 4]}
+          ],
+          "decorations": []
+        }
+        """);
+
+        var disabled = new HashSet<string>(StringComparer.Ordinal) { "basic:Blur", "builtin:ScreenTile" };
+        var result = DerivedChartExporter.Export(chartPath, videoPath, OutputProfile.VideoVfx, disabledFilterKeys: disabled);
+        Equal(2, result.DisabledFilterEvents);
+        var actions = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(result.ChartPath))!["actions"]!.AsArray();
+        False(actions.Single(node => node!["filter"]?.GetValue<string>() == "Blur")!["enabled"]!.GetValue<bool>());
+        True(actions.Single(node => node!["filter"]?.GetValue<string>() == "Sepia")!["enabled"]!.GetValue<bool>());
+        var tile = actions.Single(node => node!["eventType"]!.GetValue<string>() == "ScreenTile")!["tile"]!.AsArray();
+        Equal(1, tile[0]!.GetValue<int>());
+        Equal(1, tile[1]!.GetValue<int>());
     }
     finally
     {

@@ -49,6 +49,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     private float _pitch = 1f;
     private float _initialZoomRatio = 1f;
     private SpriteRenderer? _backgroundRenderer;
+    private OfflineEffectController? _effects;
     private bool _cameraFollowsPlayer;
     private Vector2 _lastPlayerFollowPosition;
 
@@ -125,6 +126,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         _camera.clearFlags = CameraClearFlags.SolidColor;
         _camera.backgroundColor = ParseColor(settings.Value<string>("backgroundColor") ?? "000000ff");
         _camera.aspect = _job.width / (float)_job.height;
+        if (_job.includeEffects)
+        {
+            _effects = cameraObject.AddComponent<OfflineEffectController>();
+            _effects.Configure(_job.bakedFilterKeys);
+        }
         _cameraFollowsPlayer = initialCameraMode == "Player";
         _lastPlayerFollowPosition = PlayerFollowPositionAt(0f);
 
@@ -168,6 +174,10 @@ public sealed class WorkerRuntime : MonoBehaviour
                 {
                     AddBackgroundEvent(action, repeat.Floor, repeat.AngleOffset);
                 }
+                else if (_effects != null && OfflineEffectController.Supports(eventType))
+                {
+                    _effects.AddEvent(action, repeat.Floor, repeat.AngleOffset, _timeline, _pitch, _eventSequence++);
+                }
             }
         }
 
@@ -175,6 +185,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         _cameraEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
         ResolveCameraModes(initialCameraMode);
         _backgroundEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
+        _effects?.Prepare();
         ApplyTimeline(0f);
     }
 
@@ -571,6 +582,11 @@ public sealed class WorkerRuntime : MonoBehaviour
 
             StartEncoder();
             target = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            target.Create();
+            var previousTarget = RenderTexture.active;
+            RenderTexture.active = target;
+            GL.Clear(true, true, _camera.backgroundColor);
+            RenderTexture.active = previousTarget;
             frameTexture = new Texture2D(_job.width, _job.height, TextureFormat.RGBA32, false, false);
             var watch = Stopwatch.StartNew();
             var previewWatch = Stopwatch.StartNew();
@@ -696,6 +712,10 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         foreach (var decoration in _decorations) decoration.ApplyVisual(_camera);
         UpdateBackgroundTransform();
+        _effects?.Apply(time);
+        _camera.clearFlags = _effects?.HallOfMirrorsEnabled == true
+            ? CameraClearFlags.Depth
+            : CameraClearFlags.SolidColor;
     }
 
     private void AdvanceMoves(float time)
@@ -976,6 +996,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public bool includeTrack;
         public bool includePlanets;
         public bool includeEffects;
+        public string[]? bakedFilterKeys;
         public bool includeBackgroundDecorations = true;
         public bool includeForegroundDecorations = true;
         public int[]? retainedDecorationIndices;

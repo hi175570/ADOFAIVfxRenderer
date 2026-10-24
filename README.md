@@ -26,13 +26,16 @@ The current implementation milestone includes:
 - first-floor synchronization: the exporter compares the game's video trigger time with the actual first playable floor, so normal intros produce `0 ms` while unusual first angles or floor-zero speed events can correctly produce positive or negative offsets;
 - a full-page Video VFX retention editor with whitelist/blacklist semantics, reference-order/depth sorting, transparent-image previews, and non-destructive integration with both worker baking and derived-chart export;
 - paired decoration diagnostics that render ten identical timestamps with and without the selected decoration (twenty images total) and show every pair inside the app;
+- a `滤镜与装饰` workspace with per-filter ownership: keep the group live in the chart, bake a supported offline approximation into the video, or explicitly ignore it; baked/ignored groups are disabled only in the generated chart;
+- filter grouping by basic/advanced type, plane, target type, and target tag, so filters aimed at different objects are never silently merged into one choice;
+- an initial independent-worker filter stack for selected basic/advanced camera filters, Bloom, ScreenTile, and ScreenScroll, plus opt-in filtered decoration diagnostics; Hall of Mirrors remains realtime-only because Video VFX does not contain the track/particle/history layers needed to bake it faithfully;
 - remembered game/chart paths, a dedicated settings tab, and guarded cleanup of only app-generated diagnostic caches;
 - selectable automatic, CPU/WARP, hardware-GPU, and NVIDIA/RTX/NVENC backends with capability probing and no silent fallback;
 - selectable background/foreground decoration content with UI always excluded;
 - quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.
 
-The worker is intentionally not described as pixel-accurate for every chart yet. Image decorations used by the current target chart have verified timeline, tiling, v19 `NO TAG` masking semantics, masking depth ranges, blending, repeat, player-follow camera, unwrapped full-turn camera rotation, and tween adapters. Text, particle, and object decorations remain live in the derived chart instead of being silently dropped. Track/planet rendering and original filters still need verified offline adapters, so their formal-render and diagnostic controls are visibly disabled rather than pretending to work. Video VFX and depth-split Video VFX Pro are enabled end to end; Video and Video Pro remain disabled until their offline filter path is verified.
+The worker is intentionally not described as pixel-accurate for every chart yet. Image decorations used by the current target chart have verified timeline, tiling, v19 `NO TAG` masking semantics, masking depth ranges, blending, repeat, player-follow camera, unwrapped full-turn camera rotation, and tween adapters. Text, particle, and object decorations remain live in the derived chart instead of being silently dropped. Offline filters are opt-in per group and explicitly labelled as approximations; advanced filters aimed at tagged decorations are not offered as bakeable until object-scoped compositing exists. Track/planet rendering still needs verified offline adapters. Video VFX and depth-split Video VFX Pro are enabled end to end; Video and Video Pro remain disabled until their full offline visual path is verified.
 
 ## Build and test
 

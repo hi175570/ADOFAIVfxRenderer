@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private readonly RenderWorkerClient _worker = new();
     private readonly AppSettings _settings = AppSettingsStore.Load();
     private readonly ObservableCollection<DecorationRetentionItem> _decorationChoices = [];
+    private readonly ObservableCollection<FilterOwnershipItem> _filterChoices = [];
     private ICollectionView? _decorationChoicesView;
     private GameInstallation? _installation;
     private ChartMetadata? _chart;
@@ -37,6 +38,8 @@ public partial class MainWindow : Window
     private int _batchTotal;
     private int _batchCompleted;
     private IReadOnlySet<int> _batchRetainedDecorationIndices = new HashSet<int>();
+    private IReadOnlySet<string> _batchBakedFilterKeys = new HashSet<string>();
+    private IReadOnlySet<string> _batchDisabledFilterKeys = new HashSet<string>();
     private RenderBackend _batchRenderBackend = RenderBackend.Automatic;
 
     public MainWindow()
@@ -330,6 +333,7 @@ public partial class MainWindow : Window
         ChartPathBox.Text = path;
         _chart = ChartMetadataReader.Read(path);
         LoadDecorationCatalog(path);
+        LoadFilterCatalog(path);
         SaveRememberedPaths(chartPath: path);
         UpdateChartCompatibilityText();
     }
@@ -382,6 +386,46 @@ public partial class MainWindow : Window
         DecorationPreviewTitle.Text = "从左侧选择一张贴图";
         DecorationPreviewDetails.Text = "棋盘格可以同时看清透明、白色、灰色和黑色内容。";
         RefreshRetentionSummary();
+    }
+
+    private void LoadFilterCatalog(string chartPath)
+    {
+        _filterChoices.Clear();
+        foreach (var item in FilterCatalogReader.Read(chartPath))
+        {
+            var choice = new FilterOwnershipItem(item);
+            choice.PropertyChanged += (_, args) =>
+            {
+                if (args.PropertyName == nameof(FilterOwnershipItem.Ownership)) RefreshFilterOwnershipSummary();
+            };
+            _filterChoices.Add(choice);
+        }
+        FilterOwnershipGrid.ItemsSource = _filterChoices;
+        RefreshFilterOwnershipSummary();
+    }
+
+    private IReadOnlySet<string> GetBakedFilterKeys() => _filterChoices
+        .Where(static item => item.Ownership == FilterOwnership.BakeIntoVideo)
+        .Select(static item => item.Item.Key)
+        .ToHashSet(StringComparer.Ordinal);
+
+    private IReadOnlySet<string> GetDisabledFilterKeys() => _filterChoices
+        .Where(static item => item.Ownership is FilterOwnership.BakeIntoVideo or FilterOwnership.Ignore)
+        .Select(static item => item.Item.Key)
+        .ToHashSet(StringComparer.Ordinal);
+
+    private void RefreshFilterOwnershipSummary()
+    {
+        if (FilterOwnershipSummaryText is null) return;
+        var realtime = _filterChoices.Count(static item => item.Ownership == FilterOwnership.Realtime);
+        var baked = _filterChoices.Count(static item => item.Ownership == FilterOwnership.BakeIntoVideo);
+        var ignored = _filterChoices.Count(static item => item.Ownership == FilterOwnership.Ignore);
+        var unsupportedBake = _filterChoices.Count(static item =>
+            item.Ownership == FilterOwnership.BakeIntoVideo && !item.Item.OfflineSupported);
+        FilterOwnershipSummaryText.Text = _chart is null
+            ? "尚未载入谱面。"
+            : $"共 {_filterChoices.Count:N0} 组 · 保留实时 {realtime:N0} · 烤入视频 {baked:N0} · 忽略 {ignored:N0}" +
+              (unsupportedBake > 0 ? $" · 有 {unsupportedBake:N0} 组尚无离线实现，开始渲染时会阻止并指出。" : "");
     }
 
     private void RetentionModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -783,6 +827,16 @@ public partial class MainWindow : Window
             _batchChart = _chart;
             _batchTail = TailExtension.FromSeconds(tailSeconds);
             _batchRetainedDecorationIndices = GetRetainedDecorationIndices();
+            _batchBakedFilterKeys = GetBakedFilterKeys();
+            _batchDisabledFilterKeys = GetDisabledFilterKeys();
+            var unsupportedBake = _filterChoices
+                .Where(static item => item.Ownership == FilterOwnership.BakeIntoVideo && !item.Item.OfflineSupported)
+                .Select(static item => item.DisplayName)
+                .ToArray();
+            if (unsupportedBake.Length > 0)
+            {
+                throw new NotSupportedException("这些滤镜尚不能离线烤入：" + string.Join("、", unsupportedBake));
+            }
             _batchRenderBackend = ((Choice<RenderBackend>)RenderBackendBox.SelectedItem).Value;
             _batchTotal = variants.Count;
             _batchCompleted = 0;
@@ -824,9 +878,13 @@ public partial class MainWindow : Window
             _batchTail,
             _durationLimitSeconds,
             _batchRetainedDecorationIndices,
+            _batchBakedFilterKeys,
+            _batchDisabledFilterKeys,
             _batchRenderBackend);
         var current = _batchTotal - _renderQueue.Count;
-        SummaryText.Text = $"批量任务 {current}/{_batchTotal}：{variant.DisplayName}\n输出文件：{outputPath}";
+        SummaryText.Text = $"批量任务 {current}/{_batchTotal}：{variant.DisplayName}\n" +
+                           $"烤入滤镜 {_batchBakedFilterKeys.Count:N0} 组；派生谱关闭 {_batchDisabledFilterKeys.Count:N0} 组。\n" +
+                           $"输出文件：{outputPath}";
     }
 
     private async void Worker_StatusChanged(WorkerStatus status)
@@ -975,6 +1033,48 @@ public partial class MainWindow : Window
                 if (_isListed == value) return;
                 _isListed = value;
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsListed)));
+            }
+        }
+    }
+
+    private sealed record FilterOwnershipOption(string Label, FilterOwnership Value);
+
+    private sealed class FilterOwnershipItem : INotifyPropertyChanged
+    {
+        private static readonly FilterOwnershipOption[] Options =
+        [
+            new("保留实时", FilterOwnership.Realtime),
+            new("烤入视频", FilterOwnership.BakeIntoVideo),
+            new("忽略/关闭", FilterOwnership.Ignore),
+        ];
+        private FilterOwnership _ownership = FilterOwnership.Realtime;
+
+        public FilterOwnershipItem(FilterCatalogItem item) => Item = item;
+        public event PropertyChangedEventHandler? PropertyChanged;
+        public FilterCatalogItem Item { get; }
+        public string DisplayName => Item.DisplayName;
+        public string EventKind => Item.EventType switch
+        {
+            "SetFilter" => "基础",
+            "SetFilterAdvanced" => "高级",
+            _ => "内建",
+        };
+        public string Plane => Item.Plane;
+        public string TargetDescription => string.IsNullOrWhiteSpace(Item.TargetTag)
+            ? Item.TargetType
+            : $"{Item.TargetType} · {Item.TargetTag}";
+        public int FirstFloor => Item.FirstFloor;
+        public int InvocationCount => Item.InvocationCount;
+        public string OfflineStatus => Item.OfflineSupported ? "可离线近似；建议对照确认" : "尚未实现，只能实时或忽略";
+        public IReadOnlyList<FilterOwnershipOption> OwnershipChoices => Options;
+        public FilterOwnership Ownership
+        {
+            get => _ownership;
+            set
+            {
+                if (_ownership == value) return;
+                _ownership = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Ownership)));
             }
         }
     }

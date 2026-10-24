@@ -9,6 +9,8 @@ param(
     [int]$Fps = 15,
     [string]$VideoEncoder = "libopenh264",
     [string]$EncoderPreset = "",
+    [switch]$IncludeEffects,
+    [string[]]$BakedFilterKey = @(),
     [switch]$CpuCompatibility
 )
 
@@ -39,7 +41,8 @@ $job = [ordered]@{
     tailSeconds = 0
     includeTrack = $false
     includePlanets = $false
-    includeEffects = $false
+    includeEffects = [bool]$IncludeEffects -or $BakedFilterKey.Count -gt 0
+    bakedFilterKeys = @($BakedFilterKey)
     includeBackgroundDecorations = $true
     includeForegroundDecorations = $true
     retainedDecorationIndices = @()
