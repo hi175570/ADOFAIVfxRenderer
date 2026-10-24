@@ -21,7 +21,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     private readonly Dictionary<string, Texture2D> _textures = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Sprite> _sprites = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Material> _blendMaterials = new(StringComparer.Ordinal);
-    private Material? _spriteMaterial;
+    private Material? _tileMaterial;
     private readonly List<DecorationState> _decorations = new();
     private readonly List<MoveEvent> _moves = new();
     private readonly List<MoveEvent> _activeMoves = new();
@@ -39,11 +39,16 @@ public sealed class WorkerRuntime : MonoBehaviour
     private float[] _floorTimes = Array.Empty<float>();
     private float[] _floorBpms = Array.Empty<float>();
     private Vector2[] _floorPositions = Array.Empty<Vector2>();
+    private Vector2[] _followFrom = Array.Empty<Vector2>();
+    private Vector2[] _followTarget = Array.Empty<Vector2>();
+    private float[] _followDuration = Array.Empty<float>();
     private AdoTimelineResult _timeline = null!;
     private string _chartDirectory = "";
     private float _pitch = 1f;
     private float _initialZoomRatio = 1f;
     private SpriteRenderer? _backgroundRenderer;
+    private bool _cameraFollowsPlayer;
+    private Vector2 _lastPlayerFollowPosition;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Boot()
@@ -108,7 +113,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         _initialZoomRatio = Math.Max(0.01f, (settings.Value<float?>("zoom") ?? 100f) / 100f);
         _camera.orthographicSize = DefaultCameraOrthoSize * _initialZoomRatio;
         var initialCameraOffset = ReadVector2(settings["position"], Vector2.zero) * TileSize;
-        var initialCameraBase = (settings.Value<string>("relativeTo") ?? "Player") == "Tile"
+        var initialCameraMode = settings.Value<string>("relativeTo") ?? "Player";
+        var initialCameraBase = initialCameraMode == "Tile"
             ? _floorPositions[0]
             : Vector2.zero;
         _camera.transform.position = new Vector3(initialCameraBase.x + initialCameraOffset.x, initialCameraBase.y + initialCameraOffset.y, -10f);
@@ -116,6 +122,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         _camera.clearFlags = CameraClearFlags.SolidColor;
         _camera.backgroundColor = ParseColor(settings.Value<string>("backgroundColor") ?? "000000ff");
         _camera.aspect = _job.width / (float)_job.height;
+        _cameraFollowsPlayer = initialCameraMode == "Player";
+        _lastPlayerFollowPosition = PlayerFollowPositionAt(0f);
 
         var backgroundObject = new GameObject("Custom Background");
         _backgroundRenderer = backgroundObject.AddComponent<SpriteRenderer>();
@@ -129,6 +137,7 @@ public sealed class WorkerRuntime : MonoBehaviour
                 AddDecoration(decoration);
             }
         }
+        ResolveMaskingTargets();
 
         var repeatRules = BuildRepeatRules(actions);
         foreach (var token in actions)
@@ -158,6 +167,7 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         _moves.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
         _cameraEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
+        ResolveCameraModes(initialCameraMode);
         _backgroundEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
         ApplyTimeline(0f);
     }
@@ -197,6 +207,40 @@ public sealed class WorkerRuntime : MonoBehaviour
                 new Vector2(Mathf.Cos(radians), Mathf.Sin(radians)) * TileSize;
             entryAngle = Mathf.Repeat(radians + Mathf.PI, Mathf.PI * 2f);
         }
+        BuildPlayerFollowTimeline();
+    }
+
+    private void BuildPlayerFollowTimeline()
+    {
+        _followFrom = new Vector2[_floorPositions.Length];
+        _followTarget = new Vector2[_floorPositions.Length];
+        _followDuration = new float[_floorPositions.Length];
+        _followFrom[0] = _floorPositions[0];
+        _followTarget[0] = _floorPositions[0];
+        _followDuration[0] = 0f;
+        for (var floor = 1; floor < _floorPositions.Length; floor++)
+        {
+            _followFrom[floor] = EvaluateFollowSegment(floor - 1, _floorTimes[floor]);
+            _followTarget[floor] = _floorPositions[floor];
+            _followDuration[floor] = 120f / Math.Max(0.000001f, _floorBpms[floor] * _pitch);
+        }
+    }
+
+    private Vector2 PlayerFollowPositionAt(float time)
+    {
+        if (_floorTimes.Length == 0) return Vector2.zero;
+        var floor = Array.BinarySearch(_floorTimes, time);
+        if (floor < 0) floor = Math.Max(0, ~floor - 1);
+        while (floor + 1 < _floorTimes.Length && _floorTimes[floor + 1] <= time) floor++;
+        return EvaluateFollowSegment(floor, time);
+    }
+
+    private Vector2 EvaluateFollowSegment(int floor, float time)
+    {
+        floor = Math.Clamp(floor, 0, _followFrom.Length - 1);
+        var duration = _followDuration[floor];
+        var amount = duration <= 0f ? 1f : Mathf.Clamp01((time - _floorTimes[floor]) / duration);
+        return Vector2.LerpUnclamped(_followFrom[floor], _followTarget[floor], amount);
     }
 
     private static List<double> ReadAngles(JObject chart)
@@ -246,16 +290,10 @@ public sealed class WorkerRuntime : MonoBehaviour
         spriteMask.sprite = renderer.sprite;
         spriteMask.alphaCutoff = 0.001f;
         spriteMask.enabled = false;
-        renderer.maskInteraction = maskingType switch
-        {
-            "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
-            "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
-            _ => SpriteMaskInteraction.None,
-        };
-        ApplyMaterial(
-            renderer,
-            data.Value<string>("blendMode") ?? "None",
-            ReadVector2(data["tile"], Vector2.one));
+        renderer.maskInteraction = SpriteMaskInteraction.None;
+        if (maskingType is "None" or "")
+            ApplyTiling(renderer, ReadVector2(data["tile"], Vector2.one));
+        ApplyBlendMode(renderer, data.Value<string>("blendMode") ?? "None");
         var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorPositions.Length - 1);
         var localPosition = ReadVector2(data["position"], Vector2.zero);
         var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
@@ -302,6 +340,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             depth,
             spriteMask,
             maskingType,
+            data.Value<string>("maskingTarget") ?? "",
             visible,
             data.Value<bool?>("useMaskingDepth") ?? false,
             data.Value<int?>("maskingFrontDepth") ?? depth,
@@ -309,6 +348,19 @@ public sealed class WorkerRuntime : MonoBehaviour
             _initialZoomRatio);
         state.ApplyVisual(_camera);
         _decorations.Add(state);
+    }
+
+    private void ResolveMaskingTargets()
+    {
+        var masks = _decorations.Where(static decoration => decoration.MaskingType == "Mask").ToArray();
+        foreach (var decoration in _decorations)
+        {
+            var hasMatchingMask = masks.Any(mask =>
+                !string.IsNullOrWhiteSpace(mask.MaskingTarget) &&
+                !string.Equals(mask.MaskingTarget, "NO TAG", StringComparison.Ordinal) &&
+                decoration.Tags.Contains(mask.MaskingTarget));
+            decoration.ConfigureMaskRelationship(hasMatchingMask);
+        }
     }
 
     private Texture2D? GetTexture(string imagePath)
@@ -336,20 +388,28 @@ public sealed class WorkerRuntime : MonoBehaviour
         return sprite;
     }
 
-    private void ApplyMaterial(SpriteRenderer renderer, string blendMode, Vector2 tile)
+    private void ApplyTiling(SpriteRenderer renderer, Vector2 tile)
     {
-        Material material;
-        if (blendMode is "None" or "Normal" or "")
+        if (Mathf.Approximately(tile.x, 1f) && Mathf.Approximately(tile.y, 1f)) return;
+        if (_tileMaterial == null)
         {
-            if (_spriteMaterial == null)
-            {
-                var spriteShader = Resources.Load<Shader>("ADOFAISprite");
-                if (spriteShader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Sprite shader resource.");
-                _spriteMaterial = new Material(spriteShader) { name = "ADOFAI VFX Sprite" };
-            }
-            material = _spriteMaterial;
+            var shader = Resources.Load<Shader>("ADOFAITile");
+            if (shader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Tile shader resource.");
+            _tileMaterial = new Material(shader) { name = "ADOFAI VFX Tile" };
         }
-        else if (!_blendMaterials.TryGetValue(blendMode, out material))
+
+        renderer.sharedMaterial = _tileMaterial;
+        var properties = new MaterialPropertyBlock();
+        renderer.GetPropertyBlock(properties);
+        properties.SetFloat("RepeatX", Math.Max(0.000001f, Math.Abs(tile.x)));
+        properties.SetFloat("RepeatY", Math.Max(0.000001f, Math.Abs(tile.y)));
+        renderer.SetPropertyBlock(properties);
+    }
+
+    private void ApplyBlendMode(SpriteRenderer renderer, string blendMode)
+    {
+        if (blendMode is "None" or "Normal" or "") return;
+        if (!_blendMaterials.TryGetValue(blendMode, out var material))
         {
             var shader = Resources.Load<Shader>("ADOFAIBlend");
             if (shader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Blend shader resource.");
@@ -365,10 +425,6 @@ public sealed class WorkerRuntime : MonoBehaviour
             _blendMaterials[blendMode] = material;
         }
         renderer.sharedMaterial = material;
-        var properties = new MaterialPropertyBlock();
-        renderer.GetPropertyBlock(properties);
-        properties.SetVector("_Tile", new Vector4(Math.Max(0.000001f, tile.x), Math.Max(0.000001f, tile.y), 0f, 0f));
-        renderer.SetPropertyBlock(properties);
     }
 
     private static Dictionary<int, Dictionary<string, RepeatRule>> BuildRepeatRules(JArray actions)
@@ -455,6 +511,20 @@ public sealed class WorkerRuntime : MonoBehaviour
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
         _cameraEvents.Add(new CameraEvent(start, duration, data, _floorPositions[floor], _eventSequence++));
     }
+
+    private void ResolveCameraModes(string initialMode)
+    {
+        var mode = IsCameraMode(initialMode) ? initialMode : "Player";
+        foreach (var cameraEvent in _cameraEvents)
+        {
+            if (cameraEvent.RequestedMode is { } requestedMode && IsCameraMode(requestedMode))
+                mode = requestedMode;
+            cameraEvent.ConfigureMode(mode);
+        }
+    }
+
+    private static bool IsCameraMode(string mode) =>
+        mode is "Player" or "Tile" or "Global" or "LastPosition" or "LastPositionNoRotation";
 
     private void AddBackgroundEvent(JObject data, int repeatedFloor, float angleOffset)
     {
@@ -580,16 +650,20 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         while (_nextCameraEvent < _cameraEvents.Count && _cameraEvents[_nextCameraEvent].Start <= time)
         {
+            AdvancePlayerFollow(_cameraEvents[_nextCameraEvent].Start);
             AdvanceCamera(_cameraEvents[_nextCameraEvent].Start);
             var cameraEvent = _cameraEvents[_nextCameraEvent++];
+            if (cameraEvent.ChangesMode) _cameraFollowsPlayer = cameraEvent.IsPlayerMode;
             for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
             {
-                _activeCameraEvents[index].CompleteConflicts(_camera, cameraEvent);
+                _activeCameraEvents[index].CompleteConflicts(_camera, cameraEvent, PlayerFollowPositionAt(cameraEvent.Start));
                 if (_activeCameraEvents[index].IsComplete) _activeCameraEvents.RemoveAt(index);
             }
-            cameraEvent.Capture(_camera);
-            if (!cameraEvent.Apply(_camera, cameraEvent.Start)) _activeCameraEvents.Add(cameraEvent);
+            cameraEvent.Capture(_camera, PlayerFollowPositionAt(cameraEvent.Start));
+            if (!cameraEvent.Apply(_camera, cameraEvent.Start, PlayerFollowPositionAt(cameraEvent.Start)))
+                _activeCameraEvents.Add(cameraEvent);
         }
+        AdvancePlayerFollow(time);
         AdvanceCamera(time);
 
         while (_nextBackgroundEvent < _backgroundEvents.Count && _backgroundEvents[_nextBackgroundEvent].Start <= time)
@@ -611,10 +685,23 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private void AdvanceCamera(float time)
     {
+        var followPosition = PlayerFollowPositionAt(time);
         for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
         {
-            if (_activeCameraEvents[index].Apply(_camera, time)) _activeCameraEvents.RemoveAt(index);
+            if (_activeCameraEvents[index].Apply(_camera, time, followPosition)) _activeCameraEvents.RemoveAt(index);
         }
+    }
+
+    private void AdvancePlayerFollow(float time)
+    {
+        var followPosition = PlayerFollowPositionAt(time);
+        if (_cameraFollowsPlayer)
+        {
+            var delta = followPosition - _lastPlayerFollowPosition;
+            var current = _camera.transform.position;
+            _camera.transform.position = new Vector3(current.x + delta.x, current.y + delta.y, -10f);
+        }
+        _lastPlayerFollowPosition = followPosition;
     }
 
     private void ApplyBackground(JObject data)
@@ -898,6 +985,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             int depth,
             SpriteMask? spriteMask,
             string maskingType,
+            string maskingTarget,
             bool visible,
             bool useMaskingDepth,
             int maskingFrontDepth,
@@ -922,6 +1010,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             Depth = depth;
             SpriteMask = spriteMask;
             MaskingType = maskingType;
+            MaskingTarget = maskingTarget;
             Visible = visible;
             UseMaskingDepth = useMaskingDepth;
             MaskingFrontDepth = maskingFrontDepth;
@@ -947,6 +1036,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         public int Depth { get; set; }
         public SpriteMask? SpriteMask { get; }
         public string MaskingType { get; private set; }
+        public string MaskingTarget { get; }
+        private bool HasMatchingMask { get; set; }
         public bool Visible { get; private set; }
         public bool UseMaskingDepth { get; private set; }
         public int MaskingFrontDepth { get; private set; }
@@ -956,8 +1047,26 @@ public sealed class WorkerRuntime : MonoBehaviour
         public void SetVisible(bool visible)
         {
             Visible = visible;
-            Renderer.enabled = visible && MaskingType != "Mask";
-            if (SpriteMask != null) SpriteMask.enabled = visible && MaskingType == "Mask";
+            Renderer.enabled = visible && MaskingType != "Mask" &&
+                               (MaskingType != "VisibleInsideMask" || HasMatchingMask);
+            if (SpriteMask != null)
+                SpriteMask.enabled = visible && MaskingType == "Mask" &&
+                                     !string.IsNullOrWhiteSpace(MaskingTarget) &&
+                                     !string.Equals(MaskingTarget, "NO TAG", StringComparison.Ordinal);
+        }
+
+        public void ConfigureMaskRelationship(bool hasMatchingMask)
+        {
+            HasMatchingMask = hasMatchingMask;
+            Renderer.maskInteraction = !hasMatchingMask
+                ? SpriteMaskInteraction.None
+                : MaskingType switch
+                {
+                    "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
+                    "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
+                    _ => SpriteMaskInteraction.None,
+                };
+            SetVisible(Visible);
         }
 
         public void SetDepth(int depth)
@@ -973,12 +1082,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (useDepth.HasValue) UseMaskingDepth = useDepth.Value;
             if (frontDepth.HasValue) MaskingFrontDepth = frontDepth.Value;
             if (backDepth.HasValue) MaskingBackDepth = backDepth.Value;
-            Renderer.maskInteraction = MaskingType switch
-            {
-                "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
-                "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
-                _ => SpriteMaskInteraction.None,
-            };
+            ConfigureMaskRelationship(HasMatchingMask);
             SetVisible(Visible);
             RefreshMaskRange();
         }
@@ -1240,6 +1344,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         private readonly Vector2 _floorPosition;
         private Property _active;
         private readonly Property _properties;
+        private string _resolvedMode = "Player";
         public CameraEvent(float start, float duration, JObject data, Vector2 floorPosition, int order)
         {
             Start = start;
@@ -1257,50 +1362,65 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
         public float Start { get; }
         public int Order { get; }
+        public string? RequestedMode => HasValue(_data, "relativeTo") ? _data.Value<string>("relativeTo") : null;
+        public bool ChangesMode => RequestedMode != null;
+        public bool IsPlayerMode => _resolvedMode == "Player";
         private float Duration { get; }
         public bool IsComplete => _active == Property.None;
 
-        public void CompleteConflicts(Camera camera, CameraEvent incoming)
+        public void ConfigureMode(string mode) => _resolvedMode = mode;
+
+        public void CompleteConflicts(Camera camera, CameraEvent incoming, Vector2 followPosition)
         {
             var overlap = _active & incoming._properties;
-            if ((overlap & Property.PositionX) != 0) camera.transform.position = new Vector3(_targetPosition.x, camera.transform.position.y, -10f);
-            if ((overlap & Property.PositionY) != 0) camera.transform.position = new Vector3(camera.transform.position.x, _targetPosition.y, -10f);
+            var target = WorldPosition(_targetPosition, followPosition);
+            if ((overlap & Property.PositionX) != 0) camera.transform.position = new Vector3(target.x, camera.transform.position.y, -10f);
+            if ((overlap & Property.PositionY) != 0) camera.transform.position = new Vector3(camera.transform.position.x, target.y, -10f);
             if ((overlap & Property.Rotation) != 0) camera.transform.rotation = Quaternion.Euler(0f, 0f, _targetRotation);
             if ((overlap & Property.Zoom) != 0) camera.orthographicSize = _targetSize;
             _active &= ~overlap;
         }
 
-        public void Capture(Camera camera)
+        public void Capture(Camera camera, Vector2 followPosition)
         {
             _active = _properties;
-            _position = camera.transform.position;
+            var cameraPosition = camera.transform.position;
+            _position = IsPlayerMode
+                ? new Vector3(cameraPosition.x - followPosition.x, cameraPosition.y - followPosition.y, -10f)
+                : cameraPosition;
             _rotation = camera.transform.eulerAngles.z;
             _size = camera.orthographicSize;
             var requested = ReadVector2(_data["position"], new Vector2(float.NaN, float.NaN)) * TileSize;
-            if (float.IsNaN(requested.x)) requested.x = 0f;
-            if (float.IsNaN(requested.y)) requested.y = 0f;
-            var relativeTo = _data.Value<string>("relativeTo") ?? "LastPosition";
-            var target = relativeTo switch
+            if (ChangesMode)
             {
+                if (float.IsNaN(requested.x)) requested.x = 0f;
+                if (float.IsNaN(requested.y)) requested.y = 0f;
+            }
+            var target = _resolvedMode switch
+            {
+                "Player" => requested,
                 "Tile" => _floorPosition + requested,
                 "Global" => requested,
-                "Player" => _floorPosition + requested,
                 _ => new Vector2(_position.x, _position.y) + requested,
             };
+            if (float.IsNaN(target.x)) target.x = _position.x;
+            if (float.IsNaN(target.y)) target.y = _position.y;
             _targetPosition = new Vector3(target.x, target.y, -10f);
             _targetRotation = _data.Value<float?>("rotation") ?? _rotation;
-            if (relativeTo == "LastPosition" && !HasValue(_data, "rotation")) _targetRotation = _rotation;
+            if (_resolvedMode == "LastPosition" && !HasValue(_data, "rotation")) _targetRotation = _rotation;
             _targetSize = _data.Value<float?>("zoom") is { } zoom
                 ? DefaultCameraOrthoSize * Math.Max(0.01f, zoom / 100f)
                 : _size;
         }
-        public bool Apply(Camera camera, float time)
+        public bool Apply(Camera camera, float time, Vector2 followPosition)
         {
             var rawAmount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
             var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
             var current = camera.transform.position;
-            if ((_active & Property.PositionX) != 0) current.x = Mathf.LerpUnclamped(_position.x, _targetPosition.x, amount);
-            if ((_active & Property.PositionY) != 0) current.y = Mathf.LerpUnclamped(_position.y, _targetPosition.y, amount);
+            var logical = Vector3.LerpUnclamped(_position, _targetPosition, amount);
+            var world = WorldPosition(logical, followPosition);
+            if ((_active & Property.PositionX) != 0) current.x = world.x;
+            if ((_active & Property.PositionY) != 0) current.y = world.y;
             camera.transform.position = new Vector3(current.x, current.y, -10f);
             if ((_active & Property.Rotation) != 0)
                 camera.transform.rotation = Quaternion.Euler(0f, 0f, Mathf.LerpUnclamped(_rotation, _targetRotation, amount));
@@ -1309,6 +1429,10 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (rawAmount >= 1f) _active = Property.None;
             return rawAmount >= 1f || IsComplete;
         }
+
+        private Vector3 WorldPosition(Vector3 logicalPosition, Vector2 followPosition) => IsPlayerMode
+            ? new Vector3(logicalPosition.x + followPosition.x, logicalPosition.y + followPosition.y, -10f)
+            : new Vector3(logicalPosition.x, logicalPosition.y, -10f);
     }
 
     private sealed class BackgroundEvent

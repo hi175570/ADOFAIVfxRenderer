@@ -20,14 +20,14 @@ The current implementation milestone includes:
 - an independently built Unity worker process with direct RenderTexture capture and raw-frame FFmpeg encoding;
 - offline `AddDecoration`, `MoveDecorations`, `MoveCamera`, `CustomBackground`, and beat/floor `RepeatEvents` support;
 - a shared v13-v19 rhythm timeline for midspins, twirls, three-planet sections, holds, pauses, free-roam spans, BPM changes, and speed-event angle offsets;
-- the full easing families used by the current target chart, per-property tween replacement, tiled images, sprite masks, depth ranges, and Difference/Overlay/SoftLight/LinearDodge blend modes;
+- the full easing families used by the current target chart, per-property tween replacement, player-follow camera motion, tiled images, empty-target alpha-mask behavior, masking depth ranges, and Difference/Overlay/SoftLight/LinearDodge blend modes;
 - automatic non-destructive derived-chart export with `bgVideo`, a calculated signed `vidOffset`, and removal of only the visual elements actually baked into the selected profile;
 - first-floor synchronization: the exporter compares the game's video trigger time with the actual first playable floor, so normal intros produce `0 ms` while unusual first angles or floor-zero speed events can correctly produce positive or negative offsets;
 - selectable render content (background/foreground decorations, track, planets, and effects) with UI always excluded;
 - quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.
 
-The worker is intentionally not described as pixel-accurate for every chart yet. Image decorations used by the current target chart have verified timeline, masking, blending, repeat, camera, and tween adapters. Text, particle, and object decorations remain live in the derived chart instead of being silently dropped; target-tag alpha masks, exact legacy camera edge cases, track/planet rendering, and filters still need verified offline adapters. Video VFX and depth-split Video VFX Pro are enabled end to end; Video and Video Pro remain disabled until their offline filter path is verified.
+The worker is intentionally not described as pixel-accurate for every chart yet. Image decorations used by the current target chart have verified timeline, tiling, empty-target masking, blending, repeat, player-follow camera, and tween adapters. Text, particle, and object decorations remain live in the derived chart instead of being silently dropped; non-empty target-tag alpha masks, exact legacy camera edge cases, track/planet rendering, and filters still need verified offline adapters. Video VFX and depth-split Video VFX Pro are enabled end to end; Video and Video Pro remain disabled until their offline filter path is verified.
 
 ## Build and test
 
