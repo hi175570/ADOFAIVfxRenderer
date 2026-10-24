@@ -152,7 +152,7 @@ public partial class MainWindow : Window
                 Content = resolution.Name,
                 Tag = resolution,
                 ToolTip = $"{resolution.Width} × {resolution.Height}",
-                IsChecked = resolution == VideoPresets.P1080,
+                IsChecked = resolution == VideoPresets.P720,
             };
             check.Checked += SelectionChanged;
             check.Unchecked += SelectionChanged;
@@ -166,7 +166,7 @@ public partial class MainWindow : Window
             {
                 Content = frameRate.ToString(CultureInfo.InvariantCulture),
                 Tag = frameRate,
-                IsChecked = frameRate == 60,
+                IsChecked = frameRate == 30,
             };
             check.Checked += FrameRateSelectionChanged;
             check.Unchecked += FrameRateSelectionChanged;
