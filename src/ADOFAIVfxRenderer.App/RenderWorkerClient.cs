@@ -16,6 +16,7 @@ internal sealed class RenderWorkerClient : IDisposable
     private string? _activeChartPath;
     private OutputProfile _activeProfile;
     private decimal _activeRenderStartSeconds;
+    private IReadOnlySet<int> _activeRetainedDecorationIndices = new HashSet<int>();
     private bool _derivedExportAttempted;
 
     public RenderWorkerClient()
@@ -41,7 +42,9 @@ internal sealed class RenderWorkerClient : IDisposable
         ChartMetadata chart,
         RenderVariant variant,
         TailExtension tail,
-        decimal? durationLimitSeconds = null)
+        decimal? durationLimitSeconds = null,
+        IReadOnlySet<int>? retainedDecorationIndices = null,
+        RenderBackend renderBackend = RenderBackend.Automatic)
     {
         if (!installation.CanRender || installation.RootDirectory is null)
         {
@@ -67,6 +70,8 @@ internal sealed class RenderWorkerClient : IDisposable
         }
 
         ValidateStandaloneWorker(workerExecutable, installation.RootDirectory);
+        var ffmpegPath = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe");
+        var resolvedBackend = ResolveBackend(renderBackend, ffmpegPath);
 
         var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
         var renderStartSeconds = DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
@@ -97,10 +102,13 @@ internal sealed class RenderWorkerClient : IDisposable
             IncludeEffects = variant.Content.HasFlag(RenderContent.Effects),
             IncludeBackgroundDecorations = variant.Content.HasFlag(RenderContent.BackgroundDecorations),
             IncludeForegroundDecorations = variant.Content.HasFlag(RenderContent.ForegroundDecorations),
+            RetainedDecorationIndices = retainedDecorationIndices?.OrderBy(static index => index).ToArray() ?? [],
             BitrateKbps = variant.BitrateKbps,
             DurationLimitSeconds = durationLimitSeconds.HasValue ? (float)durationLimitSeconds.Value : 0f,
             RenderStartSeconds = (float)renderStartSeconds,
-            FfmpegPath = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe"),
+            FfmpegPath = ffmpegPath,
+            VideoEncoder = resolvedBackend.VideoEncoder,
+            EncoderPreset = resolvedBackend.EncoderPreset,
         };
         var jobPath = Path.Combine(outputDirectory, "render-job.json");
         File.WriteAllText(jobPath, JsonSerializer.Serialize(job, JsonOptions));
@@ -108,6 +116,9 @@ internal sealed class RenderWorkerClient : IDisposable
         _activeChartPath = chart.Path;
         _activeProfile = variant.Profile;
         _activeRenderStartSeconds = renderStartSeconds;
+        _activeRetainedDecorationIndices = retainedDecorationIndices is null
+            ? new HashSet<int>()
+            : new HashSet<int>(retainedDecorationIndices);
         _derivedExportAttempted = false;
 
         var workerLogPath = Path.Combine(outputDirectory, "worker.log");
@@ -121,14 +132,14 @@ internal sealed class RenderWorkerClient : IDisposable
             // Unity's normal player mode can create a visible top-level window even when
             // ProcessWindowStyle.Hidden is requested. Batch mode keeps the render device
             // available (unlike -nographics) without opening a second game-like window.
-            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\" -screen-fullscreen 0 -screen-width {variant.Resolution.Width} -screen-height {variant.Resolution.Height}",
+            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\" -screen-fullscreen 0 -screen-width {variant.Resolution.Width} -screen-height {variant.Resolution.Height} {resolvedBackend.UnityArguments}",
         };
         _workerProcess = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动独立 Unity Worker。");
         _timer.Start();
         StatusChanged?.Invoke(new WorkerStatus
         {
             State = "starting",
-            Message = "正在启动独立 Unity Worker（不会启动游戏）……",
+            Message = $"正在启动独立 Unity Worker（{resolvedBackend.Description}；不会启动游戏）……",
             OutputPath = outputPath,
         });
         return outputPath;
@@ -179,15 +190,19 @@ internal sealed class RenderWorkerClient : IDisposable
                             _derivedExportAttempted = true;
                             try
                             {
+                                var retainedDecorationIndices = new HashSet<int>(_activeRetainedDecorationIndices);
+                                retainedDecorationIndices.UnionWith(status.UnbakedDecorationIndices);
                                 var derived = DerivedChartExporter.Export(
                                     _activeChartPath ?? throw new InvalidOperationException("缺少活动谱面路径。"),
                                     status.OutputPath,
                                     _activeProfile,
-                                    _activeRenderStartSeconds);
+                                    _activeRenderStartSeconds,
+                                    retainedDecorationIndices);
                                 status.DerivedChartPath = derived.ChartPath;
                                 status.VideoOffsetMilliseconds = derived.VideoOffsetMilliseconds;
                                 status.Message =
-                                    $"视频与派生谱面已完成；视频偏移 {derived.VideoOffsetMilliseconds} ms。";
+                                    $"视频与派生谱面已完成；视频偏移 {derived.VideoOffsetMilliseconds} ms；" +
+                                    $"自动保留 {status.UnbakedDecorationIndices.Length} 个未成功烘焙的装饰。";
                             }
                             catch (Exception exception) when (exception is IOException or JsonException or InvalidDataException)
                             {
@@ -229,7 +244,7 @@ internal sealed class RenderWorkerClient : IDisposable
         WriteIndented = true,
     };
 
-    private static string? FindStandaloneWorker()
+    internal static string? FindStandaloneWorker()
     {
         var packaged = Path.Combine(AppContext.BaseDirectory, "UnityWorker", "ADOFAI VFX Worker.exe");
         if (File.Exists(packaged))
@@ -244,7 +259,7 @@ internal sealed class RenderWorkerClient : IDisposable
         return File.Exists(development) ? development : null;
     }
 
-    private static void ValidateStandaloneWorker(string workerExecutable, string gameRootDirectory)
+    internal static void ValidateStandaloneWorker(string workerExecutable, string gameRootDirectory)
     {
         var workerPath = Path.GetFullPath(workerExecutable);
         var gameRoot = Path.GetFullPath(gameRootDirectory)
@@ -273,6 +288,68 @@ internal sealed class RenderWorkerClient : IDisposable
         {
             throw new InvalidOperationException(
                 "拒绝启动：目标 Player 含有游戏 Assembly-CSharp.dll；正式渲染器绝不会运行游戏 Player。");
+        }
+    }
+
+    private static ResolvedRenderBackend ResolveBackend(RenderBackend backend, string ffmpegPath)
+    {
+        if (!File.Exists(ffmpegPath)) throw new FileNotFoundException("游戏目录内缺少 FFmpeg。", ffmpegPath);
+        return backend switch
+        {
+            RenderBackend.Automatic => new ResolvedRenderBackend(
+                backend, "libopenh264", "", "-force-d3d11", "GPU 光栅 + CPU H.264 编码"),
+            RenderBackend.CpuCompatibility => new ResolvedRenderBackend(
+                backend, "libopenh264", "", "-force-d3d11 -force-driver-type-warp", "CPU WARP 光栅 + CPU H.264 编码"),
+            RenderBackend.HardwareGpu => ResolveFirstHardwareEncoder(ffmpegPath),
+            RenderBackend.NvidiaRtx when CanEncode(ffmpegPath, "h264_nvenc") => new ResolvedRenderBackend(
+                backend, "h264_nvenc", "p7", "-force-d3d11", "GPU 光栅 + NVIDIA NVENC p7 编码"),
+            RenderBackend.NvidiaRtx => throw new InvalidOperationException(
+                "当前机器或 FFmpeg 无法实际启动 NVIDIA NVENC；RTX 模式没有静默回退。请选择自动、CPU 或普通 GPU。"),
+            _ => throw new ArgumentOutOfRangeException(nameof(backend)),
+        };
+    }
+
+    private static ResolvedRenderBackend ResolveFirstHardwareEncoder(string ffmpegPath)
+    {
+        foreach (var encoder in new[] { "h264_nvenc", "h264_qsv", "h264_amf" })
+        {
+            if (!CanEncode(ffmpegPath, encoder)) continue;
+            return new ResolvedRenderBackend(
+                RenderBackend.HardwareGpu,
+                encoder,
+                encoder == "h264_nvenc" ? "p4" : "",
+                "-force-d3d11",
+                $"GPU 光栅 + {encoder} 硬件编码");
+        }
+        throw new InvalidOperationException(
+            "没有找到可实际编码一帧的 H.264 硬件编码器；普通 GPU 模式没有静默回退。请选择自动或 CPU。 ");
+    }
+
+    private static bool CanEncode(string ffmpegPath, string encoder)
+    {
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = ffmpegPath,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                Arguments = $"-hide_banner -loglevel error -f lavfi -i color=c=black:s=64x64:r=1 -frames:v 1 -an -c:v {encoder} -f null NUL",
+            });
+            if (process is null) return false;
+            if (!process.WaitForExit(8000))
+            {
+                process.Kill(entireProcessTree: true);
+                return false;
+            }
+            return process.ExitCode == 0;
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            return false;
         }
     }
 }
@@ -324,6 +401,9 @@ internal sealed class WorkerJob
     [JsonPropertyName("includeForegroundDecorations")]
     public bool IncludeForegroundDecorations { get; init; }
 
+    [JsonPropertyName("retainedDecorationIndices")]
+    public int[] RetainedDecorationIndices { get; init; } = [];
+
     [JsonPropertyName("bitrateKbps")]
     public int BitrateKbps { get; init; }
 
@@ -335,6 +415,12 @@ internal sealed class WorkerJob
 
     [JsonPropertyName("ffmpegPath")]
     public string FfmpegPath { get; init; } = "";
+
+    [JsonPropertyName("videoEncoder")]
+    public string VideoEncoder { get; init; } = "libopenh264";
+
+    [JsonPropertyName("encoderPreset")]
+    public string EncoderPreset { get; init; } = "";
 }
 
 internal sealed class WorkerStatus
@@ -356,6 +442,9 @@ internal sealed class WorkerStatus
 
     [JsonPropertyName("error")]
     public string Error { get; set; } = "";
+
+    [JsonPropertyName("unbakedDecorationIndices")]
+    public int[] UnbakedDecorationIndices { get; init; } = [];
 
     public string DerivedChartPath { get; set; } = "";
 

@@ -7,6 +7,10 @@
         MinWidth="980"
         MinHeight="680"
         WindowStartupLocation="CenterScreen">
+    <TabControl x:Name="MainTabs"
+                Background="{StaticResource WindowBackground}"
+                BorderThickness="0">
+        <TabItem Header="渲染">
     <Grid Margin="20" Background="{StaticResource WindowBackground}">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="430" />
@@ -77,9 +81,18 @@
                         <WrapPanel x:Name="ContentChecksPanel" Margin="0,9,0,0">
                             <CheckBox x:Name="BackgroundDecorationsCheckBox" Content="背景装饰" />
                             <CheckBox x:Name="ForegroundDecorationsCheckBox" Content="前景装饰" />
-                            <CheckBox x:Name="TrackCheckBox" Content="轨道" />
-                            <CheckBox x:Name="PlanetsCheckBox" Content="星球" />
-                            <CheckBox x:Name="EffectsCheckBox" Content="特效/滤镜" />
+                            <CheckBox x:Name="TrackCheckBox"
+                                      IsEnabled="False"
+                                      ToolTip="原版轨道离线适配完成后开放。"
+                                      Content="轨道（待适配）" />
+                            <CheckBox x:Name="PlanetsCheckBox"
+                                      IsEnabled="False"
+                                      ToolTip="原版星球离线适配完成后开放。"
+                                      Content="星球（待适配）" />
+                            <CheckBox x:Name="EffectsCheckBox"
+                                      IsEnabled="False"
+                                      ToolTip="原版滤镜程序集适配完成后开放。"
+                                      Content="特效/滤镜（待适配）" />
                         </WrapPanel>
                         <TextBlock Margin="0,8,0,0"
                                    Foreground="{StaticResource TextSecondary}"
@@ -127,6 +140,13 @@
                     <StackPanel>
                         <TextBlock Text="分辨率策略" />
                         <ComboBox x:Name="ResolutionStrategyBox" Margin="0,6,0,10" />
+                        <TextBlock Text="计算 / 编码后端" />
+                        <ComboBox x:Name="RenderBackendBox" Margin="0,6,0,6" />
+                        <TextBlock x:Name="RenderBackendHelpText"
+                                   Margin="0,0,0,10"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   TextWrapping="Wrap"
+                                   Text="自动选择稳定路径。CPU 模式使用 WARP 软件光栅；GPU/RTX 模式使用硬件编码。" />
                         <TextBlock Text="视频质量" />
                         <ComboBox x:Name="QualityBox"
                                   Margin="0,6,0,10"
@@ -152,10 +172,7 @@
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <Button x:Name="StartRenderButton"
-                            Padding="18,11"
-                            FontWeight="SemiBold"
-                            Background="#5BCB82"
-                            Foreground="#07110A"
+                            Style="{StaticResource RenderActionButtonStyle}"
                             Click="StartRender_Click"
                             Content="开始离线渲染（首测 Video VFX）" />
                     <Button x:Name="CancelRenderButton"
@@ -258,4 +275,293 @@
             </Grid>
         </Grid>
     </Grid>
+        </TabItem>
+        <TabItem Header="Video VFX 贴图保留">
+            <Grid Margin="20" Background="{StaticResource WindowBackground}">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="14" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="220" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Margin="0,0,10,0" Text="名单模式" />
+                    <ComboBox x:Name="RetentionModeBox"
+                              Grid.Column="1"
+                              SelectionChanged="RetentionModeBox_SelectionChanged" />
+                    <CheckBox x:Name="HideBackgroundDecorationsCheckBox"
+                              Grid.Column="2"
+                              Margin="22,0,0,0"
+                              VerticalAlignment="Center"
+                              IsChecked="True"
+                              Checked="RetentionFilter_Changed"
+                              Unchecked="RetentionFilter_Changed"
+                              Content="隐藏深度 &gt; 0 的背景装饰" />
+                    <TextBlock x:Name="RetentionExplanationText"
+                               Grid.Column="3"
+                               Margin="18,0,0,0"
+                               Foreground="{StaticResource TextSecondary}"
+                               TextWrapping="Wrap" />
+                    <TextBlock x:Name="RetentionCountText"
+                               Grid.Column="4"
+                               Margin="18,0,0,0"
+                               Foreground="{StaticResource TextSecondary}"
+                               Text="尚未载入谱面" />
+                </Grid>
+
+                <Grid Grid.Row="2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="520" MinWidth="390" />
+                        <ColumnDefinition Width="14" />
+                        <ColumnDefinition Width="*" MinWidth="360" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border Background="{StaticResource PanelBackground}"
+                            BorderBrush="{StaticResource PanelBorder}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                        <ListView x:Name="DecorationRetentionList"
+                                  BorderThickness="0"
+                                  SelectionChanged="DecorationRetentionList_SelectionChanged"
+                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                  VirtualizingPanel.IsVirtualizing="True"
+                                  VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="4">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="76" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <CheckBox Margin="4,0,10,0"
+                                                  VerticalAlignment="Center"
+                                                  IsChecked="{Binding IsListed, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                  Checked="RetentionItem_Checked"
+                                                  Unchecked="RetentionItem_Checked" />
+                                        <Border Grid.Column="1"
+                                                Width="68"
+                                                Height="48"
+                                                Background="{StaticResource TransparencyGrid}"
+                                                BorderBrush="{StaticResource PanelBorder}"
+                                                BorderThickness="1"
+                                                CornerRadius="3">
+                                            <Image Source="{Binding Thumbnail}"
+                                                   Stretch="Uniform"
+                                                   RenderOptions.BitmapScalingMode="HighQuality" />
+                                        </Border>
+                                        <StackPanel Grid.Column="2" Margin="10,0,0,0">
+                                            <TextBlock FontWeight="SemiBold"
+                                                       Text="{Binding DisplayName}"
+                                                       TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Margin="0,3,0,0"
+                                                       Foreground="{StaticResource TextSecondary}"
+                                                       Text="{Binding Detail}"
+                                                       TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Margin="0,2,0,0"
+                                                       Foreground="{StaticResource TextSecondary}"
+                                                       Text="{Binding TagText}"
+                                                       TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                    </Grid>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </Border>
+
+                    <Border Grid.Column="2"
+                            Background="{StaticResource PanelBackground}"
+                            BorderBrush="{StaticResource PanelBorder}"
+                            BorderThickness="1"
+                            CornerRadius="8">
+                        <Grid Margin="14">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="230" />
+                            </Grid.RowDefinitions>
+                            <Border Background="{StaticResource TransparencyGrid}"
+                                    BorderBrush="{StaticResource PanelBorder}"
+                                    BorderThickness="1"
+                                    CornerRadius="5"
+                                    ClipToBounds="True">
+                                <Grid>
+                                    <Image x:Name="DecorationLargePreview"
+                                           Stretch="Uniform"
+                                           RenderOptions.BitmapScalingMode="HighQuality" />
+                                    <Grid x:Name="DiagnosticComparisonPanel"
+                                          Background="{StaticResource PanelBackground}"
+                                          Visibility="Collapsed">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="10" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid Grid.Column="0">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="*" />
+                                            </Grid.RowDefinitions>
+                                            <TextBlock Margin="0,0,0,6"
+                                                       HorizontalAlignment="Center"
+                                                       FontWeight="SemiBold"
+                                                       Text="包含此贴图" />
+                                            <Border Grid.Row="1" Background="{StaticResource TransparencyGrid}">
+                                                <Image x:Name="DiagnosticWithImage" Stretch="Uniform" />
+                                            </Border>
+                                        </Grid>
+                                        <Grid Grid.Column="2">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="*" />
+                                            </Grid.RowDefinitions>
+                                            <TextBlock Margin="0,0,0,6"
+                                                       HorizontalAlignment="Center"
+                                                       FontWeight="SemiBold"
+                                                       Text="不包含此贴图" />
+                                            <Border Grid.Row="1" Background="{StaticResource TransparencyGrid}">
+                                                <Image x:Name="DiagnosticWithoutImage" Stretch="Uniform" />
+                                            </Border>
+                                        </Grid>
+                                    </Grid>
+                                </Grid>
+                            </Border>
+                            <StackPanel Grid.Row="1" Margin="0,12,0,0">
+                                <TextBlock x:Name="DecorationPreviewTitle"
+                                           FontSize="18"
+                                           FontWeight="SemiBold"
+                                           Text="从左侧选择一张贴图" />
+                                <TextBlock x:Name="DecorationPreviewDetails"
+                                           Margin="0,5,0,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           TextWrapping="Wrap"
+                                           Text="棋盘格可以同时看清透明、白色、灰色和黑色内容。" />
+                            </StackPanel>
+                            <Grid Grid.Row="2" Margin="0,10,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Button x:Name="GenerateDecorationComparisonButton"
+                                        Style="{StaticResource RenderActionButtonStyle}"
+                                        Padding="14,7"
+                                        Click="GenerateDecorationComparison_Click"
+                                        Content="生成 10 个有/无贴图对照" />
+                                <StackPanel Grid.Column="1"
+                                            Margin="12,0,0,0"
+                                            VerticalAlignment="Center"
+                                            Orientation="Horizontal">
+                                    <CheckBox x:Name="DiagnosticTrackCheckBox"
+                                              IsEnabled="False"
+                                              ToolTip="独立 Worker 的原版轨道适配完成后开放；当前不会伪装成已生效。"
+                                              Content="轨道（待适配）" />
+                                    <CheckBox x:Name="DiagnosticPlanetsCheckBox"
+                                              IsEnabled="False"
+                                              ToolTip="独立 Worker 的原版星球适配完成后开放；当前不会伪装成已生效。"
+                                              Content="星球（待适配）" />
+                                    <CheckBox x:Name="DiagnosticEffectsCheckBox"
+                                              IsEnabled="False"
+                                              ToolTip="原版滤镜程序集适配完成后开放；当前不会启动游戏或伪装成已生效。"
+                                              Content="滤镜（待适配）" />
+                                </StackPanel>
+                                <TextBlock x:Name="DecorationDiagnosticStatusText"
+                                           Grid.Column="2"
+                                           Margin="12,0,0,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           TextWrapping="Wrap"
+                                           Text="选择装饰后可从调用时刻 +1 ms 开始，每隔 1 秒生成一对。" />
+                            </Grid>
+                            <ListBox x:Name="DecorationComparisonList"
+                                     Grid.Row="3"
+                                     BorderThickness="0"
+                                     Background="{StaticResource InputBackground}"
+                                     SelectionChanged="DecorationComparisonList_SelectionChanged"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                     ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                                <ListBox.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <VirtualizingStackPanel Orientation="Horizontal" />
+                                    </ItemsPanelTemplate>
+                                </ListBox.ItemsPanel>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Width="190" Margin="5">
+                                            <TextBlock HorizontalAlignment="Center"
+                                                       FontWeight="SemiBold"
+                                                       Text="{Binding TimestampLabel}" />
+                                            <Grid Height="86" Margin="0,5,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="4" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <Border Background="{StaticResource TransparencyGrid}">
+                                                    <Image Source="{Binding WithImage}" Stretch="Uniform" />
+                                                </Border>
+                                                <Border Grid.Column="2" Background="{StaticResource TransparencyGrid}">
+                                                    <Image Source="{Binding WithoutImage}" Stretch="Uniform" />
+                                                </Border>
+                                            </Grid>
+                                            <Grid Margin="0,3,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock HorizontalAlignment="Center" FontSize="12" Text="包含此贴图" />
+                                                <TextBlock Grid.Column="1" HorizontalAlignment="Center" FontSize="12" Text="不包含此贴图" />
+                                            </Grid>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </Grid>
+        </TabItem>
+        <TabItem Header="设置">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel Margin="20">
+                    <TextBlock FontSize="24"
+                               FontWeight="SemiBold"
+                               Text="设置" />
+                    <TextBlock Margin="0,5,0,18"
+                               Foreground="{StaticResource TextSecondary}"
+                               Text="后续功能设置会继续放在这个独立页面。" />
+                    <GroupBox Header="预渲染缓存">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Text="装饰有/无对照图" />
+                                <TextBlock Margin="0,5,20,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           TextWrapping="Wrap"
+                                           Text="删除本工具生成的诊断 JPG 与临时对照视频；不会删除正式输出、派生谱面、源谱或素材。" />
+                                <TextBlock x:Name="PreRenderCacheStatusText"
+                                           Margin="0,8,20,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           Text="尚未检查。" />
+                            </StackPanel>
+                            <Button Grid.Column="1"
+                                    Padding="16,9"
+                                    VerticalAlignment="Center"
+                                    Click="DeletePreRenderedImages_Click"
+                                    Content="删除所有预渲染图" />
+                        </Grid>
+                    </GroupBox>
+                </StackPanel>
+            </ScrollViewer>
+        </TabItem>
+    </TabControl>
 </Window>

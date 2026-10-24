@@ -1,9 +1,13 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using ADOFAIVfxRenderer.Core;
 using Microsoft.Win32;
@@ -16,6 +20,9 @@ public partial class MainWindow : Window
     private readonly List<CheckBox> _resolutionChecks = [];
     private readonly List<CheckBox> _frameRateChecks = [];
     private readonly RenderWorkerClient _worker = new();
+    private readonly AppSettings _settings = AppSettingsStore.Load();
+    private readonly ObservableCollection<DecorationRetentionItem> _decorationChoices = [];
+    private ICollectionView? _decorationChoicesView;
     private GameInstallation? _installation;
     private ChartMetadata? _chart;
     private bool _updatingTail;
@@ -29,6 +36,8 @@ public partial class MainWindow : Window
     private TailExtension _batchTail = TailExtension.Zero;
     private int _batchTotal;
     private int _batchCompleted;
+    private IReadOnlySet<int> _batchRetainedDecorationIndices = new HashSet<int>();
+    private RenderBackend _batchRenderBackend = RenderBackend.Automatic;
 
     public MainWindow()
     {
@@ -38,6 +47,8 @@ public partial class MainWindow : Window
         _viewReady = true;
         PopulateOptions();
         PopulateDetectedGames();
+        RestoreRememberedPaths();
+        RefreshPreRenderCacheStatus();
         RecalculateTailFrames();
         Loaded += ApplyCommandLineSmokeTest;
     }
@@ -58,9 +69,7 @@ public partial class MainWindow : Window
             GamePathBox.Text = gamePath;
             InspectGame();
 
-            ChartPathBox.Text = chartPath;
-            _chart = ChartMetadataReader.Read(chartPath);
-            UpdateChartCompatibilityText();
+            LoadChart(chartPath);
 
             var fps = int.TryParse(GetArgumentValue(arguments, "--fps"), out var parsedFps) ? parsedFps : 15;
             var resolutionName = GetArgumentValue(arguments, "--resolution") ?? "144p";
@@ -97,7 +106,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exception) when (exception is IOException or InvalidDataException or InvalidOperationException)
         {
-            MessageBox.Show(this, exception.Message, "冒烟测试无法启动", MessageBoxButton.OK, MessageBoxImage.Error);
+            DarkDialog.Show(this, exception.Message, "冒烟测试无法启动");
         }
     }
 
@@ -188,6 +197,15 @@ public partial class MainWindow : Window
         };
         ResolutionStrategyBox.SelectedIndex = 0;
 
+        RenderBackendBox.ItemsSource = new[]
+        {
+            new Choice<RenderBackend>("自动（GPU 画面 + CPU 编码，推荐）", RenderBackend.Automatic),
+            new Choice<RenderBackend>("CPU 兼容（WARP 软件光栅 + CPU 编码）", RenderBackend.CpuCompatibility),
+            new Choice<RenderBackend>("普通 GPU（自动硬件 H.264 编码）", RenderBackend.HardwareGpu),
+            new Choice<RenderBackend>("NVIDIA / RTX（NVENC 高质量）", RenderBackend.NvidiaRtx),
+        };
+        RenderBackendBox.SelectedIndex = 0;
+
         QualityBox.ItemsSource = new[]
         {
             new Choice<VideoQualityPreset>("平衡（推荐）", VideoQualityPreset.Balanced),
@@ -196,7 +214,27 @@ public partial class MainWindow : Window
             new Choice<VideoQualityPreset>("自定义", VideoQualityPreset.Custom),
         };
         QualityBox.SelectedIndex = 0;
+        RetentionModeBox.ItemsSource = new[]
+        {
+            new Choice<DecorationRetentionMode>("白名单：勾选要保留的贴图", DecorationRetentionMode.Whitelist),
+            new Choice<DecorationRetentionMode>("黑名单：勾选不要保留的贴图", DecorationRetentionMode.Blacklist),
+        };
+        RetentionModeBox.SelectedIndex = 0;
         RefreshContentChoices();
+    }
+
+    private void RestoreRememberedPaths()
+    {
+        if (Directory.Exists(_settings.GameDirectory))
+        {
+            GamePathBox.Text = _settings.GameDirectory;
+            InspectGame();
+        }
+
+        if (File.Exists(_settings.LastChartPath))
+        {
+            LoadChart(_settings.LastChartPath);
+        }
     }
 
     private void PopulateDetectedGames()
@@ -213,6 +251,7 @@ public partial class MainWindow : Window
         {
             Title = "选择包含 A Dance of Fire and Ice.exe 的目录",
             Multiselect = false,
+            InitialDirectory = Directory.Exists(GamePathBox.Text) ? GamePathBox.Text : null,
         };
 
         if (dialog.ShowDialog(this) == true)
@@ -245,6 +284,10 @@ public partial class MainWindow : Window
                 $"⚠ 找到完整游戏，但该程序集版本尚无已验证适配器。\nUnity {_installation.UnityVersion}",
             _ => "✗ " + string.Join("\n", _installation.Problems),
         };
+        if (_installation.CanRender && _installation.RootDirectory is not null)
+        {
+            SaveRememberedPaths(gameDirectory: _installation.RootDirectory);
+        }
         UpdateChartCompatibilityText();
     }
 
@@ -255,6 +298,7 @@ public partial class MainWindow : Window
             Title = "选择 ADOFAI 谱面",
             Filter = "ADOFAI 谱面 (*.adofai)|*.adofai|所有文件 (*.*)|*.*",
             CheckFileExists = true,
+            InitialDirectory = GetRememberedChartDirectory(),
         };
 
         if (dialog.ShowDialog(this) != true)
@@ -262,17 +306,42 @@ public partial class MainWindow : Window
             return;
         }
 
-        ChartPathBox.Text = dialog.FileName;
         try
         {
-            _chart = ChartMetadataReader.Read(dialog.FileName);
-            UpdateChartCompatibilityText();
+            LoadChart(dialog.FileName);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
         {
             _chart = null;
             ChartStatusText.Text = $"✗ {exception.Message}";
         }
+    }
+
+    private string? GetRememberedChartDirectory()
+    {
+        if (Directory.Exists(_settings.LastChartDirectory)) return _settings.LastChartDirectory;
+        if (File.Exists(_settings.LastChartPath)) return Path.GetDirectoryName(_settings.LastChartPath);
+        return null;
+    }
+
+    private void LoadChart(string path)
+    {
+        path = Path.GetFullPath(path);
+        ChartPathBox.Text = path;
+        _chart = ChartMetadataReader.Read(path);
+        LoadDecorationCatalog(path);
+        SaveRememberedPaths(chartPath: path);
+        UpdateChartCompatibilityText();
+    }
+
+    private void SaveRememberedPaths(string? gameDirectory = null, string? chartPath = null)
+    {
+        var effectiveGame = gameDirectory ?? (_installation?.CanRender == true ? _installation.RootDirectory : _settings.GameDirectory) ?? "";
+        var effectiveChart = chartPath ?? (_chart?.Path ?? _settings.LastChartPath);
+        var chartDirectory = string.IsNullOrWhiteSpace(effectiveChart)
+            ? _settings.LastChartDirectory
+            : Path.GetDirectoryName(effectiveChart) ?? "";
+        AppSettingsStore.Save(new AppSettings(effectiveGame, effectiveChart, chartDirectory));
     }
 
     private void UpdateChartCompatibilityText()
@@ -293,6 +362,165 @@ public partial class MainWindow : Window
         ChartStatusText.Text = problem is null
             ? $"✓ 谱面格式版本 {_chart.Version}，所选游戏可读取。"
             : $"✗ {problem}";
+    }
+
+    private void LoadDecorationCatalog(string chartPath)
+    {
+        _decorationChoices.Clear();
+        foreach (var item in DecorationCatalogReader.Read(chartPath))
+        {
+            _decorationChoices.Add(new DecorationRetentionItem(item));
+        }
+
+        _decorationChoicesView = CollectionViewSource.GetDefaultView(_decorationChoices);
+        _decorationChoicesView.Filter = item => item is DecorationRetentionItem choice &&
+            (HideBackgroundDecorationsCheckBox.IsChecked != true || choice.Item.Depth <= 0);
+        DecorationRetentionList.ItemsSource = _decorationChoicesView;
+        DecorationComparisonList.ItemsSource = null;
+        DiagnosticComparisonPanel.Visibility = Visibility.Collapsed;
+        DecorationLargePreview.Source = null;
+        DecorationPreviewTitle.Text = "从左侧选择一张贴图";
+        DecorationPreviewDetails.Text = "棋盘格可以同时看清透明、白色、灰色和黑色内容。";
+        RefreshRetentionSummary();
+    }
+
+    private void RetentionModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_viewReady) return;
+        RefreshRetentionSummary();
+    }
+
+    private void RetentionFilter_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_viewReady) return;
+        _decorationChoicesView?.Refresh();
+    }
+
+    private void RetentionItem_Checked(object sender, RoutedEventArgs e)
+    {
+        if (!_viewReady) return;
+        RefreshRetentionSummary();
+    }
+
+    private DecorationRetentionMode CurrentRetentionMode =>
+        RetentionModeBox.SelectedItem is Choice<DecorationRetentionMode> choice
+            ? choice.Value
+            : DecorationRetentionMode.Whitelist;
+
+    private IReadOnlySet<int> GetRetainedDecorationIndices()
+    {
+        IEnumerable<DecorationRetentionItem> retained = CurrentRetentionMode == DecorationRetentionMode.Whitelist
+            ? _decorationChoices.Where(static item => item.IsListed)
+            : _decorationChoices.Where(static item => !item.IsListed);
+        return retained.Select(static item => item.Item.Index).ToHashSet();
+    }
+
+    private void RefreshRetentionSummary()
+    {
+        if (RetentionExplanationText is null || RetentionCountText is null) return;
+        var retainedCount = GetRetainedDecorationIndices().Count;
+        RetentionExplanationText.Text = CurrentRetentionMode == DecorationRetentionMode.Whitelist
+            ? "勾选的贴图不烘焙进 Video VFX，而是在派生谱面中继续实时显示。"
+            : "勾选的贴图仍烘焙进视频；未勾选的贴图留在派生谱面中实时显示。";
+        RetentionCountText.Text = _chart is null
+            ? "尚未载入谱面"
+            : $"实时保留 {retainedCount:N0} / {_decorationChoices.Count:N0} 个";
+    }
+
+    private void DecorationRetentionList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (DecorationRetentionList.SelectedItem is not DecorationRetentionItem selected) return;
+        DiagnosticComparisonPanel.Visibility = Visibility.Collapsed;
+        DecorationLargePreview.Source = selected.FullImage;
+        DecorationPreviewTitle.Text = selected.DisplayName;
+        DecorationPreviewDetails.Text = selected.FullDetail;
+        DecorationDiagnosticStatusText.Text =
+            "可从首次调用时刻 +1 ms 开始，每隔 1 秒生成一对，共 20 张；当前只对照离线装饰层。";
+    }
+
+    private async void GenerateDecorationComparison_Click(object sender, RoutedEventArgs e)
+    {
+        if (_installation is null || !_installation.CanRender || _chart is null ||
+            DecorationRetentionList.SelectedItem is not DecorationRetentionItem selected)
+        {
+            DarkDialog.Show(this, "请先选择有效游戏、谱面和一张装饰贴图。", "无法生成对照");
+            return;
+        }
+
+        GenerateDecorationComparisonButton.IsEnabled = false;
+        DecorationComparisonList.ItemsSource = null;
+        DiagnosticComparisonPanel.Visibility = Visibility.Collapsed;
+        try
+        {
+            var progress = new Progress<string>(message => DecorationDiagnosticStatusText.Text = message);
+            var files = await DecorationDiagnosticClient.GenerateAsync(
+                _installation,
+                _chart,
+                selected.Item,
+                DiagnosticTrackCheckBox.IsChecked == true,
+                DiagnosticPlanetsCheckBox.IsChecked == true,
+                DiagnosticEffectsCheckBox.IsChecked == true,
+                progress);
+            var pairs = files.Select(static pair => new DecorationComparisonViewItem(pair)).ToArray();
+            DecorationComparisonList.ItemsSource = pairs;
+            DecorationComparisonList.SelectedIndex = pairs.Length > 0 ? 0 : -1;
+            DecorationDiagnosticStatusText.Text = $"完成：{pairs.Length} 组同一时间点对照，共 {pairs.Length * 2} 张。";
+            RefreshPreRenderCacheStatus();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            DecorationDiagnosticStatusText.Text = "生成失败：" + exception.Message;
+            DarkDialog.Show(this, exception.Message, "装饰对照生成失败");
+        }
+        finally
+        {
+            GenerateDecorationComparisonButton.IsEnabled = true;
+        }
+    }
+
+    private void DecorationComparisonList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (DecorationComparisonList.SelectedItem is not DecorationComparisonViewItem selected) return;
+        DiagnosticWithImage.Source = selected.WithImage;
+        DiagnosticWithoutImage.Source = selected.WithoutImage;
+        DiagnosticComparisonPanel.Visibility = Visibility.Visible;
+        DecorationPreviewTitle.Text = selected.TimestampLabel;
+        DecorationPreviewDetails.Text = "左：包含此贴图；右：不包含此贴图。两张来自完全相同的谱面时间点。";
+    }
+
+    private void RefreshPreRenderCacheStatus()
+    {
+        if (PreRenderCacheStatusText is null) return;
+        var roots = PreRenderCacheRegistry.Load().Where(Directory.Exists).ToArray();
+        var fileCount = roots.Sum(root => Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).Count());
+        PreRenderCacheStatusText.Text = roots.Length == 0
+            ? "当前没有已登记的预渲染缓存。"
+            : $"已登记 {roots.Length:N0} 组缓存，共 {fileCount:N0} 个文件。";
+    }
+
+    private void DeletePreRenderedImages_Click(object sender, RoutedEventArgs e)
+    {
+        var roots = PreRenderCacheRegistry.Load()
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var deleted = 0;
+        foreach (var root in roots)
+        {
+            var parent = Directory.GetParent(root);
+            if (parent is null || !parent.Name.Equals("ADOFAIVfxRenderer Diagnostics", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!Directory.Exists(root)) continue;
+            Directory.Delete(root, recursive: true);
+            deleted++;
+        }
+
+        PreRenderCacheRegistry.Clear();
+        DecorationComparisonList.ItemsSource = null;
+        DiagnosticComparisonPanel.Visibility = Visibility.Collapsed;
+        DiagnosticWithImage.Source = null;
+        DiagnosticWithoutImage.Source = null;
+        PreRenderCacheStatusText.Text = $"已删除 {deleted:N0} 组预渲染缓存；正式输出和源文件未改动。";
     }
 
     private void SelectionChanged(object sender, RoutedEventArgs e)
@@ -456,13 +684,13 @@ public partial class MainWindow : Window
 
         if (profiles.Length == 0 || resolutions.Length == 0 || frameRates.Length == 0)
         {
-            MessageBox.Show(this, "输出版本、分辨率和 FPS 都至少选择一个。", "无法生成计划", MessageBoxButton.OK, MessageBoxImage.Warning);
+            DarkDialog.Show(this, "输出版本、分辨率和 FPS 都至少选择一个。", "无法生成计划");
             return;
         }
 
         if (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var tailSeconds))
         {
-            MessageBox.Show(this, "结束延长秒数无效。", "无法生成计划", MessageBoxButton.OK, MessageBoxImage.Warning);
+            DarkDialog.Show(this, "结束延长秒数无效。", "无法生成计划");
             return;
         }
 
@@ -474,7 +702,7 @@ public partial class MainWindow : Window
         }
         catch (InvalidOperationException exception)
         {
-            MessageBox.Show(this, exception.Message, "无法生成计划", MessageBoxButton.OK, MessageBoxImage.Warning);
+            DarkDialog.Show(this, exception.Message, "无法生成计划");
             return;
         }
         var strategy = ((Choice<ResolutionRenderStrategy>)ResolutionStrategyBox.SelectedItem).Value;
@@ -554,6 +782,8 @@ public partial class MainWindow : Window
             _batchInstallation = _installation;
             _batchChart = _chart;
             _batchTail = TailExtension.FromSeconds(tailSeconds);
+            _batchRetainedDecorationIndices = GetRetainedDecorationIndices();
+            _batchRenderBackend = ((Choice<RenderBackend>)RenderBackendBox.SelectedItem).Value;
             _batchTotal = variants.Count;
             _batchCompleted = 0;
             OutputList.ItemsSource = variants.Select(static variant => "等待 · " + variant.DisplayName).ToArray();
@@ -570,7 +800,7 @@ public partial class MainWindow : Window
             _renderQueue.Clear();
             StartRenderButton.IsEnabled = true;
             CancelRenderButton.IsEnabled = false;
-            MessageBox.Show(this, exception.Message, "无法开始渲染", MessageBoxButton.OK, MessageBoxImage.Warning);
+            DarkDialog.Show(this, exception.Message, "无法开始渲染");
         }
     }
 
@@ -592,7 +822,9 @@ public partial class MainWindow : Window
             _batchChart ?? throw new InvalidOperationException("缺少批量渲染的谱面信息。"),
             variant,
             _batchTail,
-            _durationLimitSeconds);
+            _durationLimitSeconds,
+            _batchRetainedDecorationIndices,
+            _batchRenderBackend);
         var current = _batchTotal - _renderQueue.Count;
         SummaryText.Text = $"批量任务 {current}/{_batchTotal}：{variant.DisplayName}\n输出文件：{outputPath}";
     }
@@ -651,7 +883,7 @@ public partial class MainWindow : Window
                 _renderQueue.Clear();
                 StartRenderButton.IsEnabled = true;
                 CancelRenderButton.IsEnabled = false;
-                MessageBox.Show(this, exception.Message, "无法继续批量渲染", MessageBoxButton.OK, MessageBoxImage.Warning);
+                DarkDialog.Show(this, exception.Message, "无法继续批量渲染");
             }
         }
         else if (status.State is "failed" or "cancelled")
@@ -664,6 +896,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        SaveRememberedPaths();
         _worker.StatusChanged -= Worker_StatusChanged;
         if (_worker.IsRunning)
         {
@@ -705,6 +938,80 @@ public partial class MainWindow : Window
     private sealed record Choice<T>(string Label, T Value)
     {
         public override string ToString() => Label;
+    }
+
+    private enum DecorationRetentionMode
+    {
+        Whitelist,
+        Blacklist,
+    }
+
+    private sealed class DecorationRetentionItem : INotifyPropertyChanged
+    {
+        private bool _isListed;
+        private BitmapSource? _thumbnail;
+        private BitmapSource? _fullImage;
+
+        public DecorationRetentionItem(DecorationCatalogItem item) => Item = item;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        public DecorationCatalogItem Item { get; }
+        public string DisplayName => string.IsNullOrWhiteSpace(Item.ImageName)
+            ? $"无贴图装饰 #{Item.Index}"
+            : Path.GetFileName(Item.ImageName);
+        public string Detail => $"首次引用格 {Item.ReferenceFloor} · 深度 {Item.Depth} · {Item.TimeSeconds:0.###} 秒";
+        public string TagText => string.IsNullOrWhiteSpace(Item.Tag) ? "无标签" : "标签：" + Item.Tag;
+        public string FullDetail =>
+            $"源格 {Item.Floor} · 首次引用格 {Item.ReferenceFloor} · 深度 {Item.Depth} · " +
+            $"首次引用 {Item.TimeSeconds:0.###} 秒 · 遮罩 {Item.MaskingType}\n{Item.ImagePath}";
+        public BitmapSource? Thumbnail => _thumbnail ??= LoadBitmap(Item.ImagePath, 160);
+        public BitmapSource? FullImage => _fullImage ??= LoadBitmap(Item.ImagePath, 1600);
+
+        public bool IsListed
+        {
+            get => _isListed;
+            set
+            {
+                if (_isListed == value) return;
+                _isListed = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsListed)));
+            }
+        }
+    }
+
+    private sealed class DecorationComparisonViewItem
+    {
+        public DecorationComparisonViewItem(DecorationComparisonFilePair pair)
+        {
+            TimestampLabel = $"{pair.TimeSeconds:0.###} 秒";
+            WithImage = LoadBitmap(pair.WithDecorationPath, 900);
+            WithoutImage = LoadBitmap(pair.WithoutDecorationPath, 900);
+        }
+
+        public string TimestampLabel { get; }
+        public BitmapSource? WithImage { get; }
+        public BitmapSource? WithoutImage { get; }
+    }
+
+    private static BitmapSource? LoadBitmap(string path, int decodePixelWidth)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.DecodePixelWidth = decodePixelWidth;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            return image;
+        }
+        catch (Exception exception) when (exception is IOException or NotSupportedException)
+        {
+            return null;
+        }
     }
 
     [DllImport("dwmapi.dll")]

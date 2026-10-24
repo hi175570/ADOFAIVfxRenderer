@@ -22,6 +22,8 @@ var tests = new (string Name, Action Run)[]
     ("Current target timeline when present", CurrentTargetTimeline),
     ("Derived Video VFX ownership", DerivedVideoVfxOwnership),
     ("Derived Video VFX Pro ownership", DerivedVideoVfxProOwnership),
+    ("Derived chart retains selected decoration", DerivedChartRetainsSelectedDecoration),
+    ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
 };
 
 var failures = new List<string>();
@@ -319,6 +321,76 @@ static void DerivedVideoVfxProOwnership() => TestDerivedOwnership(
     OutputProfile.VideoVfxPro,
     expectedDecorationCount: 1,
     expectedRemainingDepth: -10);
+
+static void DerivedChartRetainsSelectedDecoration()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-retained-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var videoPath = Path.Combine(root, "render.mp4");
+        File.WriteAllBytes(videoPath, [1]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "keep.png", "depth": 5},
+            {"floor": 0, "eventType": "AddText", "decText": "index spacer"},
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "bake.png", "depth": -5}
+          ]
+        }
+        """);
+
+        var result = DerivedChartExporter.Export(chartPath, videoPath, OutputProfile.VideoVfx, 0m, new HashSet<int> { 0 });
+        Equal(1, result.RemovedDecorations);
+        var derived = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(result.ChartPath))!.AsObject();
+        var remaining = derived["decorations"]!.AsArray();
+        True(remaining.Any(node => node?["decorationImage"]?.GetValue<string>() == "keep.png"));
+        False(remaining.Any(node => node?["decorationImage"]?.GetValue<string>() == "bake.png"));
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void DecorationCatalogUsesFirstInvocation()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-catalog-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180, 0],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 1, "eventType": "MoveDecorations", "tag": "hidden", "angleOffset": 90, "visible": true}
+          ],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "visible": false, "tag": "hidden", "decorationImage": "a.png", "depth": 1},
+            {"floor": 0, "eventType": "AddDecoration", "visible": true, "tag": "shown", "decorationImage": "b.png", "depth": 2}
+          ]
+        }
+        """);
+
+        var items = DecorationCatalogReader.Read(chartPath);
+        var hidden = items.Single(item => item.Tag == "hidden");
+        Equal(1, hidden.ReferenceFloor);
+        Near(0.25d, hidden.TimeSeconds, 0.000001d);
+        var shown = items.Single(item => item.Tag == "shown");
+        Equal(0, shown.ReferenceFloor);
+        Near(0d, shown.TimeSeconds, 0.000001d);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
 
 static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCount, int? expectedRemainingDepth)
 {

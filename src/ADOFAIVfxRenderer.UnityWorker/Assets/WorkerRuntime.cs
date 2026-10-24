@@ -27,7 +27,9 @@ public sealed class WorkerRuntime : MonoBehaviour
     private readonly List<MoveEvent> _activeMoves = new();
     private readonly List<CameraEvent> _cameraEvents = new();
     private readonly List<CameraEvent> _activeCameraEvents = new();
+    private readonly CameraLogicalState _cameraState = new();
     private readonly List<BackgroundEvent> _backgroundEvents = new();
+    private readonly HashSet<int> _unbakedDecorationIndices = new();
     private WorkerJob _job = null!;
     private WorkerStatus _status = null!;
     private Camera _camera = null!;
@@ -118,7 +120,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             ? _floorPositions[0]
             : Vector2.zero;
         _camera.transform.position = new Vector3(initialCameraBase.x + initialCameraOffset.x, initialCameraBase.y + initialCameraOffset.y, -10f);
-        _camera.transform.rotation = Quaternion.Euler(0f, 0f, settings.Value<float?>("rotation") ?? 0f);
+        _cameraState.Rotation = settings.Value<float?>("rotation") ?? 0f;
+        _camera.transform.rotation = Quaternion.Euler(0f, 0f, _cameraState.Rotation);
         _camera.clearFlags = CameraClearFlags.SolidColor;
         _camera.backgroundColor = ParseColor(settings.Value<string>("backgroundColor") ?? "000000ff");
         _camera.aspect = _job.width / (float)_job.height;
@@ -130,11 +133,14 @@ public sealed class WorkerRuntime : MonoBehaviour
         _backgroundRenderer.sortingOrder = short.MinValue;
         _backgroundRenderer.enabled = false;
 
-        foreach (var token in (JArray?)chart["decorations"] ?? new JArray())
+        var retainedDecorationIndices = new HashSet<int>(_job.retainedDecorationIndices ?? Array.Empty<int>());
+        var chartDecorations = (JArray?)chart["decorations"] ?? new JArray();
+        for (var decorationIndex = 0; decorationIndex < chartDecorations.Count; decorationIndex++)
         {
+            var token = chartDecorations[decorationIndex];
             if (token is JObject decoration && decoration.Value<string>("eventType") == "AddDecoration")
             {
-                AddDecoration(decoration);
+                if (!retainedDecorationIndices.Contains(decorationIndex)) AddDecoration(decoration, decorationIndex);
             }
         }
         ResolveMaskingTargets();
@@ -265,22 +271,16 @@ public sealed class WorkerRuntime : MonoBehaviour
         return result;
     }
 
-    private void AddDecoration(JObject data)
+    private void AddDecoration(JObject data, int sourceIndex)
     {
         var imageName = data.Value<string>("decorationImage");
-        if (string.IsNullOrWhiteSpace(imageName))
+        Sprite? sprite = null;
+        if (!string.IsNullOrWhiteSpace(imageName))
         {
-            return;
+            var imagePath = Path.Combine(_chartDirectory, imageName);
+            if (File.Exists(imagePath)) sprite = GetSprite(imagePath);
+            if (sprite == null) _unbakedDecorationIndices.Add(sourceIndex);
         }
-
-        var imagePath = Path.Combine(_chartDirectory, imageName);
-        if (!File.Exists(imagePath))
-        {
-            return;
-        }
-
-        var sprite = GetSprite(imagePath);
-        if (sprite == null) return;
 
         var gameObject = new GameObject(imageName);
         var renderer = gameObject.AddComponent<SpriteRenderer>();
@@ -312,6 +312,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
             (depth < 0 && !_job.includeForegroundDecorations))
         {
+            _unbakedDecorationIndices.Add(sourceIndex);
             return;
         }
         renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
@@ -323,6 +324,7 @@ public sealed class WorkerRuntime : MonoBehaviour
                           (relativeTo is "Camera" or "CameraAspect" ? 1f : TileSize);
         var parallaxOffset = ReadVector2(data["parallaxOffset"], Vector2.zero) * TileSize;
         var state = new DecorationState(
+            sourceIndex,
             gameObject.transform,
             renderer,
             tags,
@@ -495,12 +497,24 @@ public sealed class WorkerRuntime : MonoBehaviour
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
         var replaceSprite = HasValue(data, "decorationImage");
         Sprite? sprite = null;
+        var replacementFailed = false;
         if (replaceSprite && data.Value<string>("decorationImage") is { Length: > 0 } imageName)
         {
             var imagePath = Path.Combine(_chartDirectory, imageName);
             if (File.Exists(imagePath)) sprite = GetSprite(imagePath);
+            replacementFailed = sprite == null;
         }
-        _moves.Add(new MoveEvent(start, duration, SplitTags(data.Value<string>("tag")), data, replaceSprite, sprite, _eventSequence++));
+        _moves.Add(new MoveEvent(
+            start,
+            duration,
+            SplitTags(data.Value<string>("tag")),
+            data,
+            replaceSprite,
+            sprite,
+            replacementFailed,
+            index => _unbakedDecorationIndices.Add(index),
+            ResolveMaskingTargets,
+            _eventSequence++));
     }
 
     private void AddCameraEvent(JObject data, int repeatedFloor, float angleOffset)
@@ -602,6 +616,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             _status.state = "complete";
             _status.percent = 100f;
             _status.message = "独立 Unity Worker 渲染完成。";
+            _status.unbakedDecorationIndices = _unbakedDecorationIndices.OrderBy(static index => index).ToArray();
             WriteStatus();
             yield return null;
             Application.Quit(0);
@@ -656,11 +671,15 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (cameraEvent.ChangesMode) _cameraFollowsPlayer = cameraEvent.IsPlayerMode;
             for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
             {
-                _activeCameraEvents[index].CompleteConflicts(_camera, cameraEvent, PlayerFollowPositionAt(cameraEvent.Start));
+                _activeCameraEvents[index].CompleteConflicts(
+                    _camera,
+                    _cameraState,
+                    cameraEvent,
+                    PlayerFollowPositionAt(cameraEvent.Start));
                 if (_activeCameraEvents[index].IsComplete) _activeCameraEvents.RemoveAt(index);
             }
-            cameraEvent.Capture(_camera, PlayerFollowPositionAt(cameraEvent.Start));
-            if (!cameraEvent.Apply(_camera, cameraEvent.Start, PlayerFollowPositionAt(cameraEvent.Start)))
+            cameraEvent.Capture(_camera, _cameraState, PlayerFollowPositionAt(cameraEvent.Start));
+            if (!cameraEvent.Apply(_camera, _cameraState, cameraEvent.Start, PlayerFollowPositionAt(cameraEvent.Start)))
                 _activeCameraEvents.Add(cameraEvent);
         }
         AdvancePlayerFollow(time);
@@ -688,7 +707,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         var followPosition = PlayerFollowPositionAt(time);
         for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
         {
-            if (_activeCameraEvents[index].Apply(_camera, time, followPosition)) _activeCameraEvents.RemoveAt(index);
+            if (_activeCameraEvents[index].Apply(_camera, _cameraState, time, followPosition))
+                _activeCameraEvents.RemoveAt(index);
         }
     }
 
@@ -753,12 +773,20 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private void StartEncoder()
     {
+        var encoder = string.IsNullOrWhiteSpace(_job.videoEncoder) ? "libopenh264" : _job.videoEncoder;
+        if (encoder != "libopenh264" && encoder != "h264_nvenc" && encoder != "h264_qsv" && encoder != "h264_amf")
+            throw new InvalidOperationException("Unsupported video encoder: " + encoder);
+        var presetArguments = encoder == "h264_nvenc"
+            ? " -preset " + (_job.encoderPreset == "p7" ? "p7" : "p4") + " -tune hq"
+            : "";
         var arguments = string.Format(
             CultureInfo.InvariantCulture,
-            "-hide_banner -loglevel warning -y -f rawvideo -pixel_format rgba -video_size {0}x{1} -framerate {2} -i pipe:0 -vf vflip -an -c:v libopenh264 -b:v {3}k -pix_fmt yuv420p \"{4}\"",
+            "-hide_banner -loglevel warning -y -f rawvideo -pixel_format rgba -video_size {0}x{1} -framerate {2} -i pipe:0 -vf vflip -an -c:v {3}{4} -b:v {5}k -pix_fmt yuv420p \"{6}\"",
             _job.width,
             _job.height,
             _job.framesPerSecond,
+            encoder,
+            presetArguments,
             Math.Max(1, _job.bitrateKbps),
             _job.outputPath.Replace("\"", "\\\""));
         _ffmpeg = new Process
@@ -946,6 +974,9 @@ public sealed class WorkerRuntime : MonoBehaviour
         public bool includeEffects;
         public bool includeBackgroundDecorations = true;
         public bool includeForegroundDecorations = true;
+        public int[]? retainedDecorationIndices;
+        public string? videoEncoder;
+        public string? encoderPreset;
     }
 
     [Serializable]
@@ -957,6 +988,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public string outputPath = "";
         public string previewPath = "";
         public string error = "";
+        public int[] unbakedDecorationIndices = Array.Empty<int>();
         public int currentFrame;
         public int totalFrames;
         public float percent;
@@ -968,6 +1000,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     private sealed class DecorationState
     {
         public DecorationState(
+            int sourceIndex,
             Transform transform,
             SpriteRenderer renderer,
             HashSet<string> tags,
@@ -992,6 +1025,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             int maskingBackDepth,
             float initialZoomRatio)
         {
+            SourceIndex = sourceIndex;
             Transform = transform;
             Renderer = renderer;
             Tags = tags;
@@ -1016,7 +1050,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             MaskingFrontDepth = maskingFrontDepth;
             MaskingBackDepth = maskingBackDepth;
             InitialZoomRatio = initialZoomRatio;
+            RefreshMaskRange();
         }
+        public int SourceIndex { get; }
         public Transform Transform { get; }
         public SpriteRenderer Renderer { get; }
         public HashSet<string> Tags { get; }
@@ -1036,7 +1072,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public int Depth { get; set; }
         public SpriteMask? SpriteMask { get; }
         public string MaskingType { get; private set; }
-        public string MaskingTarget { get; }
+        public string MaskingTarget { get; private set; }
         private bool HasMatchingMask { get; set; }
         public bool Visible { get; private set; }
         public bool UseMaskingDepth { get; private set; }
@@ -1085,6 +1121,11 @@ public sealed class WorkerRuntime : MonoBehaviour
             ConfigureMaskRelationship(HasMatchingMask);
             SetVisible(Visible);
             RefreshMaskRange();
+        }
+
+        public void SetMaskingTarget(string target)
+        {
+            MaskingTarget = string.IsNullOrWhiteSpace(target) ? "NO TAG" : target;
         }
 
         public void SetSprite(Sprite? sprite)
@@ -1162,7 +1203,20 @@ public sealed class WorkerRuntime : MonoBehaviour
         private readonly Property _properties;
         private readonly bool _replaceSprite;
         private readonly Sprite? _replacementSprite;
-        public MoveEvent(float start, float duration, HashSet<string> tags, JObject data, bool replaceSprite, Sprite? replacementSprite, int order)
+        private readonly bool _replacementFailed;
+        private readonly Action<int> _markUnbaked;
+        private readonly Action _refreshMasks;
+        public MoveEvent(
+            float start,
+            float duration,
+            HashSet<string> tags,
+            JObject data,
+            bool replaceSprite,
+            Sprite? replacementSprite,
+            bool replacementFailed,
+            Action<int> markUnbaked,
+            Action refreshMasks,
+            int order)
         {
             Start = start;
             Duration = duration;
@@ -1171,6 +1225,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             _properties = GetProperties(data);
             _replaceSprite = replaceSprite;
             _replacementSprite = replacementSprite;
+            _replacementFailed = replacementFailed;
+            _markUnbaked = markUnbaked;
+            _refreshMasks = refreshMasks;
             Order = order;
         }
         public float Start { get; }
@@ -1194,6 +1251,7 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         public void Capture(IEnumerable<DecorationState> decorations)
         {
+            var maskingChanged = false;
             foreach (var decoration in decorations)
             {
                 if (!_tags.Overlaps(decoration.Tags)) continue;
@@ -1201,7 +1259,11 @@ public sealed class WorkerRuntime : MonoBehaviour
                     decoration.RelativeTo = relativeTo;
                 if (HasValue(_data, "visible")) decoration.SetVisible(_data.Value<bool>("visible"));
                 if (HasValue(_data, "depth")) decoration.SetDepth(_data.Value<int>("depth"));
-                if (_replaceSprite) decoration.SetSprite(_replacementSprite);
+                if (_replaceSprite)
+                {
+                    decoration.SetSprite(_replacementSprite);
+                    if (_replacementFailed) _markUnbaked(decoration.SourceIndex);
+                }
                 if (HasValue(_data, "maskingType") || HasValue(_data, "useMaskingDepth") ||
                     HasValue(_data, "maskingFrontDepth") || HasValue(_data, "maskingBackDepth"))
                 {
@@ -1210,9 +1272,16 @@ public sealed class WorkerRuntime : MonoBehaviour
                         HasValue(_data, "useMaskingDepth") ? _data.Value<bool?>("useMaskingDepth") : null,
                         HasValue(_data, "maskingFrontDepth") ? _data.Value<int?>("maskingFrontDepth") : null,
                         HasValue(_data, "maskingBackDepth") ? _data.Value<int?>("maskingBackDepth") : null);
+                    maskingChanged = HasValue(_data, "maskingType");
+                }
+                if (HasValue(_data, "maskingTarget"))
+                {
+                    decoration.SetMaskingTarget(_data.Value<string>("maskingTarget") ?? "NO TAG");
+                    maskingChanged = true;
                 }
                 _targets.Add(new Snapshot(decoration, _data, _properties));
             }
+            if (maskingChanged) _refreshMasks();
         }
         public bool Apply(float time)
         {
@@ -1370,25 +1439,33 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         public void ConfigureMode(string mode) => _resolvedMode = mode;
 
-        public void CompleteConflicts(Camera camera, CameraEvent incoming, Vector2 followPosition)
+        public void CompleteConflicts(
+            Camera camera,
+            CameraLogicalState cameraState,
+            CameraEvent incoming,
+            Vector2 followPosition)
         {
             var overlap = _active & incoming._properties;
             var target = WorldPosition(_targetPosition, followPosition);
             if ((overlap & Property.PositionX) != 0) camera.transform.position = new Vector3(target.x, camera.transform.position.y, -10f);
             if ((overlap & Property.PositionY) != 0) camera.transform.position = new Vector3(camera.transform.position.x, target.y, -10f);
-            if ((overlap & Property.Rotation) != 0) camera.transform.rotation = Quaternion.Euler(0f, 0f, _targetRotation);
+            if ((overlap & Property.Rotation) != 0)
+            {
+                cameraState.Rotation = _targetRotation;
+                camera.transform.rotation = Quaternion.Euler(0f, 0f, cameraState.Rotation);
+            }
             if ((overlap & Property.Zoom) != 0) camera.orthographicSize = _targetSize;
             _active &= ~overlap;
         }
 
-        public void Capture(Camera camera, Vector2 followPosition)
+        public void Capture(Camera camera, CameraLogicalState cameraState, Vector2 followPosition)
         {
             _active = _properties;
             var cameraPosition = camera.transform.position;
             _position = IsPlayerMode
                 ? new Vector3(cameraPosition.x - followPosition.x, cameraPosition.y - followPosition.y, -10f)
                 : cameraPosition;
-            _rotation = camera.transform.eulerAngles.z;
+            _rotation = cameraState.Rotation;
             _size = camera.orthographicSize;
             var requested = ReadVector2(_data["position"], new Vector2(float.NaN, float.NaN)) * TileSize;
             if (ChangesMode)
@@ -1406,13 +1483,16 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (float.IsNaN(target.x)) target.x = _position.x;
             if (float.IsNaN(target.y)) target.y = _position.y;
             _targetPosition = new Vector3(target.x, target.y, -10f);
-            _targetRotation = _data.Value<float?>("rotation") ?? _rotation;
-            if (_resolvedMode == "LastPosition" && !HasValue(_data, "rotation")) _targetRotation = _rotation;
+            _targetRotation = _data.Value<float?>("rotation") is { } requestedRotation
+                ? _resolvedMode == "LastPosition"
+                    ? _rotation + requestedRotation
+                    : requestedRotation
+                : _rotation;
             _targetSize = _data.Value<float?>("zoom") is { } zoom
                 ? DefaultCameraOrthoSize * Math.Max(0.01f, zoom / 100f)
                 : _size;
         }
-        public bool Apply(Camera camera, float time, Vector2 followPosition)
+        public bool Apply(Camera camera, CameraLogicalState cameraState, float time, Vector2 followPosition)
         {
             var rawAmount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
             var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
@@ -1423,7 +1503,10 @@ public sealed class WorkerRuntime : MonoBehaviour
             if ((_active & Property.PositionY) != 0) current.y = world.y;
             camera.transform.position = new Vector3(current.x, current.y, -10f);
             if ((_active & Property.Rotation) != 0)
-                camera.transform.rotation = Quaternion.Euler(0f, 0f, Mathf.LerpUnclamped(_rotation, _targetRotation, amount));
+            {
+                cameraState.Rotation = Mathf.LerpUnclamped(_rotation, _targetRotation, amount);
+                camera.transform.rotation = Quaternion.Euler(0f, 0f, cameraState.Rotation);
+            }
             if ((_active & Property.Zoom) != 0)
                 camera.orthographicSize = Mathf.LerpUnclamped(_size, _targetSize, amount);
             if (rawAmount >= 1f) _active = Property.None;
@@ -1433,6 +1516,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         private Vector3 WorldPosition(Vector3 logicalPosition, Vector2 followPosition) => IsPlayerMode
             ? new Vector3(logicalPosition.x + followPosition.x, logicalPosition.y + followPosition.y, -10f)
             : new Vector3(logicalPosition.x, logicalPosition.y, -10f);
+    }
+
+    private sealed class CameraLogicalState
+    {
+        public float Rotation { get; set; }
     }
 
     private sealed class BackgroundEvent

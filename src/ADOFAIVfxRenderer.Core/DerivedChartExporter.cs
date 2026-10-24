@@ -22,7 +22,8 @@ public static class DerivedChartExporter
         string sourceChartPath,
         string renderedVideoPath,
         OutputProfile profile,
-        decimal renderStartSeconds = 0m)
+        decimal renderStartSeconds = 0m,
+        IReadOnlySet<int>? retainedDecorationIndices = null)
     {
         if (profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
         {
@@ -49,7 +50,7 @@ public static class DerivedChartExporter
         settings["loopVideo"] = false;
         settings["showDefaultBGIfNoImage"] = false;
 
-        var removedDecorations = RemoveBakedDecorations(root, profile);
+        var removedDecorations = RemoveBakedDecorations(root, profile, retainedDecorationIndices);
         var removedBackgroundEvents = RemoveBakedBackgroundEvents(root);
 
         var outputFolderName = Path.GetFileName(Path.GetDirectoryName(renderedVideoPath));
@@ -86,7 +87,10 @@ public static class DerivedChartExporter
         return 0m;
     }
 
-    private static int RemoveBakedDecorations(JsonObject root, OutputProfile profile)
+    private static int RemoveBakedDecorations(
+        JsonObject root,
+        OutputProfile profile,
+        IReadOnlySet<int>? retainedDecorationIndices)
     {
         if (root["decorations"] is not JsonArray decorations) return 0;
         var removed = 0;
@@ -100,7 +104,7 @@ public static class DerivedChartExporter
 
             var depth = decoration["depth"]?.GetValue<int>() ?? 0;
             var baked = profile == OutputProfile.VideoVfx || depth >= 0;
-            if (!baked) continue;
+            if (!baked || retainedDecorationIndices?.Contains(index) == true) continue;
             decorations.RemoveAt(index);
             removed++;
         }
