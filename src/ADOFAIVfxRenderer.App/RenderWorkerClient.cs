@@ -13,6 +13,9 @@ internal sealed class RenderWorkerClient : IDisposable
     private Process? _workerProcess;
     private string? _statusPath;
     private string? _lastStatusJson;
+    private string? _activeChartPath;
+    private OutputProfile _activeProfile;
+    private bool _derivedExportAttempted;
 
     public RenderWorkerClient()
     {
@@ -94,6 +97,9 @@ internal sealed class RenderWorkerClient : IDisposable
         var jobPath = Path.Combine(outputDirectory, "render-job.json");
         File.WriteAllText(jobPath, JsonSerializer.Serialize(job, JsonOptions));
         _lastStatusJson = null;
+        _activeChartPath = chart.Path;
+        _activeProfile = variant.Profile;
+        _derivedExportAttempted = false;
 
         var workerLogPath = Path.Combine(outputDirectory, "worker.log");
         var startInfo = new ProcessStartInfo
@@ -159,6 +165,26 @@ internal sealed class RenderWorkerClient : IDisposable
                     var status = JsonSerializer.Deserialize<WorkerStatus>(json, JsonOptions);
                     if (status != null)
                     {
+                        if (status.State == "complete" && !_derivedExportAttempted)
+                        {
+                            _derivedExportAttempted = true;
+                            try
+                            {
+                                var derived = DerivedChartExporter.Export(
+                                    _activeChartPath ?? throw new InvalidOperationException("缺少活动谱面路径。"),
+                                    status.OutputPath,
+                                    _activeProfile);
+                                status.DerivedChartPath = derived.ChartPath;
+                                status.VideoOffsetMilliseconds = derived.VideoOffsetMilliseconds;
+                                status.Message =
+                                    $"视频与派生谱面已完成；视频偏移 {derived.VideoOffsetMilliseconds} ms。";
+                            }
+                            catch (Exception exception) when (exception is IOException or JsonException or InvalidDataException)
+                            {
+                                status.Message = "视频已完成，但派生谱面导出失败。";
+                                status.Error = exception.Message;
+                            }
+                        }
                         _lastStatusJson = json;
                         StatusChanged?.Invoke(status);
                         if (status.State is "complete" or "failed" or "cancelled")
@@ -307,7 +333,7 @@ internal sealed class WorkerStatus
     public string State { get; init; } = "";
 
     [JsonPropertyName("message")]
-    public string Message { get; init; } = "";
+    public string Message { get; set; } = "";
 
     [JsonPropertyName("outputPath")]
     public string OutputPath { get; init; } = "";
@@ -316,7 +342,11 @@ internal sealed class WorkerStatus
     public string PreviewPath { get; init; } = "";
 
     [JsonPropertyName("error")]
-    public string Error { get; init; } = "";
+    public string Error { get; set; } = "";
+
+    public string DerivedChartPath { get; set; } = "";
+
+    public int VideoOffsetMilliseconds { get; set; }
 
     [JsonPropertyName("currentFrame")]
     public int CurrentFrame { get; init; }

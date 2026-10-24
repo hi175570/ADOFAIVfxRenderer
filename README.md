@@ -20,6 +20,7 @@ The current implementation milestone includes:
 - an independently built Unity worker process with direct RenderTexture capture and raw-frame FFmpeg encoding;
 - offline `AddDecoration`, `MoveDecorations`, `MoveCamera`, `CustomBackground`, and beat-based `RepeatEvents` support;
 - v13-compatible tile units, decoration parallax, camera-relative placement, opening-countdown timing, easing, and per-floor BPM timing;
+- automatic non-destructive derived-chart export with `bgVideo`, countdown-corrected `vidOffset`, and removal of only the visual elements actually baked into the selected profile;
 - selectable render content (background/foreground decorations, track, planets, and effects) with UI always excluded;
 - quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.

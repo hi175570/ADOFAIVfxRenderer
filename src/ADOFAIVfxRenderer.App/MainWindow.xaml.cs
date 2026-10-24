@@ -573,7 +573,9 @@ public partial class MainWindow : Window
         {
             SummaryText.Text = status.State == "failed"
                 ? $"渲染失败：{status.Error}\n输出位置：{status.OutputPath}"
-                : $"输出文件：{status.OutputPath}";
+                : string.IsNullOrWhiteSpace(status.DerivedChartPath)
+                    ? $"输出文件：{status.OutputPath}"
+                    : $"视频：{status.OutputPath}\n派生谱面：{status.DerivedChartPath}\n视频偏移：{status.VideoOffsetMilliseconds} ms";
         }
 
         if (!string.IsNullOrWhiteSpace(status.PreviewPath) && File.Exists(status.PreviewPath))

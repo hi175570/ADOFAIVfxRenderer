@@ -15,6 +15,9 @@ var tests = new (string Name, Action Run)[]
     ("Invalid game path", InvalidGamePath),
     ("Selected chart version", SelectedChartVersion),
     ("Current local game probe when present", CurrentLocalGameProbe),
+    ("Derived chart video offset", DerivedChartVideoOffset),
+    ("Derived Video VFX ownership", DerivedVideoVfxOwnership),
+    ("Derived Video VFX Pro ownership", DerivedVideoVfxProOwnership),
 };
 
 var failures = new List<string>();
@@ -201,6 +204,82 @@ static void CurrentLocalGameProbe()
     True(installation.CanRender);
     Equal(19, installation.Adapter?.MaximumChartVersion);
     Equal(276, installation.Capabilities.CameraFilterComponentCount);
+}
+
+static void DerivedChartVideoOffset()
+{
+    var settings = new System.Text.Json.Nodes.JsonObject
+    {
+        ["separateCountdownTime"] = true,
+        ["countdownTicks"] = 4,
+        ["bpm"] = 135,
+    };
+    Equal(1778, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
+    Equal(1278, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 0.5m));
+    settings["separateCountdownTime"] = false;
+    Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
+}
+
+static void DerivedVideoVfxOwnership() => TestDerivedOwnership(
+    OutputProfile.VideoVfx,
+    expectedDecorationCount: 2,
+    expectedRemainingDepth: null);
+
+static void DerivedVideoVfxProOwnership() => TestDerivedOwnership(
+    OutputProfile.VideoVfxPro,
+    expectedDecorationCount: 1,
+    expectedRemainingDepth: -10);
+
+static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCount, int? expectedRemainingDepth)
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-export-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var videoDirectory = Path.Combine(root, "output");
+        Directory.CreateDirectory(videoDirectory);
+        var videoPath = Path.Combine(videoDirectory, "render.mp4");
+        File.WriteAllBytes(videoPath, [1, 2, 3]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120, "countdownTicks": 4, "separateCountdownTime": true},
+          "actions": [
+            {"floor": 0, "eventType": "CustomBackground", "color": "000000"},
+            {"floor": 0, "eventType": "SetFilter", "filter": "Blur"}
+          ],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "bg.png", "depth": 10},
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "fg.png", "depth": -10},
+            {"floor": 0, "eventType": "AddText", "decText": "keep me", "depth": 0}
+          ]
+        }
+        """);
+
+        var result = DerivedChartExporter.Export(chartPath, videoPath, profile);
+        Equal(expectedDecorationCount, result.RemovedDecorations);
+        Equal(1, result.RemovedBackgroundEvents);
+        Equal(2000, result.VideoOffsetMilliseconds);
+        var derived = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(result.ChartPath))!.AsObject();
+        Equal("output/render.mp4", derived["settings"]!["bgVideo"]!.GetValue<string>());
+        True(derived["actions"]!.AsArray().Any(node => node!["eventType"]!.GetValue<string>() == "SetFilter"));
+        var remaining = derived["decorations"]!.AsArray();
+        True(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddText"));
+        if (expectedRemainingDepth.HasValue)
+        {
+            True(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddDecoration" &&
+                                       node["depth"]!.GetValue<int>() == expectedRemainingDepth.Value));
+        }
+        else
+        {
+            False(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddDecoration"));
+        }
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
 }
 
 static void Equal<T>(T expected, T actual)
