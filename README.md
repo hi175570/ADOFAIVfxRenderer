@@ -24,7 +24,7 @@ The current implementation milestone includes:
 - quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.
 
-The worker is intentionally not described as pixel-accurate yet. The current clean-room v13-v19 event adapter is incomplete: the full easing set, floor-based repeats, masks, particles, objects, track/planet rendering, filters, and exact legacy camera semantics still need verified adapters. Video VFX is the only enabled end-to-end test profile.
+The worker is intentionally not described as pixel-accurate yet. The current clean-room v13-v19 event adapter is incomplete: the full easing set, floor-based repeats, masks, particles, objects, track/planet rendering, filters, and exact legacy camera semantics still need verified adapters. Video VFX and depth-split Video VFX Pro are enabled end to end; Video and Video Pro remain disabled until their offline filter path is verified.
 
 ## Build and test
 

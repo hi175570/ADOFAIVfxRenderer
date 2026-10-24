@@ -279,6 +279,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         var color = ParseColor(data.Value<string>("color") ?? "ffffffff");
         var opacity = (data.Value<float?>("opacity") ?? 100f) / 100f;
         var depth = data.Value<int?>("depth") ?? 0;
+        if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
+            (depth < 0 && !_job.includeForegroundDecorations))
+        {
+            return;
+        }
         renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
         renderer.enabled = data.Value<bool?>("visible") ?? true;
 
@@ -722,6 +727,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         public int bitrateKbps = 2000;
         public float tailSeconds;
         public float durationLimitSeconds;
+        public bool includeTrack;
+        public bool includePlanets;
+        public bool includeEffects;
+        public bool includeBackgroundDecorations = true;
+        public bool includeForegroundDecorations = true;
     }
 
     [Serializable]

@@ -57,9 +57,13 @@ public partial class MainWindow : Window
 
             var fps = int.TryParse(GetArgumentValue(arguments, "--fps"), out var parsedFps) ? parsedFps : 15;
             var resolutionName = GetArgumentValue(arguments, "--resolution") ?? "144p";
+            var profileName = GetArgumentValue(arguments, "--profile") ?? nameof(OutputProfile.VideoVfx);
+            var smokeProfile = Enum.TryParse<OutputProfile>(profileName, ignoreCase: true, out var parsedProfile)
+                ? parsedProfile
+                : OutputProfile.VideoVfx;
             foreach (var check in _profileChecks)
             {
-                check.IsChecked = (OutputProfile)check.Tag == OutputProfile.VideoVfx;
+                check.IsChecked = (OutputProfile)check.Tag == smokeProfile;
             }
 
             foreach (var check in _resolutionChecks)
@@ -515,9 +519,9 @@ public partial class MainWindow : Window
             }
 
             var profile = (OutputProfile)profiles[0].Tag;
-            if (profile != OutputProfile.VideoVfx)
+            if (profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
             {
-                throw new NotSupportedException("当前可实测的是 Video VFX；另外三种会在这个渲染链稳定后接入。");
+                throw new NotSupportedException("当前可实测的是 Video VFX 与 Video VFX Pro；Video / Video Pro 要等原版滤镜适配完成。");
             }
 
             if (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var tailSeconds))

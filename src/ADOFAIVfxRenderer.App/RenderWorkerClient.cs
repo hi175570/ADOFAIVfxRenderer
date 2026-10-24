@@ -44,9 +44,9 @@ internal sealed class RenderWorkerClient : IDisposable
             throw new InvalidOperationException("已有一个 ADOFAI VFX Worker 正在渲染。");
         }
 
-        if (variant.Profile != OutputProfile.VideoVfx)
+        if (variant.Profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
         {
-            throw new NotSupportedException("首个测试 Worker 目前只支持单个 Video VFX 输出。");
+            throw new NotSupportedException("当前独立 Worker 支持 Video VFX 与 Video VFX Pro；含离线滤镜的版本尚未开放。");
         }
 
         var workerExecutable = FindStandaloneWorker();
@@ -67,7 +67,7 @@ internal sealed class RenderWorkerClient : IDisposable
         var chartName = Path.GetFileNameWithoutExtension(chart.Path);
         var outputPath = Path.Combine(
             outputDirectory,
-            $"{chartName}-VideoVFX-{variant.Resolution.Name}-{variant.FramesPerSecond}fps.mp4");
+            $"{chartName}-{variant.Profile}-{variant.Resolution.Name}-{variant.FramesPerSecond}fps.mp4");
         _statusPath = Path.Combine(outputDirectory, "render-status.json");
 
         var job = new WorkerJob
@@ -77,7 +77,7 @@ internal sealed class RenderWorkerClient : IDisposable
             OutputPath = outputPath,
             StatusPath = _statusPath,
             PreviewDirectory = previewDirectory,
-            Profile = "VideoVfx",
+            Profile = variant.Profile.ToString(),
             Width = variant.Resolution.Width,
             Height = variant.Resolution.Height,
             FramesPerSecond = variant.FramesPerSecond,
