@@ -216,6 +216,7 @@ static void DerivedChartVideoOffset()
     };
     Equal(1778, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
     Equal(1278, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 0.5m));
+    Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 4m * 60m / 135m));
     settings["separateCountdownTime"] = false;
     Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
 }

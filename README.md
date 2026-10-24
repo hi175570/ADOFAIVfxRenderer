@@ -21,6 +21,7 @@ The current implementation milestone includes:
 - offline `AddDecoration`, `MoveDecorations`, `MoveCamera`, `CustomBackground`, and beat-based `RepeatEvents` support;
 - v13-compatible tile units, decoration parallax, camera-relative placement, opening-countdown timing, easing, and per-floor BPM timing;
 - automatic non-destructive derived-chart export with `bgVideo`, countdown-corrected `vidOffset`, and removal of only the visual elements actually baked into the selected profile;
+- deterministic zero-offset mode: offline sampling starts at the game's background-video start time so newly generated charts use `vidOffset: 0` without post-encoding trimming;
 - selectable render content (background/foreground decorations, track, planets, and effects) with UI always excluded;
 - quality-derived and custom kbps bitrate support;
 - dependency-free core regression tests.

@@ -411,7 +411,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             Directory.CreateDirectory(_job.previewDirectory);
             var duration = _job.durationLimitSeconds > 0f
                 ? _job.durationLimitSeconds
-                : (_floorTimes.Length == 0 ? 1f : _floorTimes[^1]) + Math.Max(0f, _job.tailSeconds);
+                : Math.Max(0f, (_floorTimes.Length == 0 ? 1f : _floorTimes[^1]) - _job.renderStartSeconds) +
+                  Math.Max(0f, _job.tailSeconds);
             var totalFrames = Math.Max(1, Mathf.CeilToInt(duration * _job.framesPerSecond));
             _status.totalFrames = totalFrames;
             _status.state = "rendering";
@@ -424,7 +425,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             var watch = Stopwatch.StartNew();
             for (var frame = 0; frame < totalFrames; frame++)
             {
-                var time = frame / (float)_job.framesPerSecond;
+                var time = _job.renderStartSeconds + frame / (float)_job.framesPerSecond;
                 ApplyTimeline(time);
                 _camera.targetTexture = target;
                 _camera.Render();
@@ -727,6 +728,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public int bitrateKbps = 2000;
         public float tailSeconds;
         public float durationLimitSeconds;
+        public float renderStartSeconds;
         public bool includeTrack;
         public bool includePlanets;
         public bool includeEffects;

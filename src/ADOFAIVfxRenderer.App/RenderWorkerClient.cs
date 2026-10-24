@@ -15,6 +15,7 @@ internal sealed class RenderWorkerClient : IDisposable
     private string? _lastStatusJson;
     private string? _activeChartPath;
     private OutputProfile _activeProfile;
+    private decimal _activeRenderStartSeconds;
     private bool _derivedExportAttempted;
 
     public RenderWorkerClient()
@@ -63,6 +64,7 @@ internal sealed class RenderWorkerClient : IDisposable
         ValidateStandaloneWorker(workerExecutable, installation.RootDirectory);
 
         var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        var renderStartSeconds = DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
         var chartDirectory = Path.GetDirectoryName(chart.Path)!;
         var outputDirectory = Path.Combine(chartDirectory, "ADOFAIVfxRenderer Output", timestamp);
         var previewDirectory = Path.Combine(outputDirectory, "preview");
@@ -92,6 +94,7 @@ internal sealed class RenderWorkerClient : IDisposable
             IncludeForegroundDecorations = variant.Content.HasFlag(RenderContent.ForegroundDecorations),
             BitrateKbps = variant.BitrateKbps,
             DurationLimitSeconds = durationLimitSeconds.HasValue ? (float)durationLimitSeconds.Value : 0f,
+            RenderStartSeconds = (float)renderStartSeconds,
             FfmpegPath = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe"),
         };
         var jobPath = Path.Combine(outputDirectory, "render-job.json");
@@ -99,6 +102,7 @@ internal sealed class RenderWorkerClient : IDisposable
         _lastStatusJson = null;
         _activeChartPath = chart.Path;
         _activeProfile = variant.Profile;
+        _activeRenderStartSeconds = renderStartSeconds;
         _derivedExportAttempted = false;
 
         var workerLogPath = Path.Combine(outputDirectory, "worker.log");
@@ -173,7 +177,8 @@ internal sealed class RenderWorkerClient : IDisposable
                                 var derived = DerivedChartExporter.Export(
                                     _activeChartPath ?? throw new InvalidOperationException("缺少活动谱面路径。"),
                                     status.OutputPath,
-                                    _activeProfile);
+                                    _activeProfile,
+                                    _activeRenderStartSeconds);
                                 status.DerivedChartPath = derived.ChartPath;
                                 status.VideoOffsetMilliseconds = derived.VideoOffsetMilliseconds;
                                 status.Message =
@@ -319,6 +324,9 @@ internal sealed class WorkerJob
 
     [JsonPropertyName("durationLimitSeconds")]
     public float DurationLimitSeconds { get; init; }
+
+    [JsonPropertyName("renderStartSeconds")]
+    public float RenderStartSeconds { get; init; }
 
     [JsonPropertyName("ffmpegPath")]
     public string FfmpegPath { get; init; } = "";

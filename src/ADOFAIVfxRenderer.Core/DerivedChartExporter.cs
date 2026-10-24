@@ -70,15 +70,30 @@ public static class DerivedChartExporter
 
     public static int CalculateVideoOffsetMilliseconds(JsonObject settings, decimal renderStartSeconds = 0m)
     {
+        var countdownSeconds = CalculateVideoStartSeconds(settings);
+        return checked((int)Math.Round(
+            (countdownSeconds - renderStartSeconds) * 1000m,
+            MidpointRounding.AwayFromZero));
+    }
+
+    public static decimal CalculateRecommendedRenderStartSeconds(string sourceChartPath)
+    {
+        sourceChartPath = Path.GetFullPath(sourceChartPath);
+        var root = JsonNode.Parse(File.ReadAllText(sourceChartPath, Encoding.UTF8)) as JsonObject
+                   ?? throw new InvalidDataException("谱面根节点不是 JSON 对象。");
+        var settings = root["settings"] as JsonObject
+                       ?? throw new InvalidDataException("谱面缺少 settings。");
+        return CalculateVideoStartSeconds(settings);
+    }
+
+    private static decimal CalculateVideoStartSeconds(JsonObject settings)
+    {
         var separateCountdown = settings["separateCountdownTime"]?.GetValue<bool>() ?? false;
         var countdownTicks = settings["countdownTicks"]?.GetValue<int>() ?? 4;
         var bpm = ReadDecimal(settings["bpm"], 100m);
         if (bpm <= 0m) throw new InvalidDataException("settings.bpm 必须大于零。");
 
-        var countdownSeconds = separateCountdown ? Math.Max(0, countdownTicks) * 60m / bpm : 0m;
-        return checked((int)Math.Round(
-            (countdownSeconds - renderStartSeconds) * 1000m,
-            MidpointRounding.AwayFromZero));
+        return separateCountdown ? Math.Max(0, countdownTicks) * 60m / bpm : 0m;
     }
 
     private static decimal ReadDecimal(JsonNode? node, decimal fallback)
