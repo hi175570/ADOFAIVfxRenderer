@@ -1,7 +1,6 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Globalization;
 
 namespace ADOFAIVfxRenderer.Core;
 
@@ -43,7 +42,7 @@ public static class DerivedChartExporter
         var sourceDirectory = Path.GetDirectoryName(sourceChartPath)!;
         var relativeVideoPath = Path.GetRelativePath(sourceDirectory, renderedVideoPath)
             .Replace(Path.DirectorySeparatorChar, '/');
-        var videoOffset = CalculateVideoOffsetMilliseconds(settings, renderStartSeconds);
+        var videoOffset = VideoSynchronizationCalculator.Calculate(root, renderStartSeconds).VideoOffsetMilliseconds;
 
         settings["bgVideo"] = relativeVideoPath;
         settings["vidOffset"] = videoOffset;
@@ -68,11 +67,12 @@ public static class DerivedChartExporter
             removedBackgroundEvents);
     }
 
-    public static int CalculateVideoOffsetMilliseconds(JsonObject settings, decimal renderStartSeconds = 0m)
+    public static int CalculateVideoOffsetMilliseconds(JsonObject chartOrSettings, decimal renderStartSeconds = 0m)
     {
-        var countdownSeconds = CalculateVideoStartSeconds(settings);
+        if (chartOrSettings["settings"] is JsonObject)
+            return VideoSynchronizationCalculator.Calculate(chartOrSettings, renderStartSeconds).VideoOffsetMilliseconds;
         return checked((int)Math.Round(
-            (countdownSeconds - renderStartSeconds) * 1000m,
+            -renderStartSeconds * 1000m,
             MidpointRounding.AwayFromZero));
     }
 
@@ -83,29 +83,7 @@ public static class DerivedChartExporter
                    ?? throw new InvalidDataException("谱面根节点不是 JSON 对象。");
         var settings = root["settings"] as JsonObject
                        ?? throw new InvalidDataException("谱面缺少 settings。");
-        return CalculateVideoStartSeconds(settings);
-    }
-
-    private static decimal CalculateVideoStartSeconds(JsonObject settings)
-    {
-        var separateCountdown = settings["separateCountdownTime"]?.GetValue<bool>() ?? false;
-        var countdownTicks = settings["countdownTicks"]?.GetValue<int>() ?? 4;
-        var bpm = ReadDecimal(settings["bpm"], 100m);
-        if (bpm <= 0m) throw new InvalidDataException("settings.bpm 必须大于零。");
-
-        return separateCountdown ? Math.Max(0, countdownTicks) * 60m / bpm : 0m;
-    }
-
-    private static decimal ReadDecimal(JsonNode? node, decimal fallback)
-    {
-        if (node == null) return fallback;
-        return decimal.TryParse(
-            node.ToString(),
-            NumberStyles.Float,
-            CultureInfo.InvariantCulture,
-            out var value)
-            ? value
-            : fallback;
+        return 0m;
     }
 
     private static int RemoveBakedDecorations(JsonObject root, OutputProfile profile)

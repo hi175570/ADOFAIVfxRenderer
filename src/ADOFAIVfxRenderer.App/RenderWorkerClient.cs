@@ -22,7 +22,7 @@ internal sealed class RenderWorkerClient : IDisposable
     {
         _timer = new DispatcherTimer(DispatcherPriority.Background)
         {
-            Interval = TimeSpan.FromMilliseconds(250),
+            Interval = TimeSpan.FromMilliseconds(50),
         };
         _timer.Tick += PollStatus;
     }
@@ -30,6 +30,11 @@ internal sealed class RenderWorkerClient : IDisposable
     public event Action<WorkerStatus>? StatusChanged;
 
     public bool IsRunning => _timer.IsEnabled;
+
+    public async Task WaitForExitAsync()
+    {
+        if (_workerProcess is { HasExited: false }) await _workerProcess.WaitForExitAsync();
+    }
 
     public string Start(
         GameInstallation installation,
@@ -190,12 +195,12 @@ internal sealed class RenderWorkerClient : IDisposable
                                 status.Error = exception.Message;
                             }
                         }
-                        _lastStatusJson = json;
-                        StatusChanged?.Invoke(status);
                         if (status.State is "complete" or "failed" or "cancelled")
                         {
                             _timer.Stop();
                         }
+                        _lastStatusJson = json;
+                        StatusChanged?.Invoke(status);
                     }
                 }
             }
@@ -370,4 +375,7 @@ internal sealed class WorkerStatus
 
     [JsonPropertyName("secondsPerFrame")]
     public float SecondsPerFrame { get; init; }
+
+    [JsonPropertyName("chartDurationSeconds")]
+    public float ChartDurationSeconds { get; init; }
 }

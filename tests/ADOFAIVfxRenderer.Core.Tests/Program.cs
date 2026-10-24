@@ -1,4 +1,5 @@
 using ADOFAIVfxRenderer.Core;
+using ADOFAIVfxTimeline;
 
 var tests = new (string Name, Action Run)[]
 {
@@ -16,6 +17,9 @@ var tests = new (string Name, Action Run)[]
     ("Selected chart version", SelectedChartVersion),
     ("Current local game probe when present", CurrentLocalGameProbe),
     ("Derived chart video offset", DerivedChartVideoOffset),
+    ("Video sync follows first playable floor", VideoSyncFollowsFirstPlayableFloor),
+    ("Timeline handles midspins and tempo", TimelineHandlesMidspinsAndTempo),
+    ("Current target timeline when present", CurrentTargetTimeline),
     ("Derived Video VFX ownership", DerivedVideoVfxOwnership),
     ("Derived Video VFX Pro ownership", DerivedVideoVfxProOwnership),
 };
@@ -214,11 +218,96 @@ static void DerivedChartVideoOffset()
         ["countdownTicks"] = 4,
         ["bpm"] = 135,
     };
-    Equal(1778, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
-    Equal(1278, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 0.5m));
-    Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 4m * 60m / 135m));
+    Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
+    Equal(-500, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 0.5m));
+    Equal(-1778, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 4m * 60m / 135m));
     settings["separateCountdownTime"] = false;
     Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
+}
+
+static void VideoSyncFollowsFirstPlayableFloor()
+{
+    static System.Text.Json.Nodes.JsonObject Chart(double firstAngle) => new()
+    {
+        ["angleData"] = new System.Text.Json.Nodes.JsonArray(firstAngle, 0d),
+        ["settings"] = new System.Text.Json.Nodes.JsonObject
+        {
+            ["bpm"] = 120,
+            ["countdownTicks"] = 4,
+            ["separateCountdownTime"] = true,
+        },
+        ["actions"] = new System.Text.Json.Nodes.JsonArray(),
+    };
+
+    Equal(0, VideoSynchronizationCalculator.Calculate(Chart(0d)).VideoOffsetMilliseconds);
+    Equal(-250, VideoSynchronizationCalculator.Calculate(Chart(270d)).VideoOffsetMilliseconds);
+    Equal(250, VideoSynchronizationCalculator.Calculate(Chart(90d)).VideoOffsetMilliseconds);
+    Equal(-500, VideoSynchronizationCalculator.Calculate(Chart(0d), 0.5m).VideoOffsetMilliseconds);
+
+    const string target = @"C:\D\games\ADOFAI\adofai\[------OH_MY_PCCCCCCCC------]\THE STAR SYSTEM'S CALLING\main.adofai";
+    if (File.Exists(target))
+    {
+        var root = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(target))!.AsObject();
+        Equal(0, VideoSynchronizationCalculator.Calculate(root).VideoOffsetMilliseconds);
+    }
+}
+
+static void TimelineHandlesMidspinsAndTempo()
+{
+    var result = AdoTimelineCalculator.Calculate(
+        [360d, 999d, 180d, 360d],
+        [
+            new TimelineActionData { Order = 0, EventType = "SetSpeed", Floor = 0, SpeedType = "Bpm", BeatsPerMinute = 120d },
+            new TimelineActionData { Order = 1, EventType = "Pause", Floor = 3, Duration = 1d },
+        ],
+        initialBpm: 60d);
+
+    Equal(5, result.FloorTimesSeconds.Length);
+    Equal(999d, result.RotationAngles[1]);
+    Near(2d, result.DurationSeconds, 0.000001d);
+}
+
+static void CurrentTargetTimeline()
+{
+    const string path = @"C:\D\games\ADOFAI\adofai\[------OH_MY_PCCCCCCCC------]\THE STAR SYSTEM'S CALLING\main.adofai";
+    if (!File.Exists(path))
+    {
+        Console.WriteLine("      SKIP: current target chart is absent.");
+        return;
+    }
+
+    var root = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+    var settings = root["settings"]!.AsObject();
+    var angles = root["angleData"]!.AsArray().Select(node => node!.GetValue<double>()).ToArray();
+    var actions = root["actions"]!.AsArray().Select((node, order) =>
+    {
+        var action = node!.AsObject();
+        return new TimelineActionData
+        {
+            Order = order,
+            EventType = action["eventType"]?.GetValue<string>() ?? "",
+            Floor = action["floor"]?.GetValue<int>() ?? 0,
+            AngleOffset = action["angleOffset"]?.GetValue<double>() ?? 0d,
+            SpeedType = action["speedType"]?.GetValue<string>() ?? "",
+            BeatsPerMinute = action["beatsPerMinute"]?.GetValue<double>() ?? 0d,
+            BpmMultiplier = action["bpmMultiplier"]?.GetValue<double>() ?? 1d,
+            Duration = action["duration"]?.GetValue<double>() ?? 0d,
+            Planets = action["planets"]?.GetValue<string>() ?? "",
+        };
+    }).ToArray();
+
+    var result = AdoTimelineCalculator.Calculate(
+        angles,
+        actions,
+        settings["bpm"]!.GetValue<double>(),
+        (settings["pitch"]?.GetValue<double>() ?? 100d) / 100d);
+    Near(292.977799140286d, result.DurationSeconds, 0.00001d);
+}
+
+static void Near(double expected, double actual, double tolerance)
+{
+    if (Math.Abs(expected - actual) > tolerance)
+        throw new InvalidOperationException($"Expected {expected} ± {tolerance}, got {actual}.");
 }
 
 static void DerivedVideoVfxOwnership() => TestDerivedOwnership(
@@ -261,7 +350,7 @@ static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCo
         var result = DerivedChartExporter.Export(chartPath, videoPath, profile);
         Equal(expectedDecorationCount, result.RemovedDecorations);
         Equal(1, result.RemovedBackgroundEvents);
-        Equal(2000, result.VideoOffsetMilliseconds);
+        Equal(0, result.VideoOffsetMilliseconds);
         var derived = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(result.ChartPath))!.AsObject();
         Equal("output/render.mp4", derived["settings"]!["bgVideo"]!.GetValue<string>());
         True(derived["actions"]!.AsArray().Any(node => node!["eventType"]!.GetValue<string>() == "SetFilter"));

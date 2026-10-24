@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using ADOFAIVfxTimeline;
 using Debug = UnityEngine.Debug;
 
 namespace ADOFAIVfxWorker
@@ -18,6 +19,9 @@ public sealed class WorkerRuntime : MonoBehaviour
     private const float TileSize = 1.5f;
     private const float DefaultCameraOrthoSize = 5f;
     private readonly Dictionary<string, Texture2D> _textures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Sprite> _sprites = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Material> _blendMaterials = new(StringComparer.Ordinal);
+    private Material? _spriteMaterial;
     private readonly List<DecorationState> _decorations = new();
     private readonly List<MoveEvent> _moves = new();
     private readonly List<MoveEvent> _activeMoves = new();
@@ -31,11 +35,14 @@ public sealed class WorkerRuntime : MonoBehaviour
     private int _nextMove;
     private int _nextCameraEvent;
     private int _nextBackgroundEvent;
+    private int _eventSequence;
     private float[] _floorTimes = Array.Empty<float>();
     private float[] _floorBpms = Array.Empty<float>();
     private Vector2[] _floorPositions = Array.Empty<Vector2>();
+    private AdoTimelineResult _timeline = null!;
     private string _chartDirectory = "";
     private float _pitch = 1f;
+    private float _initialZoomRatio = 1f;
     private SpriteRenderer? _backgroundRenderer;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -91,16 +98,15 @@ public sealed class WorkerRuntime : MonoBehaviour
         var settings = (JObject?)chart["settings"] ?? new JObject();
         var bpm = settings.Value<float?>("bpm") ?? 100f;
         _pitch = Math.Max(0.01f, (settings.Value<float?>("pitch") ?? 100f) / 100f);
-        BuildFloorTimeline(
-            (JArray?)chart["angleData"],
-            (JArray?)chart["actions"],
-            bpm,
-            settings.Value<int?>("countdownTicks") ?? 4);
+        var actions = (JArray?)chart["actions"] ?? new JArray();
+        BuildFloorTimeline(chart, actions, bpm);
+        _status.chartDurationSeconds = (float)_timeline.DurationSeconds;
 
         var cameraObject = new GameObject("Render Camera");
         _camera = cameraObject.AddComponent<Camera>();
         _camera.orthographic = true;
-        _camera.orthographicSize = DefaultCameraOrthoSize * Math.Max(0.01f, (settings.Value<float?>("zoom") ?? 100f) / 100f);
+        _initialZoomRatio = Math.Max(0.01f, (settings.Value<float?>("zoom") ?? 100f) / 100f);
+        _camera.orthographicSize = DefaultCameraOrthoSize * _initialZoomRatio;
         var initialCameraOffset = ReadVector2(settings["position"], Vector2.zero) * TileSize;
         var initialCameraBase = (settings.Value<string>("relativeTo") ?? "Player") == "Tile"
             ? _floorPositions[0]
@@ -124,7 +130,6 @@ public sealed class WorkerRuntime : MonoBehaviour
             }
         }
 
-        var actions = (JArray?)chart["actions"] ?? new JArray();
         var repeatRules = BuildRepeatRules(actions);
         foreach (var token in actions)
         {
@@ -134,114 +139,86 @@ public sealed class WorkerRuntime : MonoBehaviour
             }
 
             var eventType = action.Value<string>("eventType");
-            foreach (var repeatedAngleOffset in GetRepeatedAngleOffsets(action, repeatRules))
+            foreach (var repeat in GetRepeatedPlacements(action, repeatRules, _floorTimes.Length))
             {
                 if (eventType == "MoveDecorations")
                 {
-                    AddMoveEvent(action, repeatedAngleOffset);
+                    AddMoveEvent(action, repeat.Floor, repeat.AngleOffset);
                 }
                 else if (eventType == "MoveCamera")
                 {
-                    AddCameraEvent(action, repeatedAngleOffset);
+                    AddCameraEvent(action, repeat.Floor, repeat.AngleOffset);
                 }
                 else if (eventType == "CustomBackground")
                 {
-                    AddBackgroundEvent(action, repeatedAngleOffset);
+                    AddBackgroundEvent(action, repeat.Floor, repeat.AngleOffset);
                 }
             }
         }
 
-        _moves.Sort(static (left, right) => left.Start.CompareTo(right.Start));
-        _cameraEvents.Sort(static (left, right) => left.Start.CompareTo(right.Start));
-        _backgroundEvents.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+        _moves.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
+        _cameraEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
+        _backgroundEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
         ApplyTimeline(0f);
     }
 
-    private void BuildFloorTimeline(JArray? angles, JArray? actions, float initialBpm, int countdownTicks)
+    private void BuildFloorTimeline(JObject chart, JArray actions, float initialBpm)
     {
-        var count = Math.Max(1, angles?.Count ?? 1);
-        _floorTimes = new float[count];
-        _floorBpms = new float[count];
-        _floorPositions = new Vector2[count];
-        var actionsByFloor = new Dictionary<int, List<JObject>>();
-        if (actions != null)
+        var angles = ReadAngles(chart);
+        var timelineActions = new List<TimelineActionData>(actions.Count);
+        var order = 0;
+        foreach (var action in actions.OfType<JObject>())
         {
-            foreach (var action in actions.OfType<JObject>())
+            timelineActions.Add(new TimelineActionData
             {
-                if (action.Value<string>("eventType") is "SetSpeed" or "Pause" or "Twirl" or "MultiPlanet")
-                {
-                    var floor = action.Value<int?>("floor") ?? 0;
-                    if (!actionsByFloor.TryGetValue(floor, out var list))
-                    {
-                        actionsByFloor[floor] = list = new List<JObject>();
-                    }
-                    list.Add(action);
-                }
-            }
+                Order = order++,
+                EventType = action.Value<string>("eventType") ?? "",
+                Floor = action.Value<int?>("floor") ?? 0,
+                AngleOffset = action.Value<double?>("angleOffset") ?? 0d,
+                SpeedType = action.Value<string>("speedType") ?? "",
+                BeatsPerMinute = action.Value<double?>("beatsPerMinute") ?? initialBpm,
+                BpmMultiplier = action.Value<double?>("bpmMultiplier") ?? 1d,
+                Duration = action.Value<double?>("duration") ?? 0d,
+                Planets = action.Value<string>("planets") ?? "",
+            });
         }
 
-        var bpm = initialBpm;
-        var twirled = false;
-        var threePlanets = false;
-        for (var floor = 0; floor < count; floor++)
+        _timeline = AdoTimelineCalculator.Calculate(angles, timelineActions, initialBpm, _pitch);
+        _floorTimes = _timeline.FloorTimesSeconds.Select(static value => (float)value).ToArray();
+        _floorBpms = _timeline.FloorBpms.Select(static value => (float)value).ToArray();
+        _floorPositions = new Vector2[angles.Count + 1];
+        var entryAngle = -Mathf.PI * 0.5f;
+        for (var floor = 0; floor < angles.Count; floor++)
         {
-            var pauseBeats = 0f;
-            if (actionsByFloor.TryGetValue(floor, out var changes))
-            {
-                foreach (var change in changes)
-                {
-                    switch (change.Value<string>("eventType"))
-                    {
-                    case "SetSpeed":
-                        bpm = change.Value<string>("speedType") == "Multiplier"
-                            ? bpm * (change.Value<float?>("bpmMultiplier") ?? 1f)
-                            : change.Value<float?>("beatsPerMinute") ?? bpm;
-                        break;
-                    case "Pause":
-                        pauseBeats += change.Value<float?>("duration") ?? 0f;
-                        break;
-                    case "Twirl":
-                        twirled = !twirled;
-                        break;
-                    case "MultiPlanet":
-                        threePlanets = change.Value<string>("planets") == "ThreePlanets";
-                        break;
-                    }
-                }
-            }
-
-            _floorBpms[floor] = Math.Max(1f, bpm);
-            if (floor >= count - 1)
-            {
-                break;
-            }
-
-            var currentAngle = angles?[floor]?.Value<float>() ?? 0f;
-            var nextIndex = floor + 1;
-            var nextAngle = angles?[nextIndex]?.Value<float>() ?? currentAngle;
-            var nextIsMidspin = Mathf.Approximately(nextAngle, 999f);
-            if (nextIsMidspin && nextIndex + 1 < count)
-            {
-                nextAngle = angles?[nextIndex + 1]?.Value<float>() ?? currentAngle;
-            }
-
-            var turn = Mathf.Repeat(nextAngle - currentAngle + (nextIsMidspin ? 360f : 540f), 360f);
-            if (twirled) turn = 360f - turn;
-            if (turn < 0.001f) turn = 360f;
-            turn += pauseBeats * 180f;
-            if (threePlanets && !nextIsMidspin) turn = turn > 60f ? turn - 60f : turn + 300f;
-            var seconds = turn / 180f * 60f / (_floorBpms[floor] * _pitch);
-            if (floor == 0)
-            {
-                seconds += Math.Max(0, countdownTicks - 1) * 60f / (Math.Max(1f, initialBpm) * _pitch);
-            }
-            _floorTimes[floor + 1] = _floorTimes[floor] + seconds;
-
-            var positionAngle = Mathf.Approximately(currentAngle, 999f) ? 0f : currentAngle;
-            var radians = positionAngle * Mathf.Deg2Rad;
+            var radians = Mathf.Approximately((float)angles[floor], 999f)
+                ? entryAngle
+                : (90f - (float)angles[floor]) * Mathf.Deg2Rad;
             _floorPositions[floor + 1] = _floorPositions[floor] +
                 new Vector2(Mathf.Cos(radians), Mathf.Sin(radians)) * TileSize;
+            entryAngle = Mathf.Repeat(radians + Mathf.PI, Mathf.PI * 2f);
         }
+    }
+
+    private static List<double> ReadAngles(JObject chart)
+    {
+        if (chart["angleData"] is JArray angleData && angleData.Count > 0)
+            return angleData.Select(static token => token.Value<double>()).ToList();
+
+        var map = new Dictionary<char, double>
+        {
+            ['p'] = 15d, ['J'] = 30d, ['E'] = 45d, ['T'] = 60d, ['o'] = 75d,
+            ['U'] = 90d, ['q'] = 105d, ['G'] = 120d, ['Q'] = 135d, ['H'] = 150d,
+            ['W'] = 165d, ['L'] = 180d, ['x'] = 195d, ['N'] = 210d, ['Z'] = 225d,
+            ['F'] = 240d, ['V'] = 255d, ['D'] = 270d, ['Y'] = 285d, ['B'] = 300d,
+            ['C'] = 315d, ['M'] = 330d, ['A'] = 345d, ['R'] = 360d, ['!'] = 999d,
+        };
+        var pathData = chart.Value<string>("pathData") ?? "";
+        var result = new List<double>(pathData.Length);
+        foreach (var symbol in pathData)
+            if (map.TryGetValue(symbol, out var angle)) result.Add(angle);
+        if (result.Count == 0)
+            throw new InvalidDataException("Chart has neither angleData nor a supported pathData.");
+        return result;
     }
 
     private void AddDecoration(JObject data)
@@ -258,12 +235,27 @@ public sealed class WorkerRuntime : MonoBehaviour
             return;
         }
 
-        var texture = GetTexture(imagePath);
-        if (texture == null) return;
+        var sprite = GetSprite(imagePath);
+        if (sprite == null) return;
 
         var gameObject = new GameObject(imageName);
         var renderer = gameObject.AddComponent<SpriteRenderer>();
-        renderer.sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), new Vector2(0.5f, 0.5f), 100f);
+        renderer.sprite = sprite;
+        var maskingType = data.Value<string>("maskingType") ?? "None";
+        var spriteMask = gameObject.AddComponent<SpriteMask>();
+        spriteMask.sprite = renderer.sprite;
+        spriteMask.alphaCutoff = 0.001f;
+        spriteMask.enabled = false;
+        renderer.maskInteraction = maskingType switch
+        {
+            "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
+            "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
+            _ => SpriteMaskInteraction.None,
+        };
+        ApplyMaterial(
+            renderer,
+            data.Value<string>("blendMode") ?? "None",
+            ReadVector2(data["tile"], Vector2.one));
         var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorPositions.Length - 1);
         var localPosition = ReadVector2(data["position"], Vector2.zero);
         var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
@@ -285,7 +277,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             return;
         }
         renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
-        renderer.enabled = data.Value<bool?>("visible") ?? true;
+        var visible = data.Value<bool?>("visible") ?? true;
 
         var tags = SplitTags(data.Value<string>("tag"));
         var parallax = ReadVector2(data["parallax"], Vector2.zero) / 100f;
@@ -307,7 +299,14 @@ public sealed class WorkerRuntime : MonoBehaviour
             opacity,
             data.Value<bool?>("lockRotation") ?? false,
             data.Value<bool?>("lockScale") ?? false,
-            depth);
+            depth,
+            spriteMask,
+            maskingType,
+            visible,
+            data.Value<bool?>("useMaskingDepth") ?? false,
+            data.Value<int?>("maskingFrontDepth") ?? depth,
+            data.Value<int?>("maskingBackDepth") ?? depth,
+            _initialZoomRatio);
         state.ApplyVisual(_camera);
         _decorations.Add(state);
     }
@@ -321,10 +320,55 @@ public sealed class WorkerRuntime : MonoBehaviour
             Destroy(texture);
             return null;
         }
-        texture.wrapMode = TextureWrapMode.Clamp;
+        texture.wrapMode = TextureWrapMode.Repeat;
         texture.filterMode = FilterMode.Bilinear;
         _textures[imagePath] = texture;
         return texture;
+    }
+
+    private Sprite? GetSprite(string imagePath)
+    {
+        if (_sprites.TryGetValue(imagePath, out var existing)) return existing;
+        var texture = GetTexture(imagePath);
+        if (texture == null) return null;
+        var sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), new Vector2(0.5f, 0.5f), 100f);
+        _sprites[imagePath] = sprite;
+        return sprite;
+    }
+
+    private void ApplyMaterial(SpriteRenderer renderer, string blendMode, Vector2 tile)
+    {
+        Material material;
+        if (blendMode is "None" or "Normal" or "")
+        {
+            if (_spriteMaterial == null)
+            {
+                var spriteShader = Resources.Load<Shader>("ADOFAISprite");
+                if (spriteShader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Sprite shader resource.");
+                _spriteMaterial = new Material(spriteShader) { name = "ADOFAI VFX Sprite" };
+            }
+            material = _spriteMaterial;
+        }
+        else if (!_blendMaterials.TryGetValue(blendMode, out material))
+        {
+            var shader = Resources.Load<Shader>("ADOFAIBlend");
+            if (shader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Blend shader resource.");
+            material = new Material(shader) { name = $"ADOFAI {blendMode} Blend" };
+            material.SetFloat("_BlendMode", blendMode switch
+            {
+                "Difference" => 0f,
+                "Overlay" => 1f,
+                "SoftLight" => 2f,
+                "LinearDodge" => 3f,
+                _ => throw new NotSupportedException($"Unsupported decoration blend mode: {blendMode}"),
+            });
+            _blendMaterials[blendMode] = material;
+        }
+        renderer.sharedMaterial = material;
+        var properties = new MaterialPropertyBlock();
+        renderer.GetPropertyBlock(properties);
+        properties.SetVector("_Tile", new Vector4(Math.Max(0.000001f, tile.x), Math.Max(0.000001f, tile.y), 0f, 0f));
+        renderer.SetPropertyBlock(properties);
     }
 
     private static Dictionary<int, Dictionary<string, RepeatRule>> BuildRepeatRules(JArray actions)
@@ -333,26 +377,31 @@ public sealed class WorkerRuntime : MonoBehaviour
         foreach (var repeat in actions.OfType<JObject>().Where(static action =>
                      action.Value<string>("eventType") == "RepeatEvents"))
         {
-            if ((repeat.Value<string>("repeatType") ?? "Beat") != "Beat") continue;
             var floor = repeat.Value<int?>("floor") ?? 0;
             if (!result.TryGetValue(floor, out var byTag)) result[floor] = byTag = new(StringComparer.Ordinal);
             var rule = new RepeatRule(
-                Math.Max(0, repeat.Value<int?>("repetitions") ?? 0),
-                Math.Max(0f, repeat.Value<float?>("interval") ?? 0f));
+                repeat.Value<string>("repeatType") ?? "Beat",
+                Math.Max(0, (repeat.Value<string>("repeatType") ?? "Beat") == "Beat"
+                    ? repeat.Value<int?>("repetitions") ?? 0
+                    : repeat.Value<int?>("floorCount") ?? 0),
+                Math.Max(0f, repeat.Value<float?>("interval") ?? 0f),
+                Math.Max(1, repeat.Value<int?>("gapLength") ?? 1),
+                repeat.Value<bool?>("executeOnCurrentFloor") ?? false);
             foreach (var tag in SplitTags(repeat.Value<string>("tag"))) byTag[tag] = rule;
         }
         return result;
     }
 
-    private static IEnumerable<float> GetRepeatedAngleOffsets(
+    private static IEnumerable<RepeatedPlacement> GetRepeatedPlacements(
         JObject action,
-        Dictionary<int, Dictionary<string, RepeatRule>> rules)
+        Dictionary<int, Dictionary<string, RepeatRule>> rules,
+        int floorCount)
     {
         var baseOffset = action.Value<float?>("angleOffset") ?? 0f;
         var floor = action.Value<int?>("floor") ?? 0;
         if (!rules.TryGetValue(floor, out var byTag) || string.IsNullOrWhiteSpace(action.Value<string>("eventTag")))
         {
-            yield return baseOffset;
+            yield return new RepeatedPlacement(floor, baseOffset);
             yield break;
         }
 
@@ -363,42 +412,55 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
         if (matched == null)
         {
-            yield return baseOffset;
+            yield return new RepeatedPlacement(floor, baseOffset);
             yield break;
         }
 
-        for (var repetition = 0; repetition <= matched.Repetitions; repetition++)
+        for (var repetition = 0; repetition <= matched.Count; repetition++)
         {
-            yield return baseOffset + matched.IntervalBeats * repetition * 180f;
+            if (matched.Type == "Beat")
+            {
+                yield return new RepeatedPlacement(floor, baseOffset + matched.IntervalBeats * repetition * 180f);
+            }
+            else
+            {
+                var repeatedFloor = floor + repetition * matched.GapLength;
+                if (repeatedFloor >= floorCount) yield break;
+                yield return new RepeatedPlacement(repeatedFloor, baseOffset);
+            }
         }
     }
 
-    private void AddMoveEvent(JObject data, float angleOffset)
+    private void AddMoveEvent(JObject data, int repeatedFloor, float angleOffset)
     {
-        var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorTimes.Length - 1);
-        var bpm = _floorBpms[floor];
-        var start = _floorTimes[floor] + AngleOffsetSeconds(angleOffset, bpm, _pitch);
+        var floor = Math.Clamp(repeatedFloor, 0, _floorTimes.Length - 1);
+        var bpm = (float)_timeline.BpmAtFloorAngleOffset(floor, angleOffset);
+        var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
-        _moves.Add(new MoveEvent(start, duration, SplitTags(data.Value<string>("tag")), data));
+        var replaceSprite = HasValue(data, "decorationImage");
+        Sprite? sprite = null;
+        if (replaceSprite && data.Value<string>("decorationImage") is { Length: > 0 } imageName)
+        {
+            var imagePath = Path.Combine(_chartDirectory, imageName);
+            if (File.Exists(imagePath)) sprite = GetSprite(imagePath);
+        }
+        _moves.Add(new MoveEvent(start, duration, SplitTags(data.Value<string>("tag")), data, replaceSprite, sprite, _eventSequence++));
     }
 
-    private void AddCameraEvent(JObject data, float angleOffset)
+    private void AddCameraEvent(JObject data, int repeatedFloor, float angleOffset)
     {
-        var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorTimes.Length - 1);
-        var bpm = _floorBpms[floor];
-        var start = _floorTimes[floor] + AngleOffsetSeconds(angleOffset, bpm, _pitch);
+        var floor = Math.Clamp(repeatedFloor, 0, _floorTimes.Length - 1);
+        var bpm = (float)_timeline.BpmAtFloorAngleOffset(floor, angleOffset);
+        var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
-        _cameraEvents.Add(new CameraEvent(start, duration, data, _floorPositions[floor]));
+        _cameraEvents.Add(new CameraEvent(start, duration, data, _floorPositions[floor], _eventSequence++));
     }
 
-    private void AddBackgroundEvent(JObject data, float angleOffset)
+    private void AddBackgroundEvent(JObject data, int repeatedFloor, float angleOffset)
     {
-        var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorTimes.Length - 1);
-        var start = _floorTimes[floor] + AngleOffsetSeconds(
-            angleOffset,
-            _floorBpms[floor],
-            _pitch);
-        _backgroundEvents.Add(new BackgroundEvent(start, data));
+        var floor = Math.Clamp(repeatedFloor, 0, _floorTimes.Length - 1);
+        var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
+        _backgroundEvents.Add(new BackgroundEvent(start, data, _eventSequence++));
     }
 
     private IEnumerator RenderFrames()
@@ -423,6 +485,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             target = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
             frameTexture = new Texture2D(_job.width, _job.height, TextureFormat.RGBA32, false, false);
             var watch = Stopwatch.StartNew();
+            var previewWatch = Stopwatch.StartNew();
             for (var frame = 0; frame < totalFrames; frame++)
             {
                 var time = _job.renderStartSeconds + frame / (float)_job.framesPerSecond;
@@ -446,11 +509,12 @@ public sealed class WorkerRuntime : MonoBehaviour
                 _status.percent = completed * 100f / totalFrames;
                 _status.renderedFramesPerSecond = (float)speed;
                 _status.secondsPerFrame = (float)(1d / speed);
-                if (frame % Math.Max(1, _job.framesPerSecond / 2) == 0 || completed == totalFrames)
+                if (previewWatch.Elapsed.TotalSeconds >= 0.1d || completed == totalFrames)
                 {
-                    _status.previewPath = WritePreview(ImageConversion.EncodeToPNG(frameTexture), completed);
+                    _status.previewPath = WritePreview(ImageConversion.EncodeToJPG(frameTexture, 85), completed);
                     _status.message = $"已完成 {completed:N0} / {totalFrames:N0} 帧";
                     WriteStatus();
+                    previewWatch.Restart();
                 }
                 yield return null;
             }
@@ -504,6 +568,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         {
             AdvanceMoves(_moves[_nextMove].Start);
             var move = _moves[_nextMove++];
+            for (var index = _activeMoves.Count - 1; index >= 0; index--)
+            {
+                _activeMoves[index].CompleteConflicts(move);
+                if (_activeMoves[index].IsComplete) _activeMoves.RemoveAt(index);
+            }
             move.Capture(_decorations);
             if (!move.Apply(move.Start)) _activeMoves.Add(move);
         }
@@ -513,6 +582,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         {
             AdvanceCamera(_cameraEvents[_nextCameraEvent].Start);
             var cameraEvent = _cameraEvents[_nextCameraEvent++];
+            for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
+            {
+                _activeCameraEvents[index].CompleteConflicts(_camera, cameraEvent);
+                if (_activeCameraEvents[index].IsComplete) _activeCameraEvents.RemoveAt(index);
+            }
             cameraEvent.Capture(_camera);
             if (!cameraEvent.Apply(_camera, cameraEvent.Start)) _activeCameraEvents.Add(cameraEvent);
         }
@@ -615,10 +689,13 @@ public sealed class WorkerRuntime : MonoBehaviour
         if (!_ffmpeg.Start()) throw new InvalidOperationException("Unable to start FFmpeg.");
     }
 
-    private string WritePreview(byte[] png, int frame)
+    private string WritePreview(byte[] imageBytes, int frame)
     {
-        var path = Path.Combine(_job.previewDirectory, $"preview-{frame % 2}.png");
-        File.WriteAllBytes(path, png);
+        var path = Path.Combine(_job.previewDirectory, $"preview-{frame % 2}.jpg");
+        var temporary = path + ".tmp";
+        File.WriteAllBytes(temporary, imageBytes);
+        if (File.Exists(path)) File.Delete(path);
+        File.Move(temporary, path);
         return path;
     }
 
@@ -652,9 +729,6 @@ public sealed class WorkerRuntime : MonoBehaviour
         return Path.GetFullPath(Path.Combine(Application.dataPath, "..", "render-job.json"));
     }
 
-    private static float AngleOffsetSeconds(float angleOffset, float bpm, float pitch) =>
-        angleOffset / 180f * 60f / (Math.Max(1f, bpm) * Math.Max(0.01f, pitch));
-
     private static Vector2 ReadVector2(JToken? token, Vector2 fallback)
     {
         if (token is not JArray { Count: >= 2 } array) return fallback;
@@ -676,6 +750,10 @@ public sealed class WorkerRuntime : MonoBehaviour
     private static float EaseAmount(float amount, string? ease)
     {
         amount = Mathf.Clamp01(amount);
+        const float back = 1.70158f;
+        const float backInOut = back * 1.525f;
+        var elastic = 2f * Mathf.PI / 3f;
+        var elasticInOut = 2f * Mathf.PI / 4.5f;
         return ease switch
         {
             "InSine" => 1f - Mathf.Cos(amount * Mathf.PI * 0.5f),
@@ -687,13 +765,60 @@ public sealed class WorkerRuntime : MonoBehaviour
             "InCubic" => amount * amount * amount,
             "OutCubic" => 1f - Mathf.Pow(1f - amount, 3f),
             "InOutCubic" => amount < 0.5f ? 4f * amount * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 3f) * 0.5f,
+            "InQuart" => Mathf.Pow(amount, 4f),
+            "OutQuart" => 1f - Mathf.Pow(1f - amount, 4f),
+            "InOutQuart" => amount < 0.5f ? 8f * Mathf.Pow(amount, 4f) : 1f - Mathf.Pow(-2f * amount + 2f, 4f) * 0.5f,
+            "InQuint" => Mathf.Pow(amount, 5f),
+            "OutQuint" => 1f - Mathf.Pow(1f - amount, 5f),
+            "InOutQuint" => amount < 0.5f ? 16f * Mathf.Pow(amount, 5f) : 1f - Mathf.Pow(-2f * amount + 2f, 5f) * 0.5f,
+            "InExpo" => amount <= 0f ? 0f : Mathf.Pow(2f, 10f * amount - 10f),
+            "OutExpo" => amount >= 1f ? 1f : 1f - Mathf.Pow(2f, -10f * amount),
+            "InOutExpo" => amount <= 0f ? 0f : amount >= 1f ? 1f : amount < 0.5f
+                ? Mathf.Pow(2f, 20f * amount - 10f) * 0.5f
+                : (2f - Mathf.Pow(2f, -20f * amount + 10f)) * 0.5f,
             "InCirc" => 1f - Mathf.Sqrt(1f - amount * amount),
             "OutCirc" => Mathf.Sqrt(1f - Mathf.Pow(amount - 1f, 2f)),
             "InOutCirc" => amount < 0.5f
                 ? (1f - Mathf.Sqrt(1f - Mathf.Pow(2f * amount, 2f))) * 0.5f
                 : (Mathf.Sqrt(1f - Mathf.Pow(-2f * amount + 2f, 2f)) + 1f) * 0.5f,
+            "InBack" => (back + 1f) * amount * amount * amount - back * amount * amount,
+            "OutBack" => 1f + (back + 1f) * Mathf.Pow(amount - 1f, 3f) + back * Mathf.Pow(amount - 1f, 2f),
+            "InOutBack" => amount < 0.5f
+                ? Mathf.Pow(2f * amount, 2f) * ((backInOut + 1f) * 2f * amount - backInOut) * 0.5f
+                : (Mathf.Pow(2f * amount - 2f, 2f) * ((backInOut + 1f) * (amount * 2f - 2f) + backInOut) + 2f) * 0.5f,
+            "InElastic" => amount <= 0f ? 0f : amount >= 1f ? 1f
+                : -Mathf.Pow(2f, 10f * amount - 10f) * Mathf.Sin((amount * 10f - 10.75f) * elastic),
+            "OutElastic" => amount <= 0f ? 0f : amount >= 1f ? 1f
+                : Mathf.Pow(2f, -10f * amount) * Mathf.Sin((amount * 10f - 0.75f) * elastic) + 1f,
+            "InOutElastic" => amount <= 0f ? 0f : amount >= 1f ? 1f : amount < 0.5f
+                ? -(Mathf.Pow(2f, 20f * amount - 10f) * Mathf.Sin((20f * amount - 11.125f) * elasticInOut)) * 0.5f
+                : Mathf.Pow(2f, -20f * amount + 10f) * Mathf.Sin((20f * amount - 11.125f) * elasticInOut) * 0.5f + 1f,
+            "InBounce" => 1f - EaseOutBounce(1f - amount),
+            "OutBounce" => EaseOutBounce(amount),
+            "InOutBounce" => amount < 0.5f
+                ? (1f - EaseOutBounce(1f - 2f * amount)) * 0.5f
+                : (1f + EaseOutBounce(2f * amount - 1f)) * 0.5f,
             _ => amount,
         };
+    }
+
+    private static float EaseOutBounce(float amount)
+    {
+        const float n1 = 7.5625f;
+        const float d1 = 2.75f;
+        if (amount < 1f / d1) return n1 * amount * amount;
+        if (amount < 2f / d1)
+        {
+            amount -= 1.5f / d1;
+            return n1 * amount * amount + 0.75f;
+        }
+        if (amount < 2.5f / d1)
+        {
+            amount -= 2.25f / d1;
+            return n1 * amount * amount + 0.9375f;
+        }
+        amount -= 2.625f / d1;
+        return n1 * amount * amount + 0.984375f;
     }
 
     private static Color ParseColor(string hex)
@@ -750,6 +875,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public float percent;
         public float renderedFramesPerSecond;
         public float secondsPerFrame;
+        public float chartDurationSeconds;
     }
 
     private sealed class DecorationState
@@ -769,7 +895,14 @@ public sealed class WorkerRuntime : MonoBehaviour
             float opacity,
             bool lockRotation,
             bool lockScale,
-            int depth)
+            int depth,
+            SpriteMask? spriteMask,
+            string maskingType,
+            bool visible,
+            bool useMaskingDepth,
+            int maskingFrontDepth,
+            int maskingBackDepth,
+            float initialZoomRatio)
         {
             Transform = transform;
             Renderer = renderer;
@@ -787,6 +920,13 @@ public sealed class WorkerRuntime : MonoBehaviour
             LockRotation = lockRotation;
             LockScale = lockScale;
             Depth = depth;
+            SpriteMask = spriteMask;
+            MaskingType = maskingType;
+            Visible = visible;
+            UseMaskingDepth = useMaskingDepth;
+            MaskingFrontDepth = maskingFrontDepth;
+            MaskingBackDepth = maskingBackDepth;
+            InitialZoomRatio = initialZoomRatio;
         }
         public Transform Transform { get; }
         public SpriteRenderer Renderer { get; }
@@ -805,6 +945,59 @@ public sealed class WorkerRuntime : MonoBehaviour
         public bool LockRotation { get; }
         public bool LockScale { get; }
         public int Depth { get; set; }
+        public SpriteMask? SpriteMask { get; }
+        public string MaskingType { get; private set; }
+        public bool Visible { get; private set; }
+        public bool UseMaskingDepth { get; private set; }
+        public int MaskingFrontDepth { get; private set; }
+        public int MaskingBackDepth { get; private set; }
+        public float InitialZoomRatio { get; }
+
+        public void SetVisible(bool visible)
+        {
+            Visible = visible;
+            Renderer.enabled = visible && MaskingType != "Mask";
+            if (SpriteMask != null) SpriteMask.enabled = visible && MaskingType == "Mask";
+        }
+
+        public void SetDepth(int depth)
+        {
+            Depth = depth;
+            Renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
+            RefreshMaskRange();
+        }
+
+        public void SetMasking(string? maskingType = null, bool? useDepth = null, int? frontDepth = null, int? backDepth = null)
+        {
+            if (maskingType != null) MaskingType = maskingType;
+            if (useDepth.HasValue) UseMaskingDepth = useDepth.Value;
+            if (frontDepth.HasValue) MaskingFrontDepth = frontDepth.Value;
+            if (backDepth.HasValue) MaskingBackDepth = backDepth.Value;
+            Renderer.maskInteraction = MaskingType switch
+            {
+                "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
+                "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
+                _ => SpriteMaskInteraction.None,
+            };
+            SetVisible(Visible);
+            RefreshMaskRange();
+        }
+
+        public void SetSprite(Sprite? sprite)
+        {
+            Renderer.sprite = sprite;
+            if (SpriteMask != null) SpriteMask.sprite = sprite;
+        }
+
+        private void RefreshMaskRange()
+        {
+            if (SpriteMask == null) return;
+            SpriteMask.isCustomRangeActive = UseMaskingDepth;
+            var front = Math.Min(MaskingFrontDepth, MaskingBackDepth);
+            var back = Math.Max(MaskingFrontDepth, MaskingBackDepth);
+            SpriteMask.frontSortingOrder = Math.Clamp(-front + 1, short.MinValue + 1, short.MaxValue);
+            SpriteMask.backSortingOrder = Math.Clamp(-back, short.MinValue + 1, short.MaxValue);
+        }
 
         public void ApplyVisual(Camera camera)
         {
@@ -827,34 +1020,94 @@ public sealed class WorkerRuntime : MonoBehaviour
             Transform.position = new Vector3(worldPosition.x, worldPosition.y, 0f);
             Transform.rotation = Quaternion.Euler(0f, 0f,
                 StartRotation + RotationOffset + (LockRotation ? camera.transform.eulerAngles.z : 0f));
-            Transform.localScale = new Vector3(Scale.x, Scale.y, 1f);
+            var cameraScale = LockScale
+                ? camera.orthographicSize / (DefaultCameraOrthoSize * InitialZoomRatio)
+                : 1f;
+            Transform.localScale = new Vector3(Scale.x * cameraScale, Scale.y * cameraScale, 1f);
             var renderColor = Color;
             renderColor.a *= Opacity;
             Renderer.color = renderColor;
-            Renderer.sortingOrder = Math.Clamp(-Depth, short.MinValue + 1, short.MaxValue);
+            SetDepth(Depth);
+            SetVisible(Visible);
         }
     }
 
     private sealed class MoveEvent
     {
+        [Flags]
+        private enum Property
+        {
+            None = 0,
+            PositionX = 1 << 0,
+            PositionY = 1 << 1,
+            PivotX = 1 << 2,
+            PivotY = 1 << 3,
+            ScaleX = 1 << 4,
+            ScaleY = 1 << 5,
+            Rotation = 1 << 6,
+            Color = 1 << 7,
+            Opacity = 1 << 8,
+            Parallax = 1 << 9,
+            ParallaxOffsetX = 1 << 10,
+            ParallaxOffsetY = 1 << 11,
+        }
+
         private readonly HashSet<string> _tags;
         private readonly JObject _data;
         private readonly List<Snapshot> _targets = new();
-        public MoveEvent(float start, float duration, HashSet<string> tags, JObject data)
+        private readonly Property _properties;
+        private readonly bool _replaceSprite;
+        private readonly Sprite? _replacementSprite;
+        public MoveEvent(float start, float duration, HashSet<string> tags, JObject data, bool replaceSprite, Sprite? replacementSprite, int order)
         {
             Start = start;
             Duration = duration;
             _tags = tags;
             _data = data;
+            _properties = GetProperties(data);
+            _replaceSprite = replaceSprite;
+            _replacementSprite = replacementSprite;
+            Order = order;
         }
         public float Start { get; }
+        public int Order { get; }
         private float Duration { get; }
+        public bool IsComplete => _properties == Property.None || _targets.All(static target => target.Active == Property.None);
+
+        public void CompleteConflicts(MoveEvent incoming)
+        {
+            var overlap = _properties & incoming._properties;
+            if (overlap == Property.None) return;
+            foreach (var target in _targets)
+            {
+                if (!incoming._tags.Overlaps(target.State.Tags)) continue;
+                var targetOverlap = target.Active & overlap;
+                if (targetOverlap == Property.None) continue;
+                ApplyProperties(target, targetOverlap, 1f);
+                target.Active &= ~targetOverlap;
+            }
+        }
+
         public void Capture(IEnumerable<DecorationState> decorations)
         {
             foreach (var decoration in decorations)
             {
                 if (!_tags.Overlaps(decoration.Tags)) continue;
-                _targets.Add(new Snapshot(decoration));
+                if (HasValue(_data, "relativeTo") && _data.Value<string>("relativeTo") is { } relativeTo && relativeTo != "LastPosition")
+                    decoration.RelativeTo = relativeTo;
+                if (HasValue(_data, "visible")) decoration.SetVisible(_data.Value<bool>("visible"));
+                if (HasValue(_data, "depth")) decoration.SetDepth(_data.Value<int>("depth"));
+                if (_replaceSprite) decoration.SetSprite(_replacementSprite);
+                if (HasValue(_data, "maskingType") || HasValue(_data, "useMaskingDepth") ||
+                    HasValue(_data, "maskingFrontDepth") || HasValue(_data, "maskingBackDepth"))
+                {
+                    decoration.SetMasking(
+                        HasValue(_data, "maskingType") ? _data.Value<string>("maskingType") : null,
+                        HasValue(_data, "useMaskingDepth") ? _data.Value<bool?>("useMaskingDepth") : null,
+                        HasValue(_data, "maskingFrontDepth") ? _data.Value<int?>("maskingFrontDepth") : null,
+                        HasValue(_data, "maskingBackDepth") ? _data.Value<int?>("maskingBackDepth") : null);
+                }
+                _targets.Add(new Snapshot(decoration, _data, _properties));
             }
         }
         public bool Apply(float time)
@@ -863,62 +1116,57 @@ public sealed class WorkerRuntime : MonoBehaviour
             var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
             foreach (var target in _targets)
             {
-                if (HasValue(_data, "positionOffset"))
-                {
-                    var offset = ReadVector2(_data["positionOffset"], new Vector2(float.NaN, float.NaN)) * TileSize;
-                    var basePosition = (_data.Value<string>("relativeTo") ?? "LastPosition") == "LastPosition"
-                        ? target.PivotPosition
-                        : target.State.StartPosition;
-                    var destination = target.PivotPosition;
-                    if (!float.IsNaN(offset.x)) destination.x = basePosition.x + offset.x;
-                    if (!float.IsNaN(offset.y)) destination.y = basePosition.y + offset.y;
-                    target.State.PivotPosition = Vector2.Lerp(target.PivotPosition, destination, amount);
-                }
-                if (HasValue(_data, "pivotOffset"))
-                {
-                    var pivot = ReadVector2(_data["pivotOffset"], new Vector2(float.NaN, float.NaN)) * TileSize;
-                    var destination = target.PivotOffset;
-                    if (!float.IsNaN(pivot.x)) destination.x = pivot.x;
-                    if (!float.IsNaN(pivot.y)) destination.y = pivot.y;
-                    target.State.PivotOffset = Vector2.Lerp(target.PivotOffset, destination, amount);
-                }
-                if (HasValue(_data, "scale"))
-                {
-                    var scale = ReadVector2(_data["scale"], new Vector2(float.NaN, float.NaN)) / 100f;
-                    var destination = target.Scale;
-                    if (!float.IsNaN(scale.x)) destination.x = scale.x;
-                    if (!float.IsNaN(scale.y)) destination.y = scale.y;
-                    target.State.Scale = Vector2.Lerp(target.Scale, destination, amount);
-                }
-                if (HasValue(_data, "rotationOffset"))
-                {
-                    var rotation = _data.Value<float>("rotationOffset");
-                    target.State.RotationOffset = Mathf.LerpUnclamped(target.RotationOffset, rotation, amount);
-                }
-                if (_data.Value<string>("color") is { } colorHex)
-                    target.State.Color = Color.Lerp(target.Color, ParseColor(colorHex), amount);
-                if (_data.Value<float?>("opacity") is { } opacity)
-                    target.State.Opacity = Mathf.Lerp(target.Opacity, opacity / 100f, amount);
-                if (HasValue(_data, "parallax"))
-                {
-                    var parallax = ReadVector2(_data["parallax"], target.Parallax * 100f) / 100f;
-                    target.State.Parallax = Vector2.Lerp(target.Parallax, parallax, amount);
-                }
-                if (HasValue(_data, "parallaxOffset"))
-                {
-                    var parallaxOffset = ReadVector2(_data["parallaxOffset"], target.ParallaxOffset / TileSize) * TileSize;
-                    target.State.ParallaxOffset = Vector2.Lerp(target.ParallaxOffset, parallaxOffset, amount);
-                }
-                if (HasValue(_data, "depth")) target.State.Depth = _data.Value<int>("depth");
-                if (HasValue(_data, "visible")) target.State.Renderer.enabled = _data.Value<bool>("visible");
+                ApplyProperties(target, target.Active, amount);
+                if (rawAmount >= 1f) target.Active = Property.None;
             }
-            return rawAmount >= 1f;
+            return rawAmount >= 1f || IsComplete;
         }
+
+        private static void ApplyProperties(Snapshot target, Property properties, float amount)
+        {
+            var state = target.State;
+            if ((properties & Property.PositionX) != 0) state.PivotPosition = new Vector2(Mathf.LerpUnclamped(target.PivotPosition.x, target.DestinationPosition.x, amount), state.PivotPosition.y);
+            if ((properties & Property.PositionY) != 0) state.PivotPosition = new Vector2(state.PivotPosition.x, Mathf.LerpUnclamped(target.PivotPosition.y, target.DestinationPosition.y, amount));
+            if ((properties & Property.PivotX) != 0) state.PivotOffset = new Vector2(Mathf.LerpUnclamped(target.PivotOffset.x, target.DestinationPivot.x, amount), state.PivotOffset.y);
+            if ((properties & Property.PivotY) != 0) state.PivotOffset = new Vector2(state.PivotOffset.x, Mathf.LerpUnclamped(target.PivotOffset.y, target.DestinationPivot.y, amount));
+            if ((properties & Property.ScaleX) != 0) state.Scale = new Vector2(Mathf.LerpUnclamped(target.Scale.x, target.DestinationScale.x, amount), state.Scale.y);
+            if ((properties & Property.ScaleY) != 0) state.Scale = new Vector2(state.Scale.x, Mathf.LerpUnclamped(target.Scale.y, target.DestinationScale.y, amount));
+            if ((properties & Property.Rotation) != 0) state.RotationOffset = Mathf.LerpUnclamped(target.RotationOffset, target.DestinationRotation, amount);
+            if ((properties & Property.Color) != 0) state.Color = Color.LerpUnclamped(target.Color, target.DestinationColor, amount);
+            if ((properties & Property.Opacity) != 0) state.Opacity = Mathf.LerpUnclamped(target.Opacity, target.DestinationOpacity, amount);
+            if ((properties & Property.Parallax) != 0) state.Parallax = Vector2.LerpUnclamped(target.Parallax, target.DestinationParallax, amount);
+            if ((properties & Property.ParallaxOffsetX) != 0) state.ParallaxOffset = new Vector2(Mathf.LerpUnclamped(target.ParallaxOffset.x, target.DestinationParallaxOffset.x, amount), state.ParallaxOffset.y);
+            if ((properties & Property.ParallaxOffsetY) != 0) state.ParallaxOffset = new Vector2(state.ParallaxOffset.x, Mathf.LerpUnclamped(target.ParallaxOffset.y, target.DestinationParallaxOffset.y, amount));
+        }
+
+        private static Property GetProperties(JObject data)
+        {
+            var properties = Property.None;
+            var position = ReadVector2(data["positionOffset"], new Vector2(float.NaN, float.NaN));
+            if (!float.IsNaN(position.x)) properties |= Property.PositionX;
+            if (!float.IsNaN(position.y)) properties |= Property.PositionY;
+            var pivot = ReadVector2(data["pivotOffset"], new Vector2(float.NaN, float.NaN));
+            if (!float.IsNaN(pivot.x)) properties |= Property.PivotX;
+            if (!float.IsNaN(pivot.y)) properties |= Property.PivotY;
+            var scale = ReadVector2(data["scale"], new Vector2(float.NaN, float.NaN));
+            if (!float.IsNaN(scale.x)) properties |= Property.ScaleX;
+            if (!float.IsNaN(scale.y)) properties |= Property.ScaleY;
+            if (HasValue(data, "rotationOffset")) properties |= Property.Rotation;
+            if (HasValue(data, "color")) properties |= Property.Color;
+            if (HasValue(data, "opacity")) properties |= Property.Opacity;
+            if (HasValue(data, "parallax")) properties |= Property.Parallax;
+            var parallaxOffset = ReadVector2(data["parallaxOffset"], new Vector2(float.NaN, float.NaN));
+            if (!float.IsNaN(parallaxOffset.x)) properties |= Property.ParallaxOffsetX;
+            if (!float.IsNaN(parallaxOffset.y)) properties |= Property.ParallaxOffsetY;
+            return properties;
+        }
+
         private sealed class Snapshot
         {
-            public Snapshot(DecorationState state)
+            public Snapshot(DecorationState state, JObject data, Property active)
             {
                 State = state;
+                Active = active;
                 PivotPosition = state.PivotPosition;
                 PivotOffset = state.PivotOffset;
                 Scale = state.Scale;
@@ -927,80 +1175,181 @@ public sealed class WorkerRuntime : MonoBehaviour
                 Opacity = state.Opacity;
                 Parallax = state.Parallax;
                 ParallaxOffset = state.ParallaxOffset;
+
+                var position = ReadVector2(data["positionOffset"], new Vector2(float.NaN, float.NaN)) * TileSize;
+                var basePosition = (data.Value<string>("relativeTo") ?? "LastPosition") == "LastPosition"
+                    ? PivotPosition
+                    : state.StartPosition;
+                DestinationPosition = PivotPosition;
+                if (!float.IsNaN(position.x)) DestinationPosition.x = basePosition.x + position.x;
+                if (!float.IsNaN(position.y)) DestinationPosition.y = basePosition.y + position.y;
+                var pivot = ReadVector2(data["pivotOffset"], new Vector2(float.NaN, float.NaN)) * TileSize;
+                DestinationPivot = PivotOffset;
+                if (!float.IsNaN(pivot.x)) DestinationPivot.x = pivot.x;
+                if (!float.IsNaN(pivot.y)) DestinationPivot.y = pivot.y;
+                var scale = ReadVector2(data["scale"], new Vector2(float.NaN, float.NaN)) / 100f;
+                DestinationScale = Scale;
+                if (!float.IsNaN(scale.x)) DestinationScale.x = scale.x;
+                if (!float.IsNaN(scale.y)) DestinationScale.y = scale.y;
+                DestinationRotation = data.Value<float?>("rotationOffset") ?? RotationOffset;
+                DestinationColor = data.Value<string>("color") is { } color ? ParseColor(color) : Color;
+                DestinationOpacity = (data.Value<float?>("opacity") ?? (Opacity * 100f)) / 100f;
+                DestinationParallax = ReadVector2(data["parallax"], Parallax * 100f) / 100f;
+                DestinationParallaxOffset = ReadVector2(data["parallaxOffset"], ParallaxOffset / TileSize) * TileSize;
             }
             public DecorationState State { get; }
+            public Property Active { get; set; }
             public Vector2 PivotPosition { get; }
+            public Vector2 DestinationPosition;
             public Vector2 PivotOffset { get; }
+            public Vector2 DestinationPivot;
             public Vector2 Scale { get; }
+            public Vector2 DestinationScale;
             public float RotationOffset { get; }
+            public float DestinationRotation { get; }
             public Color Color { get; }
+            public Color DestinationColor { get; }
             public float Opacity { get; }
+            public float DestinationOpacity { get; }
             public Vector2 Parallax { get; }
+            public Vector2 DestinationParallax { get; }
             public Vector2 ParallaxOffset { get; }
+            public Vector2 DestinationParallaxOffset { get; }
         }
     }
 
     private sealed class CameraEvent
     {
+        [Flags]
+        private enum Property
+        {
+            None = 0,
+            PositionX = 1,
+            PositionY = 2,
+            Rotation = 4,
+            Zoom = 8,
+        }
+
         private readonly JObject _data;
         private Vector3 _position;
+        private Vector3 _targetPosition;
         private float _rotation;
+        private float _targetRotation;
         private float _size;
+        private float _targetSize;
         private readonly Vector2 _floorPosition;
-        public CameraEvent(float start, float duration, JObject data, Vector2 floorPosition)
+        private Property _active;
+        private readonly Property _properties;
+        public CameraEvent(float start, float duration, JObject data, Vector2 floorPosition, int order)
         {
             Start = start;
             Duration = duration;
             _data = data;
             _floorPosition = floorPosition;
+            Order = order;
+            var position = ReadVector2(data["position"], new Vector2(float.NaN, float.NaN));
+            var relativeUsed = HasValue(data, "relativeTo");
+            if (!float.IsNaN(position.x) || relativeUsed) _properties |= Property.PositionX;
+            if (!float.IsNaN(position.y) || relativeUsed) _properties |= Property.PositionY;
+            if (HasValue(data, "rotation") || (relativeUsed && (data.Value<string>("relativeTo") ?? "") == "LastPosition"))
+                _properties |= Property.Rotation;
+            if (HasValue(data, "zoom")) _properties |= Property.Zoom;
         }
         public float Start { get; }
+        public int Order { get; }
         private float Duration { get; }
-        public void Capture(Camera camera) { _position = camera.transform.position; _rotation = camera.transform.eulerAngles.z; _size = camera.orthographicSize; }
+        public bool IsComplete => _active == Property.None;
+
+        public void CompleteConflicts(Camera camera, CameraEvent incoming)
+        {
+            var overlap = _active & incoming._properties;
+            if ((overlap & Property.PositionX) != 0) camera.transform.position = new Vector3(_targetPosition.x, camera.transform.position.y, -10f);
+            if ((overlap & Property.PositionY) != 0) camera.transform.position = new Vector3(camera.transform.position.x, _targetPosition.y, -10f);
+            if ((overlap & Property.Rotation) != 0) camera.transform.rotation = Quaternion.Euler(0f, 0f, _targetRotation);
+            if ((overlap & Property.Zoom) != 0) camera.orthographicSize = _targetSize;
+            _active &= ~overlap;
+        }
+
+        public void Capture(Camera camera)
+        {
+            _active = _properties;
+            _position = camera.transform.position;
+            _rotation = camera.transform.eulerAngles.z;
+            _size = camera.orthographicSize;
+            var requested = ReadVector2(_data["position"], new Vector2(float.NaN, float.NaN)) * TileSize;
+            if (float.IsNaN(requested.x)) requested.x = 0f;
+            if (float.IsNaN(requested.y)) requested.y = 0f;
+            var relativeTo = _data.Value<string>("relativeTo") ?? "LastPosition";
+            var target = relativeTo switch
+            {
+                "Tile" => _floorPosition + requested,
+                "Global" => requested,
+                "Player" => _floorPosition + requested,
+                _ => new Vector2(_position.x, _position.y) + requested,
+            };
+            _targetPosition = new Vector3(target.x, target.y, -10f);
+            _targetRotation = _data.Value<float?>("rotation") ?? _rotation;
+            if (relativeTo == "LastPosition" && !HasValue(_data, "rotation")) _targetRotation = _rotation;
+            _targetSize = _data.Value<float?>("zoom") is { } zoom
+                ? DefaultCameraOrthoSize * Math.Max(0.01f, zoom / 100f)
+                : _size;
+        }
         public bool Apply(Camera camera, float time)
         {
             var rawAmount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
             var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
-            if (HasValue(_data, "position"))
-            {
-                var offset = ReadVector2(_data["position"], Vector2.zero) * TileSize;
-                var target = (_data.Value<string>("relativeTo") ?? "LastPosition") switch
-                {
-                    "Tile" => _floorPosition + offset,
-                    "Global" => offset,
-                    "Player" => _floorPosition + offset,
-                    _ => new Vector2(_position.x, _position.y) + offset,
-                };
-                camera.transform.position = Vector3.Lerp(_position, new Vector3(target.x, target.y, -10f), amount);
-            }
-            if (_data.Value<float?>("rotation") is { } rotation)
-                camera.transform.rotation = Quaternion.Euler(0f, 0f, Mathf.LerpAngle(_rotation, rotation, amount));
-            if (_data.Value<float?>("zoom") is { } zoom)
-                camera.orthographicSize = Mathf.Lerp(_size, DefaultCameraOrthoSize * Math.Max(0.01f, zoom / 100f), amount);
-            return rawAmount >= 1f;
+            var current = camera.transform.position;
+            if ((_active & Property.PositionX) != 0) current.x = Mathf.LerpUnclamped(_position.x, _targetPosition.x, amount);
+            if ((_active & Property.PositionY) != 0) current.y = Mathf.LerpUnclamped(_position.y, _targetPosition.y, amount);
+            camera.transform.position = new Vector3(current.x, current.y, -10f);
+            if ((_active & Property.Rotation) != 0)
+                camera.transform.rotation = Quaternion.Euler(0f, 0f, Mathf.LerpUnclamped(_rotation, _targetRotation, amount));
+            if ((_active & Property.Zoom) != 0)
+                camera.orthographicSize = Mathf.LerpUnclamped(_size, _targetSize, amount);
+            if (rawAmount >= 1f) _active = Property.None;
+            return rawAmount >= 1f || IsComplete;
         }
     }
 
     private sealed class BackgroundEvent
     {
-        public BackgroundEvent(float start, JObject data)
+        public BackgroundEvent(float start, JObject data, int order)
         {
             Start = start;
             Data = data;
+            Order = order;
         }
         public float Start { get; }
         public JObject Data { get; }
+        public int Order { get; }
     }
 
     private sealed class RepeatRule
     {
-        public RepeatRule(int repetitions, float intervalBeats)
+        public RepeatRule(string type, int count, float intervalBeats, int gapLength, bool executeOnCurrentFloor)
         {
-            Repetitions = repetitions;
+            Type = type;
+            Count = count;
             IntervalBeats = intervalBeats;
+            GapLength = gapLength;
+            ExecuteOnCurrentFloor = executeOnCurrentFloor;
         }
-        public int Repetitions { get; }
+        public string Type { get; }
+        public int Count { get; }
         public float IntervalBeats { get; }
+        public int GapLength { get; }
+        public bool ExecuteOnCurrentFloor { get; }
+    }
+
+    private readonly struct RepeatedPlacement
+    {
+        public RepeatedPlacement(int floor, float angleOffset)
+        {
+            Floor = floor;
+            AngleOffset = angleOffset;
+        }
+        public int Floor { get; }
+        public float AngleOffset { get; }
     }
 }
 }

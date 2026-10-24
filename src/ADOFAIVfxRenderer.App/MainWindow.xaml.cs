@@ -22,6 +22,13 @@ public partial class MainWindow : Window
     private bool _tailFramesWereEdited;
     private bool _viewReady;
     private decimal? _durationLimitSeconds;
+    private readonly Queue<RenderVariant> _renderQueue = new();
+    private readonly List<string> _completedBatchOutputs = [];
+    private GameInstallation? _batchInstallation;
+    private ChartMetadata? _batchChart;
+    private TailExtension _batchTail = TailExtension.Zero;
+    private int _batchTotal;
+    private int _batchCompleted;
 
     public MainWindow()
     {
@@ -491,7 +498,7 @@ public partial class MainWindow : Window
 
         OutputList.ItemsSource = variants.Select(static variant => variant.DisplayName).ToArray();
         SummaryText.Text =
-            $"共 {variants.Count} 个输出 · {oneSecondPlan.Passes.Count} 个共享画面通道 · " +
+            $"共 {variants.Count} 个顺序渲染任务 · {oneSecondPlan.Passes.Count} 组相同画面配置 · " +
             $"每秒 {oneSecondPlan.UniqueSceneMoments} 个唯一时间点\n" +
             $"结束后继续 {tailSeconds:0.######} 秒；不同 FPS 自动换算各自尾帧。";
     }
@@ -510,16 +517,18 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("请先选择要渲染的 .adofai 谱面。");
             }
 
-            var profiles = _profileChecks.Where(static check => check.IsChecked == true).ToArray();
-            var resolutions = _resolutionChecks.Where(static check => check.IsChecked == true).ToArray();
-            var frameRates = _frameRateChecks.Where(static check => check.IsChecked == true).ToArray();
-            if (profiles.Length != 1 || resolutions.Length != 1 || frameRates.Length != 1)
+            var profiles = _profileChecks.Where(static check => check.IsChecked == true)
+                .Select(static check => (OutputProfile)check.Tag).ToArray();
+            var resolutions = _resolutionChecks.Where(static check => check.IsChecked == true)
+                .Select(static check => (VideoResolution)check.Tag).ToArray();
+            var frameRates = _frameRateChecks.Where(static check => check.IsChecked == true)
+                .Select(static check => (int)check.Tag).ToArray();
+            if (profiles.Length == 0 || resolutions.Length == 0 || frameRates.Length == 0)
             {
-                throw new InvalidOperationException("首个实机测试请只选择一个版本、一个分辨率和一个 FPS。");
+                throw new InvalidOperationException("输出版本、分辨率和 FPS 都至少选择一个。");
             }
 
-            var profile = (OutputProfile)profiles[0].Tag;
-            if (profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
+            if (profiles.Any(static profile => profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro)))
             {
                 throw new NotSupportedException("当前可实测的是 Video VFX 与 Video VFX Pro；Video / Video Pro 要等原版滤镜适配完成。");
             }
@@ -531,36 +540,64 @@ public partial class MainWindow : Window
 
             var quality = ((Choice<VideoQualityPreset>)QualityBox.SelectedItem).Value;
             var customBitrate = GetCustomBitrate(quality);
-            var variant = new RenderVariant(
-                profile,
-                (VideoResolution)resolutions[0].Tag,
-                (int)frameRates[0].Tag,
-                quality,
-                GetContentOverride(),
-                customBitrate);
-            var outputPath = _worker.Start(
-                _installation,
-                _chart,
-                variant,
-                TailExtension.FromSeconds(tailSeconds),
-                _durationLimitSeconds);
+            var variants = RenderBatchPlanner.BuildVariants(profiles, resolutions, frameRates, quality);
+            var contentOverride = GetContentOverride();
+            variants = variants.Select(variant => variant with
+            {
+                ContentOverride = contentOverride,
+                CustomBitrateKbps = customBitrate,
+            }).ToArray();
+
+            _renderQueue.Clear();
+            foreach (var variant in variants) _renderQueue.Enqueue(variant);
+            _completedBatchOutputs.Clear();
+            _batchInstallation = _installation;
+            _batchChart = _chart;
+            _batchTail = TailExtension.FromSeconds(tailSeconds);
+            _batchTotal = variants.Count;
+            _batchCompleted = 0;
+            OutputList.ItemsSource = variants.Select(static variant => "等待 · " + variant.DisplayName).ToArray();
 
             StartRenderButton.IsEnabled = false;
             CancelRenderButton.IsEnabled = true;
             RenderProgressBar.Value = 0;
             WorkerProgressText.Text = "0 / ? 帧 · 0%";
             WorkerSpeedText.Text = "正在启动";
-            SummaryText.Text = $"输出文件：{outputPath}";
+            StartNextBatchRender();
         }
         catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException or IOException or UnauthorizedAccessException)
         {
+            _renderQueue.Clear();
+            StartRenderButton.IsEnabled = true;
+            CancelRenderButton.IsEnabled = false;
             MessageBox.Show(this, exception.Message, "无法开始渲染", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
     private void CancelRender_Click(object sender, RoutedEventArgs e) => _worker.Cancel();
 
-    private void Worker_StatusChanged(WorkerStatus status)
+    private void StartNextBatchRender()
+    {
+        if (_renderQueue.Count == 0)
+        {
+            StartRenderButton.IsEnabled = true;
+            CancelRenderButton.IsEnabled = false;
+            SummaryText.Text = $"批量渲染完成：{_batchCompleted}/{_batchTotal}\n" + string.Join("\n", _completedBatchOutputs);
+            return;
+        }
+
+        var variant = _renderQueue.Dequeue();
+        var outputPath = _worker.Start(
+            _batchInstallation ?? throw new InvalidOperationException("缺少批量渲染的游戏安装信息。"),
+            _batchChart ?? throw new InvalidOperationException("缺少批量渲染的谱面信息。"),
+            variant,
+            _batchTail,
+            _durationLimitSeconds);
+        var current = _batchTotal - _renderQueue.Count;
+        SummaryText.Text = $"批量任务 {current}/{_batchTotal}：{variant.DisplayName}\n输出文件：{outputPath}";
+    }
+
+    private async void Worker_StatusChanged(WorkerStatus status)
     {
         WorkerStateText.Text = status.Message;
         RenderProgressBar.Value = Math.Clamp(status.Percent, 0f, 100f);
@@ -598,8 +635,28 @@ public partial class MainWindow : Window
             }
         }
 
-        if (status.State is "complete" or "failed" or "cancelled")
+        if (status.State == "complete")
         {
+            _batchCompleted++;
+            _completedBatchOutputs.Add(string.IsNullOrWhiteSpace(status.DerivedChartPath)
+                ? status.OutputPath
+                : $"{status.OutputPath} | {status.DerivedChartPath} | 偏移 {status.VideoOffsetMilliseconds} ms");
+            await _worker.WaitForExitAsync();
+            try
+            {
+                StartNextBatchRender();
+            }
+            catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException or IOException or UnauthorizedAccessException)
+            {
+                _renderQueue.Clear();
+                StartRenderButton.IsEnabled = true;
+                CancelRenderButton.IsEnabled = false;
+                MessageBox.Show(this, exception.Message, "无法继续批量渲染", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+        else if (status.State is "failed" or "cancelled")
+        {
+            _renderQueue.Clear();
             StartRenderButton.IsEnabled = true;
             CancelRenderButton.IsEnabled = false;
         }
