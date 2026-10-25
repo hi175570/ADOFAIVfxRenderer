@@ -19,8 +19,11 @@ public sealed class OfflineEffectController : MonoBehaviour
     private int _nextEvent;
     private float _time;
 
+    public bool HallOfMirrorsEnabled =>
+        _states.TryGetValue("builtin:HallOfMirrors", out var state) && state.Enabled;
+
     public static bool Supports(string? eventType) => eventType is
-        "SetFilter" or "SetFilterAdvanced" or "Bloom" or "ScreenTile" or "ScreenScroll";
+        "SetFilter" or "SetFilterAdvanced" or "Bloom" or "ScreenTile" or "ScreenScroll" or "HallOfMirrors";
 
     public void Configure(IEnumerable<string>? allowedKeys)
     {
@@ -49,6 +52,7 @@ public sealed class OfflineEffectController : MonoBehaviour
             "Bloom" => "builtin:Bloom",
             "ScreenTile" => "builtin:ScreenTile",
             "ScreenScroll" => "builtin:ScreenScroll",
+            "HallOfMirrors" => "builtin:HallOfMirrors",
             _ => "",
         };
         if (key.Length == 0 || (_allowedKeys != null && !_allowedKeys.Contains(key))) return;
@@ -154,6 +158,9 @@ public sealed class OfflineEffectController : MonoBehaviour
                 result["Y"] = scroll.y;
                 break;
             }
+            case "HallOfMirrors":
+                result["Enabled"] = 1f;
+                break;
         }
         return result;
     }
@@ -242,6 +249,9 @@ public sealed class OfflineEffectController : MonoBehaviour
         _material.SetVector("_ScreenScroll", screenScroll.Enabled
             ? new Vector4(Get(screenScroll, "X"), Get(screenScroll, "Y"), 0f, 0f)
             : Vector4.zero);
+        // Hall of Mirrors is not a UV mirror filter in ADOFAI. The game switches the
+        // background camera from Color clearing to Depth-only clearing so previous
+        // color frames remain in the target. WorkerRuntime mirrors that camera state.
         _material.SetFloat("_HallOfMirrors", 0f);
 
         var blur = Math.Max(Basic("GaussianBlur"), Math.Max(Basic("Blur"), Basic("BlurFocus")));

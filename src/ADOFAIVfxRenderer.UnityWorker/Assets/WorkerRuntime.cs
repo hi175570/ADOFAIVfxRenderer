@@ -582,6 +582,11 @@ public sealed class WorkerRuntime : MonoBehaviour
 
             StartEncoder();
             target = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            target.Create();
+            var previousTarget = RenderTexture.active;
+            RenderTexture.active = target;
+            GL.Clear(true, true, _camera.backgroundColor);
+            RenderTexture.active = previousTarget;
             frameTexture = new Texture2D(_job.width, _job.height, TextureFormat.RGBA32, false, false);
             var watch = Stopwatch.StartNew();
             var previewWatch = Stopwatch.StartNew();
@@ -708,6 +713,9 @@ public sealed class WorkerRuntime : MonoBehaviour
         foreach (var decoration in _decorations) decoration.ApplyVisual(_camera);
         UpdateBackgroundTransform();
         _effects?.Apply(time);
+        _camera.clearFlags = _effects?.HallOfMirrorsEnabled == true
+            ? CameraClearFlags.Depth
+            : CameraClearFlags.SolidColor;
     }
 
     private void AdvanceMoves(float time)

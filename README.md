@@ -28,7 +28,7 @@ The current implementation milestone includes:
 - paired decoration diagnostics that render ten identical timestamps with and without the selected decoration (twenty images total) and show every pair inside the app;
 - a `滤镜与装饰` workspace with per-filter ownership: keep the group live in the chart, bake a supported offline approximation into the video, or explicitly ignore it; baked/ignored groups are disabled only in the generated chart;
 - filter grouping by basic/advanced type, plane, target type, and target tag, so filters aimed at different objects are never silently merged into one choice;
-- an initial independent-worker filter stack for selected basic/advanced camera filters, Bloom, ScreenTile, and ScreenScroll, plus opt-in filtered decoration diagnostics; Hall of Mirrors is rejected by the offline stack because a flattened Video VFX frame has already lost the camera/layer/depth relationships that the original scene uses, and color-buffer feedback cannot reconstruct them;
+- an initial independent-worker filter stack for selected basic/advanced camera filters, Bloom, ScreenTile, and ScreenScroll, plus opt-in filtered decoration diagnostics; Hall of Mirrors remains realtime-only because Video VFX does not contain the track/particle/history layers needed to bake it faithfully;
 - remembered game/chart paths, a dedicated settings tab, and guarded cleanup of only app-generated diagnostic caches;
 - selectable automatic, CPU/WARP, hardware-GPU, and NVIDIA/RTX/NVENC backends with capability probing and no silent fallback;
 - selectable background/foreground decoration content with UI always excluded;
