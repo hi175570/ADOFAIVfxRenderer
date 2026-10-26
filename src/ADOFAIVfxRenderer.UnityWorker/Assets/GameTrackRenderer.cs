@@ -219,6 +219,14 @@ internal sealed class GameTrackRenderer
         return result;
     }
 
+    public static Vector2[] BuildPositionedFloorPositions(
+        IReadOnlyList<Vector2> floorPositions,
+        JObject settings,
+        JArray actions) =>
+        BuildInitialLayouts(floorPositions, settings, actions)
+            .Select(static layout => layout.Position)
+            .ToArray();
+
     private static AnimationLayout[] BuildAnimationLayouts(
         IReadOnlyList<float> floorTimes,
         IReadOnlyList<float> floorBpms,

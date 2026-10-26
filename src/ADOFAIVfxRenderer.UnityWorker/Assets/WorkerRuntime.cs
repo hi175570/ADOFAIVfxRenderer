@@ -52,6 +52,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     private float[] _floorTimes = Array.Empty<float>();
     private float[] _floorBpms = Array.Empty<float>();
     private Vector2[] _floorPositions = Array.Empty<Vector2>();
+    private Vector2[] _positionedFloorPositions = Array.Empty<Vector2>();
     private Vector2[] _followFrom = Array.Empty<Vector2>();
     private Vector2[] _followTarget = Array.Empty<Vector2>();
     private float[] _followDuration = Array.Empty<float>();
@@ -136,7 +137,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         _pitch = Math.Max(0.01f, (settings.Value<float?>("pitch") ?? 100f) / 100f);
         var actions = (JArray?)chart["actions"] ?? new JArray();
         InitializeGameBlendMode();
-        BuildFloorTimeline(chart, actions, bpm);
+        BuildFloorTimeline(chart, settings, actions, bpm);
         _status.chartDurationSeconds = (float)_timeline.DurationSeconds;
 
         var cameraParentObject = new GameObject("CamParent");
@@ -165,10 +166,10 @@ public sealed class WorkerRuntime : MonoBehaviour
         var initialCameraOffset = ReadVector2(settings["position"], Vector2.zero) * TileSize;
         var initialCameraMode = settings.Value<string>("relativeTo") ?? "Player";
         _cameraState.Initialize(initialCameraMode, settings.Value<float?>("rotation") ?? 0f);
-        var initialCameraBase = initialCameraMode == "Tile" ? _floorPositions[0] : Vector2.zero;
+        var initialCameraBase = initialCameraMode == "Tile" ? _positionedFloorPositions[0] : Vector2.zero;
         _cameraParent.position = new Vector3(initialCameraBase.x + initialCameraOffset.x, initialCameraBase.y + initialCameraOffset.y, 0f);
         _camera.transform.localPosition = initialCameraMode == "Player"
-            ? new Vector3(_floorPositions[0].x, _floorPositions[0].y, -10f)
+            ? new Vector3(_positionedFloorPositions[0].x, _positionedFloorPositions[0].y, -10f)
             : new Vector3(0f, 0f, -10f);
         _camera.transform.localRotation = Quaternion.Euler(0f, 0f, _cameraState.Rotation);
         _camera.clearFlags = CameraClearFlags.Nothing;
@@ -335,7 +336,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
     }
 
-    private void BuildFloorTimeline(JObject chart, JArray actions, float initialBpm)
+    private void BuildFloorTimeline(JObject chart, JObject settings, JArray actions, float initialBpm)
     {
         var angles = ReadAngles(chart);
         var timelineActions = new List<TimelineActionData>(actions.Count);
@@ -362,6 +363,10 @@ public sealed class WorkerRuntime : MonoBehaviour
         _floorPositions = AdoGeometryCalculator.BuildFloorPositions(angles, TileSize)
             .Select(static position => new Vector2((float)position.X, (float)position.Y))
             .ToArray();
+        _positionedFloorPositions = GameTrackRenderer.BuildPositionedFloorPositions(
+            _floorPositions,
+            settings,
+            actions);
         BuildPlayerFollowTimeline();
     }
 
@@ -370,13 +375,13 @@ public sealed class WorkerRuntime : MonoBehaviour
         _followFrom = new Vector2[_floorPositions.Length];
         _followTarget = new Vector2[_floorPositions.Length];
         _followDuration = new float[_floorPositions.Length];
-        _followFrom[0] = _floorPositions[0];
-        _followTarget[0] = _floorPositions[0];
+        _followFrom[0] = _positionedFloorPositions[0];
+        _followTarget[0] = _positionedFloorPositions[0];
         _followDuration[0] = 0f;
         for (var floor = 1; floor < _floorPositions.Length; floor++)
         {
             _followFrom[floor] = EvaluateFollowSegment(floor - 1, _floorTimes[floor]);
-            _followTarget[floor] = _floorPositions[floor];
+            _followTarget[floor] = _positionedFloorPositions[floor];
             _followDuration[floor] = 120f / Math.Max(0.000001f, _floorBpms[floor] * _pitch);
         }
     }
@@ -463,8 +468,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
         var startPosition = relativeTo switch
         {
-            "Tile" => _floorPositions[floor] + localPosition * TileSize,
-            "RedPlanet" or "BluePlanet" or "GreenPlanet" => _floorPositions[floor] + localPosition * TileSize,
+            "Tile" => _positionedFloorPositions[floor] + localPosition * TileSize,
+            "RedPlanet" or "BluePlanet" or "GreenPlanet" => _positionedFloorPositions[floor] + localPosition * TileSize,
             "Camera" or "CameraAspect" => localPosition,
             _ => localPosition * TileSize,
         };
@@ -630,7 +635,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
         var startPosition = relativeTo switch
         {
-            "Tile" or "RedPlanet" or "BluePlanet" or "GreenPlanet" => _floorPositions[floor] + localPosition * TileSize,
+            "Tile" or "RedPlanet" or "BluePlanet" or "GreenPlanet" => _positionedFloorPositions[floor] + localPosition * TileSize,
             "Camera" or "CameraAspect" => localPosition,
             _ => localPosition * TileSize,
         };
@@ -863,7 +868,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         var bpm = (float)_timeline.BpmAtFloorAngleOffset(floor, angleOffset);
         var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
-        _cameraEvents.Add(new CameraEvent(start, duration, data, floor, _floorPositions[floor], _eventSequence++));
+        _cameraEvents.Add(new CameraEvent(start, duration, data, floor, _positionedFloorPositions[floor], _eventSequence++));
     }
 
     private void AddBackgroundEvent(JObject data, int repeatedFloor, float angleOffset)
