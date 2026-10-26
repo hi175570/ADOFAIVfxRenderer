@@ -29,6 +29,8 @@ var tests = new (string Name, Action Run)[]
     ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
     ("Filter catalog groups by target", FilterCatalogGroupsByTarget),
     ("Derived chart disables selected filters", DerivedChartDisablesSelectedFilters),
+    ("Canonical render output layout", CanonicalRenderOutputLayout),
+    ("Derived chart replaces canonical profile output", DerivedChartReplacesCanonicalOutput),
 };
 
 var failures = new List<string>();
@@ -230,6 +232,58 @@ static void DerivedChartVideoOffset()
     Equal(-1778, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings, 4m * 60m / 135m));
     settings["separateCountdownTime"] = false;
     Equal(0, DerivedChartExporter.CalculateVideoOffsetMilliseconds(settings));
+}
+
+static void CanonicalRenderOutputLayout()
+{
+    var chartPath = Path.Combine(Path.GetTempPath(), "level", "main.adofai");
+    var first = RenderOutputLayout.Create(chartPath, OutputProfile.VideoVfx);
+    var second = RenderOutputLayout.Create(chartPath, OutputProfile.VideoVfx);
+    Equal(first, second);
+    Equal(Path.Combine(Path.GetTempPath(), "level", "Video VFX"), first.OutputDirectory);
+    Equal(Path.Combine(first.OutputDirectory, "Video VFX.mp4"), first.VideoPath);
+    Equal(Path.Combine(Path.GetTempPath(), "level", "main - Video VFX.adofai"), first.DerivedChartPath);
+
+    var pro = RenderOutputLayout.Create(chartPath, OutputProfile.VideoPro);
+    Equal(Path.Combine(first.OutputDirectory, "Video Pro.mp4"), pro.VideoPath);
+    True(first.VideoPath != pro.VideoPath);
+}
+
+static void DerivedChartReplacesCanonicalOutput()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-canonical-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var videoDirectory = Path.Combine(root, RenderOutputLayout.FolderName);
+        Directory.CreateDirectory(videoDirectory);
+        var videoPath = Path.Combine(videoDirectory, "Video VFX.mp4");
+        File.WriteAllBytes(videoPath, [1]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [],
+          "decorations": []
+        }
+        """);
+
+        var first = DerivedChartExporter.Export(chartPath, videoPath, OutputProfile.VideoVfx);
+        File.AppendAllText(first.ChartPath, "stale");
+        var second = DerivedChartExporter.Export(chartPath, videoPath, OutputProfile.VideoVfx);
+
+        Equal(first.ChartPath, second.ChartPath);
+        Equal(Path.Combine(root, "main - Video VFX.adofai"), second.ChartPath);
+        False(File.Exists(Path.Combine(root, "main - Video VFX-2.adofai")));
+        False(File.ReadAllText(second.ChartPath).EndsWith("stale", StringComparison.Ordinal));
+        var derived = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(second.ChartPath))!.AsObject();
+        Equal("Video VFX/Video VFX.mp4", derived["settings"]!["bgVideo"]!.GetValue<string>());
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
 }
 
 static void VideoSyncFollowsFirstPlayableFloor()

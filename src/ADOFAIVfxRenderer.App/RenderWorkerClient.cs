@@ -14,6 +14,7 @@ internal sealed class RenderWorkerClient : IDisposable
     private readonly DispatcherTimer _timer;
     private Process? _workerProcess;
     private string? _statusPath;
+    private string? _activeOutputPath;
     private string? _lastStatusJson;
     private string? _activeChartPath;
     private OutputProfile _activeProfile;
@@ -75,18 +76,23 @@ internal sealed class RenderWorkerClient : IDisposable
             installation.DataDirectory ?? throw new InvalidOperationException("游戏安装缺少 Data 目录。"));
         var ffmpegPath = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe");
         var resolvedBackend = ResolveBackend(renderBackend, ffmpegPath);
+        var usesOfflineFilters = variant.Content.HasFlag(RenderContent.Filters) || bakedFilterKeys?.Count > 0;
+        var internalWidth = variant.Resolution.Width;
+        var internalHeight = variant.Resolution.Height;
+        if (usesOfflineFilters && internalHeight < 1080)
+        {
+            internalHeight = 1080;
+            internalWidth = (int)Math.Round(internalHeight * variant.Resolution.Width / (double)variant.Resolution.Height);
+        }
 
-        var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
         var renderStartSeconds = DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
-        var chartDirectory = Path.GetDirectoryName(chart.Path)!;
-        var outputDirectory = Path.Combine(chartDirectory, "ADOFAIVfxRenderer Output", timestamp);
-        var previewDirectory = Path.Combine(outputDirectory, "preview");
+        var layout = RenderOutputLayout.Create(chart.Path, variant.Profile);
+        var outputDirectory = layout.OutputDirectory;
+        var previewDirectory = layout.PreviewDirectory;
         Directory.CreateDirectory(previewDirectory);
-        var chartName = Path.GetFileNameWithoutExtension(chart.Path);
-        var outputPath = Path.Combine(
-            outputDirectory,
-            $"{chartName}-{variant.Profile}-{variant.Resolution.Name}-{variant.FramesPerSecond}fps.mp4");
-        _statusPath = Path.Combine(outputDirectory, "render-status.json");
+        var outputPath = layout.VideoPath;
+        _activeOutputPath = outputPath;
+        _statusPath = layout.StatusPath;
 
         var job = new WorkerJob
         {
@@ -98,11 +104,13 @@ internal sealed class RenderWorkerClient : IDisposable
             Profile = variant.Profile.ToString(),
             Width = variant.Resolution.Width,
             Height = variant.Resolution.Height,
+            RenderWidth = internalWidth,
+            RenderHeight = internalHeight,
             FramesPerSecond = variant.FramesPerSecond,
             TailSeconds = (float)tail.Seconds,
             IncludeTrack = variant.Content.HasFlag(RenderContent.Track),
             IncludePlanets = variant.Content.HasFlag(RenderContent.Planets),
-            IncludeEffects = variant.Content.HasFlag(RenderContent.Effects) || bakedFilterKeys?.Count > 0,
+            IncludeFilters = usesOfflineFilters,
             BakedFilterKeys = bakedFilterKeys?.OrderBy(static key => key, StringComparer.Ordinal).ToArray() ?? [],
             IncludeBackgroundDecorations = variant.Content.HasFlag(RenderContent.BackgroundDecorations),
             IncludeForegroundDecorations = variant.Content.HasFlag(RenderContent.ForegroundDecorations),
@@ -117,7 +125,7 @@ internal sealed class RenderWorkerClient : IDisposable
             VideoEncoder = resolvedBackend.VideoEncoder,
             EncoderPreset = resolvedBackend.EncoderPreset,
         };
-        var jobPath = Path.Combine(outputDirectory, "render-job.json");
+        var jobPath = layout.JobPath;
         File.WriteAllText(jobPath, JsonSerializer.Serialize(job, JsonOptions));
         _lastStatusJson = null;
         _activeChartPath = chart.Path;
@@ -131,7 +139,7 @@ internal sealed class RenderWorkerClient : IDisposable
             : new HashSet<string>(disabledFilterKeys, StringComparer.Ordinal);
         _derivedExportAttempted = false;
 
-        var workerLogPath = Path.Combine(outputDirectory, "worker.log");
+        var workerLogPath = layout.WorkerLogPath;
         var startInfo = new ProcessStartInfo
         {
             FileName = workerExecutable,
@@ -142,7 +150,7 @@ internal sealed class RenderWorkerClient : IDisposable
             // Unity's normal player mode can create a visible top-level window even when
             // ProcessWindowStyle.Hidden is requested. Batch mode keeps the render device
             // available (unlike -nographics) without opening a second game-like window.
-            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\" -screen-fullscreen 0 -screen-width {variant.Resolution.Width} -screen-height {variant.Resolution.Height} {resolvedBackend.UnityArguments}",
+            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\" -screen-fullscreen 0 -screen-width {internalWidth} -screen-height {internalHeight} {resolvedBackend.UnityArguments}",
         };
         _workerProcess = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动独立 Unity Worker。");
         _timer.Start();
@@ -161,12 +169,15 @@ internal sealed class RenderWorkerClient : IDisposable
         if (_workerProcess is { HasExited: false })
         {
             _workerProcess.Kill(entireProcessTree: true);
+            _workerProcess.WaitForExit(5000);
         }
+        CleanupTemporaryVideos(_activeOutputPath);
 
         StatusChanged?.Invoke(new WorkerStatus
         {
             State = "cancelled",
             Message = "渲染已取消。",
+            OutputPath = _activeOutputPath ?? "",
         });
     }
 
@@ -225,6 +236,8 @@ internal sealed class RenderWorkerClient : IDisposable
                         if (status.State is "complete" or "failed" or "cancelled")
                         {
                             _timer.Stop();
+                            if (status.State is "failed" or "cancelled")
+                                CleanupTemporaryVideos(status.OutputPath);
                         }
                         _lastStatusJson = json;
                         StatusChanged?.Invoke(status);
@@ -236,6 +249,7 @@ internal sealed class RenderWorkerClient : IDisposable
                 (_lastStatusJson is null || !(_lastStatusJson.Contains("\"complete\"") || _lastStatusJson.Contains("\"failed\""))))
             {
                 _timer.Stop();
+                CleanupTemporaryVideos(_activeOutputPath);
                 StatusChanged?.Invoke(new WorkerStatus
                 {
                     State = "failed",
@@ -247,6 +261,22 @@ internal sealed class RenderWorkerClient : IDisposable
         catch (Exception exception) when (exception is IOException or JsonException)
         {
             // Worker 可能正在原子替换状态文件；下一次轮询会重新读取。
+        }
+    }
+
+    private static void CleanupTemporaryVideos(string? outputPath)
+    {
+        if (string.IsNullOrWhiteSpace(outputPath)) return;
+        var fullPath = Path.GetFullPath(outputPath);
+        var directory = Path.GetDirectoryName(fullPath);
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) return;
+        var fileName = Path.GetFileNameWithoutExtension(fullPath);
+        var extension = Path.GetExtension(fullPath);
+        foreach (var temporaryPath in Directory.GetFiles(directory, $".{fileName}.*.rendering{extension}"))
+        {
+            try { File.Delete(temporaryPath); }
+            catch (IOException) { /* the worker may still be releasing FFmpeg; startup also removes stale files */ }
+            catch (UnauthorizedAccessException) { /* keep the canonical output untouched */ }
         }
     }
 
@@ -497,6 +527,12 @@ internal sealed class WorkerJob
     [JsonPropertyName("height")]
     public int Height { get; init; }
 
+    [JsonPropertyName("renderWidth")]
+    public int RenderWidth { get; init; }
+
+    [JsonPropertyName("renderHeight")]
+    public int RenderHeight { get; init; }
+
     [JsonPropertyName("framesPerSecond")]
     public int FramesPerSecond { get; init; }
 
@@ -509,8 +545,8 @@ internal sealed class WorkerJob
     [JsonPropertyName("includePlanets")]
     public bool IncludePlanets { get; init; }
 
-    [JsonPropertyName("includeEffects")]
-    public bool IncludeEffects { get; init; }
+    [JsonPropertyName("includeFilters")]
+    public bool IncludeFilters { get; init; }
 
     [JsonPropertyName("bakedFilterKeys")]
     public string[] BakedFilterKeys { get; init; } = [];

@@ -89,7 +89,7 @@
                                       IsEnabled="False"
                                       ToolTip="原版星球离线适配完成后开放。"
                                       Content="星球（待适配）" />
-                            <CheckBox x:Name="EffectsCheckBox"
+                            <CheckBox x:Name="FiltersCheckBox"
                                       IsEnabled="False"
                                       ToolTip="请在“滤镜与装饰 → 滤镜”中逐组选择实时、烤入或忽略。"
                                       Content="滤镜（请到滤镜页选择）" />
@@ -469,7 +469,7 @@
                                               IsEnabled="False"
                                               ToolTip="独立 Worker 的原版星球适配完成后开放；当前不会伪装成已生效。"
                                               Content="星球（待适配）" />
-                                    <CheckBox x:Name="DiagnosticEffectsCheckBox"
+                                    <CheckBox x:Name="DiagnosticFiltersCheckBox"
                                               ToolTip="使用独立 Worker 的离线近似滤镜；适合诊断，不能保证与游戏逐像素一致。"
                                               Content="滤镜（离线预览）" />
                                 </StackPanel>

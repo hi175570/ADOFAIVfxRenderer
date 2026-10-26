@@ -20,7 +20,7 @@ internal static class DecorationDiagnosticClient
         DecorationCatalogItem decoration,
         bool includeTrack,
         bool includePlanets,
-        bool includeEffects,
+        bool includeFilters,
         IProgress<string>? progress = null)
     {
         if (!installation.CanRender || installation.RootDirectory is null)
@@ -51,7 +51,7 @@ internal static class DecorationDiagnosticClient
             startTime,
             includeTrack,
             includePlanets,
-            includeEffects,
+            includeFilters,
             []);
 
         progress?.Report("正在渲染不包含此贴图的同一组时间点……");
@@ -64,7 +64,7 @@ internal static class DecorationDiagnosticClient
             startTime,
             includeTrack,
             includePlanets,
-            includeEffects,
+            includeFilters,
             [decoration.Index]);
 
         progress?.Report("正在整理 10 组同帧对照……");
@@ -88,7 +88,7 @@ internal static class DecorationDiagnosticClient
         double startTime,
         bool includeTrack,
         bool includePlanets,
-        bool includeEffects,
+        bool includeFilters,
         int[] retainedDecorationIndices)
     {
         Directory.CreateDirectory(outputDirectory);
@@ -110,7 +110,7 @@ internal static class DecorationDiagnosticClient
             TailSeconds = 0,
             IncludeTrack = includeTrack,
             IncludePlanets = includePlanets,
-            IncludeEffects = includeEffects,
+            IncludeFilters = includeFilters,
             IncludeBackgroundDecorations = true,
             IncludeForegroundDecorations = true,
             BitrateKbps = 1200,

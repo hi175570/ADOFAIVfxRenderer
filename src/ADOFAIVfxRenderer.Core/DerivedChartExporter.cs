@@ -52,12 +52,11 @@ public static class DerivedChartExporter
         var disabledFilterEvents = DisableBakedFilters(root, profile, disabledFilterKeys);
         if (profile == OutputProfile.VideoPro) HideLiveTrackAndPlanets(root);
 
-        var outputFolderName = Path.GetFileName(Path.GetDirectoryName(renderedVideoPath));
-        var sourceName = Path.GetFileNameWithoutExtension(sourceChartPath);
-        var videoName = Path.GetFileNameWithoutExtension(renderedVideoPath);
-        var outputName = $"{sourceName}-{videoName}-{outputFolderName}.adofai";
-        var outputPath = GetUniquePath(Path.Combine(sourceDirectory, outputName));
-        File.WriteAllText(outputPath, root.ToJsonString(JsonOptions), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        var outputPath = RenderOutputLayout.Create(sourceChartPath, profile).DerivedChartPath;
+        WriteTextAtomically(
+            outputPath,
+            root.ToJsonString(JsonOptions),
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
         return new DerivedChartExportResult(
             outputPath,
@@ -210,16 +209,20 @@ public static class DerivedChartExporter
         return normalized[..6] + "00";
     }
 
-    private static string GetUniquePath(string preferredPath)
+    private static void WriteTextAtomically(string path, string contents, Encoding encoding)
     {
-        if (!File.Exists(preferredPath)) return preferredPath;
-        var directory = Path.GetDirectoryName(preferredPath)!;
-        var name = Path.GetFileNameWithoutExtension(preferredPath);
-        var extension = Path.GetExtension(preferredPath);
-        for (var suffix = 2; ; suffix++)
+        var temporaryPath = path + ".writing";
+        File.WriteAllText(temporaryPath, contents, encoding);
+        try
         {
-            var candidate = Path.Combine(directory, $"{name}-{suffix}{extension}");
-            if (!File.Exists(candidate)) return candidate;
+            if (File.Exists(path))
+                File.Replace(temporaryPath, path, null);
+            else
+                File.Move(temporaryPath, path);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
         }
     }
 }

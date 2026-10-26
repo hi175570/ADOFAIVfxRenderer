@@ -503,7 +503,7 @@ public partial class MainWindow : Window
                 selected.Item,
                 DiagnosticTrackCheckBox.IsChecked == true,
                 DiagnosticPlanetsCheckBox.IsChecked == true,
-                DiagnosticEffectsCheckBox.IsChecked == true,
+                DiagnosticFiltersCheckBox.IsChecked == true,
                 progress);
             var pairs = files.Select(static pair => new DecorationComparisonViewItem(pair)).ToArray();
             DecorationComparisonList.ItemsSource = pairs;
@@ -608,7 +608,7 @@ public partial class MainWindow : Window
         ForegroundDecorationsCheckBox.IsChecked = content.HasFlag(RenderContent.ForegroundDecorations);
         TrackCheckBox.IsChecked = content.HasFlag(RenderContent.Track);
         PlanetsCheckBox.IsChecked = content.HasFlag(RenderContent.Planets);
-        EffectsCheckBox.IsChecked = content.HasFlag(RenderContent.Effects);
+        FiltersCheckBox.IsChecked = content.HasFlag(RenderContent.Filters);
     }
 
     private RenderContent? GetContentOverride()
@@ -623,7 +623,7 @@ public partial class MainWindow : Window
         if (ForegroundDecorationsCheckBox.IsChecked == true) content |= RenderContent.ForegroundDecorations;
         if (TrackCheckBox.IsChecked == true) content |= RenderContent.Track;
         if (PlanetsCheckBox.IsChecked == true) content |= RenderContent.Planets;
-        if (EffectsCheckBox.IsChecked == true) content |= RenderContent.Effects;
+        if (FiltersCheckBox.IsChecked == true) content |= RenderContent.Filters;
         return content;
     }
 

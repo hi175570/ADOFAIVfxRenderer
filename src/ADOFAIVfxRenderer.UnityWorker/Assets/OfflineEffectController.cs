@@ -24,6 +24,16 @@ public sealed class OfflineEffectController : MonoBehaviour
     public bool HallOfMirrorsEnabled =>
         _states.TryGetValue("builtin:HallOfMirrors", out var state) && state.Enabled;
 
+    public string DescribeActiveEffects() => string.Join(
+        "; ",
+        _states
+            .Where(static pair => pair.Value.Enabled)
+            .OrderBy(static pair => pair.Key, StringComparer.Ordinal)
+            .Select(static pair =>
+                pair.Key + "{" + string.Join(",", pair.Value.Values
+                    .OrderBy(static value => value.Key, StringComparer.Ordinal)
+                    .Select(static value => value.Key + "=" + value.Value)) + "}"));
+
     public static bool Supports(string? eventType) => eventType is
         "SetFilter" or "SetFilterAdvanced" or "Bloom" or "ScreenTile" or "ScreenScroll" or "HallOfMirrors";
 
@@ -160,7 +170,8 @@ public sealed class OfflineEffectController : MonoBehaviour
                 result["Intensity"] = (effectEvent.Data.Value<float?>("intensity") ?? 0f) / 100f;
                 break;
             case "SetFilterAdvanced":
-                if (effectEvent.Data["filterProperties"] is JObject properties)
+                var properties = ReadAdvancedProperties(effectEvent.Data["filterProperties"]);
+                if (properties != null)
                 {
                     foreach (var property in properties.Properties())
                     {
@@ -197,6 +208,25 @@ public sealed class OfflineEffectController : MonoBehaviour
                 break;
         }
         return result;
+    }
+
+    private static JObject? ReadAdvancedProperties(JToken? token)
+    {
+        if (token is JObject properties) return properties;
+        if (token?.Type != JTokenType.String) return null;
+        var text = token.Value<string>()?.Trim();
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        if (!text.StartsWith("{", StringComparison.Ordinal)) text = "{" + text;
+        if (!text.EndsWith("}", StringComparison.Ordinal)) text += "}";
+        try
+        {
+            return JObject.Parse(text);
+        }
+        catch (Exception exception)
+        {
+            Debug.LogError($"Unable to parse legacy filterProperties: {text}\n{exception}");
+            return null;
+        }
     }
 
     private void AdvanceTweens(float time)

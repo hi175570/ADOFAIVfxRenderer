@@ -43,6 +43,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     private Camera _backgroundCamera = null!;
     private Camera _staticBackgroundCamera = null!;
     private Process? _ffmpeg;
+    private string? _encodingOutputPath;
     private int _nextMove;
     private int _nextCameraEvent;
     private int _nextBackgroundEvent;
@@ -115,7 +116,20 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private void BuildScene()
     {
-        var chart = JObject.Parse(File.ReadAllText(_job.chartPath));
+        var originalChart = JObject.Parse(File.ReadAllText(_job.chartPath));
+        var chart = JObject.Parse(GameChartConverter.LoadCurrentFormat(_job.chartPath, _job.gameManagedDirectory));
+        Debug.Log(
+            $"GAME_CHART_CONVERTER sourceVersion={originalChart["settings"]?["version"]} " +
+            $"currentVersion={chart["settings"]?["version"]} " +
+            $"angles={(originalChart["angleData"] as JArray)?.Count}->{(chart["angleData"] as JArray)?.Count} " +
+            $"actions={(originalChart["actions"] as JArray)?.Count}->{(chart["actions"] as JArray)?.Count} " +
+            $"decorations={(originalChart["decorations"] as JArray)?.Count}->{(chart["decorations"] as JArray)?.Count}");
+        Debug.Log(
+            "GAME_CHART_CONVERTER_ACTIONS " +
+            string.Join(",", (chart["actions"] as JArray)?.OfType<JObject>()
+                .GroupBy(static action => action.Value<string>("eventType") ?? "")
+                .OrderByDescending(static group => group.Count())
+                .Select(static group => group.Key + "=" + group.Count()) ?? Array.Empty<string>()));
         _chartDirectory = Path.GetDirectoryName(_job.chartPath)!;
         var settings = (JObject?)chart["settings"] ?? new JObject();
         var bpm = settings.Value<float?>("bpm") ?? 100f;
@@ -159,7 +173,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         _camera.transform.localRotation = Quaternion.Euler(0f, 0f, _cameraState.Rotation);
         _camera.clearFlags = CameraClearFlags.Nothing;
         _camera.backgroundColor = ParseColor(settings.Value<string>("backgroundColor") ?? "000000ff");
-        _camera.aspect = _job.width / (float)_job.height;
+        _camera.aspect = RenderWidth / (float)RenderHeight;
         _camera.cullingMask = MainCameraMask;
         _camera.depth = -1f;
         _camera.enabled = false;
@@ -188,7 +202,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         _staticBackgroundCamera.cullingMask = 1 << StaticBackgroundLayer;
         _staticBackgroundCamera.depth = -1.63f;
         _staticBackgroundCamera.enabled = false;
-        if (_job.includeEffects)
+        if (_job.includeFilters || _job.includeEffects)
         {
             _effects = cameraObject.AddComponent<OfflineEffectController>();
             _effects.Configure(_job.bakedFilterKeys, _job.gameManagedDirectory, "Foreground", cameraObject);
@@ -884,17 +898,17 @@ public sealed class WorkerRuntime : MonoBehaviour
             // frame interval instead of the worker's wall-clock rendering speed.
             Time.captureFramerate = _job.framesPerSecond;
             StartEncoder();
-            target = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            target = new RenderTexture(RenderWidth, RenderHeight, 24, RenderTextureFormat.ARGB32);
             target.Create();
-            staticStage = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            staticStage = new RenderTexture(RenderWidth, RenderHeight, 24, RenderTextureFormat.ARGB32);
             staticStage.Create();
-            backgroundStage = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            backgroundStage = new RenderTexture(RenderWidth, RenderHeight, 24, RenderTextureFormat.ARGB32);
             backgroundStage.Create();
             var previousTarget = RenderTexture.active;
             RenderTexture.active = target;
             GL.Clear(true, true, _staticBackgroundCamera.backgroundColor);
             RenderTexture.active = previousTarget;
-            frameTexture = new Texture2D(_job.width, _job.height, TextureFormat.RGBA32, false, false);
+            frameTexture = new Texture2D(RenderWidth, RenderHeight, TextureFormat.RGBA32, false, false);
             var watch = Stopwatch.StartNew();
             var previewWatch = Stopwatch.StartNew();
             var diagnoseRenderFrame = GetArgumentInt("--diagnose-render-frame", -1);
@@ -912,6 +926,8 @@ public sealed class WorkerRuntime : MonoBehaviour
                 if (frame == diagnoseRenderFrame)
                 {
                     Debug.Log($"RENDER_PIPELINE frame={frame} time={time:0.000000} hall={_effects?.HallOfMirrorsEnabled == true} staticClear={_staticBackgroundCamera.clearFlags} backgroundClear={_backgroundCamera.clearFlags} mainClear={_camera.clearFlags}");
+                    Debug.Log($"FOREGROUND_EFFECTS time={time:0.000000} {_effects?.DescribeActiveEffects()}");
+                    Debug.Log($"BACKGROUND_EFFECTS time={time:0.000000} {_backgroundEffects?.DescribeActiveEffects()}");
                     LogDecorationPipeline(time);
                     WriteRenderDiagnostic(target, frame, "00-history-or-clear");
                 }
@@ -925,7 +941,7 @@ public sealed class WorkerRuntime : MonoBehaviour
 
                 var previous = RenderTexture.active;
                 RenderTexture.active = target;
-                frameTexture.ReadPixels(new Rect(0f, 0f, _job.width, _job.height), 0, 0, false);
+                frameTexture.ReadPixels(new Rect(0f, 0f, RenderWidth, RenderHeight), 0, 0, false);
                 frameTexture.Apply(false, false);
                 RenderTexture.active = previous;
                 var raw = frameTexture.GetRawTextureData();
@@ -956,6 +972,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             {
                 throw new InvalidOperationException($"FFmpeg exited with code {_ffmpeg.ExitCode}.");
             }
+
+            CommitEncodedVideo();
 
             _status.state = "complete";
             _status.percent = 100f;
@@ -1236,16 +1254,20 @@ public sealed class WorkerRuntime : MonoBehaviour
         var presetArguments = encoder == "h264_nvenc"
             ? " -preset " + (_job.encoderPreset == "p7" ? "p7" : "p4") + " -tune hq"
             : "";
+        var videoFilter = RenderWidth == _job.width && RenderHeight == _job.height
+            ? "vflip"
+            : string.Format(CultureInfo.InvariantCulture, "vflip,scale={0}:{1}:flags=lanczos", _job.width, _job.height);
         var arguments = string.Format(
             CultureInfo.InvariantCulture,
-            "-hide_banner -loglevel warning -y -f rawvideo -pixel_format rgba -video_size {0}x{1} -framerate {2} -i pipe:0 -vf vflip -an -c:v {3}{4} -b:v {5}k -pix_fmt yuv420p \"{6}\"",
-            _job.width,
-            _job.height,
+            "-hide_banner -loglevel warning -y -f rawvideo -pixel_format rgba -video_size {0}x{1} -framerate {2} -i pipe:0 -vf {3} -an -c:v {4}{5} -b:v {6}k -pix_fmt yuv420p \"{7}\"",
+            RenderWidth,
+            RenderHeight,
             _job.framesPerSecond,
+            videoFilter,
             encoder,
             presetArguments,
             Math.Max(1, _job.bitrateKbps),
-            _job.outputPath.Replace("\"", "\\\""));
+            GetEncodingOutputPath().Replace("\"", "\\\""));
         _ffmpeg = new Process
         {
             StartInfo = new ProcessStartInfo
@@ -1259,6 +1281,33 @@ public sealed class WorkerRuntime : MonoBehaviour
             },
         };
         if (!_ffmpeg.Start()) throw new InvalidOperationException("Unable to start FFmpeg.");
+    }
+
+    private string GetEncodingOutputPath()
+    {
+        if (!string.IsNullOrWhiteSpace(_encodingOutputPath)) return _encodingOutputPath;
+        var directory = Path.GetDirectoryName(_job.outputPath) ?? ".";
+        var fileName = Path.GetFileNameWithoutExtension(_job.outputPath);
+        var extension = Path.GetExtension(_job.outputPath);
+        foreach (var stalePath in Directory.GetFiles(directory, $".{fileName}.*.rendering{extension}"))
+            File.Delete(stalePath);
+        _encodingOutputPath = Path.Combine(directory, $".{fileName}.{_job.jobId}.rendering{extension}");
+        if (File.Exists(_encodingOutputPath)) File.Delete(_encodingOutputPath);
+        return _encodingOutputPath;
+    }
+
+    private int RenderWidth => _job.renderWidth > 0 ? _job.renderWidth : _job.width;
+    private int RenderHeight => _job.renderHeight > 0 ? _job.renderHeight : _job.height;
+
+    private void CommitEncodedVideo()
+    {
+        var temporaryPath = GetEncodingOutputPath();
+        if (!File.Exists(temporaryPath))
+            throw new FileNotFoundException("FFmpeg did not create the temporary video.", temporaryPath);
+        if (File.Exists(_job.outputPath))
+            File.Replace(temporaryPath, _job.outputPath, null);
+        else
+            File.Move(temporaryPath, _job.outputPath);
     }
 
     private string WritePreview(byte[] imageBytes, int frame)
@@ -1303,6 +1352,20 @@ public sealed class WorkerRuntime : MonoBehaviour
     private void Fail(Exception exception)
     {
         Debug.LogException(exception);
+        try
+        {
+            if (_ffmpeg is { HasExited: false })
+            {
+                _ffmpeg.Kill();
+                _ffmpeg.WaitForExit(2000);
+            }
+            if (!string.IsNullOrWhiteSpace(_encodingOutputPath) && File.Exists(_encodingOutputPath))
+                File.Delete(_encodingOutputPath);
+        }
+        catch
+        {
+            // Preserve the original render exception. The next render also removes stale staging files.
+        }
         _status ??= new WorkerStatus();
         _status.state = "failed";
         _status.message = exception.Message;
@@ -1461,6 +1524,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         public string gameManagedDirectory = "";
         public int width = 640;
         public int height = 360;
+        public int renderWidth;
+        public int renderHeight;
         public int framesPerSecond = 30;
         public int bitrateKbps = 2000;
         public float tailSeconds;
@@ -1468,6 +1533,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         public float renderStartSeconds;
         public bool includeTrack;
         public bool includePlanets;
+        public bool includeFilters;
+        // Backward-compatible with older diagnostic job files.
         public bool includeEffects;
         public string[]? bakedFilterKeys;
         public bool includeBackgroundDecorations = true;

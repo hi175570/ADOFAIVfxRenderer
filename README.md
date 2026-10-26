@@ -9,7 +9,7 @@ The renderer uses its own Unity 6000.3.10f1 player and never launches `A Dance o
 The current implementation milestone includes:
 
 - game-directory discovery and verified-build capability probing;
-- `.adofai` format-version inspection;
+- `.adofai` format-version inspection plus in-memory conversion through the selected game's own `LevelData.LoadLevel`/`Encode` path before rendering;
 - the four video-background ownership profiles;
 - 144p, 360p, 720p, 1080p, and 2160p presets;
 - 15, 30, 60, 90, 120, and 144 FPS presets;
@@ -28,14 +28,16 @@ The current implementation milestone includes:
 - paired decoration diagnostics that render ten identical timestamps with and without the selected decoration (twenty images total) and show every pair inside the app;
 - a `滤镜与装饰` workspace with per-filter ownership: keep the group live in the chart, bake a supported offline approximation into the video, or explicitly ignore it; baked/ignored groups are disabled only in the generated chart;
 - filter grouping by basic/advanced type, plane, target type, and target tag, so filters aimed at different objects are never silently merged into one choice;
-- an initial independent-worker filter stack for selected basic/advanced camera filters, Bloom, ScreenTile, and ScreenScroll, plus opt-in filtered decoration diagnostics; Hall of Mirrors remains realtime-only because Video VFX does not contain the track/particle/history layers needed to bake it faithfully;
+- the installed game's original basic/advanced camera-filter components and parameter conversion, including signed values, legacy string-form `filterProperties`, Bloom, ScreenTile, ScreenScroll, and frame-history Hall of Mirrors in profiles that bake the complete scene;
+- one stable `Video VFX` folder beside the source chart: each output profile owns one canonical MP4 and one canonical derived chart, and a successful rerender atomically replaces the previous file instead of producing timestamped backups;
 - remembered game/chart paths, a dedicated settings tab, and guarded cleanup of only app-generated diagnostic caches;
 - selectable automatic, CPU/WARP, hardware-GPU, and NVIDIA/RTX/NVENC backends with capability probing and no silent fallback;
 - selectable background/foreground decoration content with UI always excluded;
 - quality-derived and custom kbps bitrate support;
+- a separate internal effect canvas: filter-bearing outputs render at a minimum 1080p reference canvas before Lanczos downscaling, so choosing a small delivery resolution does not multiply pixel-radius blur and erase the track;
 - dependency-free core regression tests.
 
-The worker is intentionally not described as pixel-accurate for every chart yet. Image decorations used by the current target chart have verified timeline, tiling, v19 `NO TAG` masking semantics, masking depth ranges, blending, repeat, player-follow camera, unwrapped full-turn camera rotation, and tween adapters. Text, particle, and object decorations remain live in the derived chart instead of being silently dropped. Offline filters are opt-in per group and explicitly labelled as approximations; advanced filters aimed at tagged decorations are not offered as bakeable until object-scoped compositing exists. Track/planet rendering still needs verified offline adapters. Video VFX and depth-split Video VFX Pro are enabled end to end; Video and Video Pro remain disabled until their full offline visual path is verified.
+The worker is intentionally not described as pixel-accurate for every chart yet. Image decorations used by the current target chart have verified timeline, tiling, v19 `NO TAG` masking semantics, masking depth ranges, blending, repeat, player-follow camera, unwrapped full-turn camera rotation, and tween adapters. Text and object decorations that are not yet supported remain live in the derived chart instead of being silently dropped. Video, Video Pro, Video VFX, and depth-split Video VFX Pro are enabled end to end; difficult charts still require comparison against the installed game's output, especially when filters target individual tagged decorations.
 
 ## Build and test
 
@@ -48,7 +50,7 @@ dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core
 
 ## Compatibility policy
 
-A chart is renderable only when the selected game installation has a verified adapter. Unknown binary builds are detected but rejected until their semantics are validated. The independent worker must never fall back to starting, copying, renaming, or hard-linking the game executable.
+A chart is renderable only when the selected game installation has a verified adapter. The current supported baseline is the detected 3.x / Unity 6000.3.10f1 installation. Older 2.9.x Unity builds are not assumed binary-compatible and are rejected until a matching worker and real installation are validated. Unknown binary builds are detected but rejected rather than silently using current-version assumptions. The independent worker must never fall back to starting, copying, renaming, or hard-linking the game executable.
 
 ## License
 

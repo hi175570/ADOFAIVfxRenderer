@@ -7,12 +7,14 @@ param(
     [double]$DurationSeconds = 10,
     [int]$Width = 640,
     [int]$Height = 360,
+    [int]$RenderWidth = 0,
+    [int]$RenderHeight = 0,
     [int]$Fps = 15,
     [int]$BitrateKbps = 1200,
     [ValidateSet("Video", "VideoPro", "VideoVfx", "VideoVfxPro")][string]$Profile = "VideoVfx",
     [string]$VideoEncoder = "libopenh264",
     [string]$EncoderPreset = "",
-    [switch]$IncludeEffects,
+    [Alias("IncludeEffects")][switch]$IncludeFilters,
     [switch]$IncludeTrack,
     [switch]$IncludePlanets,
     [switch]$NoBackgroundDecorations,
@@ -61,11 +63,13 @@ $job = [ordered]@{
     profile = $Profile
     width = $Width
     height = $Height
+    renderWidth = if ($RenderWidth -gt 0) { $RenderWidth } else { $Width }
+    renderHeight = if ($RenderHeight -gt 0) { $RenderHeight } else { $Height }
     framesPerSecond = $Fps
     tailSeconds = 0
     includeTrack = [bool]$IncludeTrack
     includePlanets = [bool]$IncludePlanets
-    includeEffects = [bool]$IncludeEffects -or $resolvedBakedFilterKeys.Count -gt 0
+    includeFilters = [bool]$IncludeFilters -or $resolvedBakedFilterKeys.Count -gt 0
     bakedFilterKeys = @($resolvedBakedFilterKeys)
     includeBackgroundDecorations = -not [bool]$NoBackgroundDecorations
     includeForegroundDecorations = -not [bool]$NoForegroundDecorations
@@ -83,7 +87,7 @@ $job | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jobPath -Encoding utf
 $log = Join-Path $output "worker.log"
 $workerArguments = @(
     '-batchmode', '-logFile', $log, '--job', $jobPath,
-    '-screen-fullscreen', '0', '-screen-width', $Width, '-screen-height', $Height,
+    '-screen-fullscreen', '0', '-screen-width', $job.renderWidth, '-screen-height', $job.renderHeight,
     '-force-d3d11'
 )
 if ($CpuCompatibility) { $workerArguments += '-force-driver-type-warp' }
