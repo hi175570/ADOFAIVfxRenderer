@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($UnityPath)) {
     $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Unity\6000.3.10f1\Editor\Unity.exe"),
         (Join-Path $env:USERPROFILE "UnityEditors\6000.3.10f1\Editor\Unity.exe"),
         "C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Unity.exe"
     )

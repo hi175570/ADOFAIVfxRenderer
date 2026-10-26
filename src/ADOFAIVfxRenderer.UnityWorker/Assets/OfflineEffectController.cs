@@ -16,6 +16,8 @@ public sealed class OfflineEffectController : MonoBehaviour
     private readonly Dictionary<string, EffectTween> _active = new(StringComparer.Ordinal);
     private Material? _material;
     private HashSet<string>? _allowedKeys;
+    private GameFilterBridge? _gameFilters;
+    private string _plane = "Foreground";
     private int _nextEvent;
     private float _time;
 
@@ -25,10 +27,17 @@ public sealed class OfflineEffectController : MonoBehaviour
     public static bool Supports(string? eventType) => eventType is
         "SetFilter" or "SetFilterAdvanced" or "Bloom" or "ScreenTile" or "ScreenScroll" or "HallOfMirrors";
 
-    public void Configure(IEnumerable<string>? allowedKeys)
+    public void Configure(
+        IEnumerable<string>? allowedKeys,
+        string? gameManagedDirectory = null,
+        string plane = "Foreground",
+        GameObject? cameraHost = null)
     {
+        _plane = plane;
         var keys = allowedKeys?.Where(static key => !string.IsNullOrWhiteSpace(key)).ToArray() ?? Array.Empty<string>();
         _allowedKeys = keys.Length == 0 ? null : new HashSet<string>(keys, StringComparer.Ordinal);
+        if (!string.IsNullOrWhiteSpace(gameManagedDirectory))
+            _gameFilters = new GameFilterBridge(gameManagedDirectory, cameraHost);
     }
 
     public void AddEvent(
@@ -45,6 +54,14 @@ public sealed class OfflineEffectController : MonoBehaviour
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f /
                                     (Math.Max(0.000001f, bpm) * Math.Max(0.000001f, pitch)));
         var type = data.Value<string>("eventType") ?? "";
+        if (type == "SetFilterAdvanced")
+        {
+            if (!string.Equals(data.Value<string>("plane") ?? "Foreground", _plane, StringComparison.Ordinal)) return;
+        }
+        else if (!string.Equals(_plane, "Foreground", StringComparison.Ordinal))
+        {
+            return;
+        }
         var key = type switch
         {
             "SetFilter" => $"basic:{data.Value<string>("filter") ?? ""}",
@@ -56,6 +73,7 @@ public sealed class OfflineEffectController : MonoBehaviour
             _ => "",
         };
         if (key.Length == 0 || (_allowedKeys != null && !_allowedKeys.Contains(key))) return;
+        _gameFilters?.Register(key, type, data);
         _events.Add(new EffectEvent(start, duration, order, key, type, data));
     }
 
@@ -64,6 +82,7 @@ public sealed class OfflineEffectController : MonoBehaviour
         _events.Sort(static (left, right) => left.Start != right.Start
             ? left.Start.CompareTo(right.Start)
             : left.Order.CompareTo(right.Order));
+        if (_gameFilters?.IsAvailable == true) return;
         var shader = Resources.Load<Shader>("ADOFAIOfflineEffects");
         if (shader == null) throw new InvalidOperationException("Missing ADOFAIOfflineEffects shader resource.");
         _material = new Material(shader) { name = "ADOFAI Offline Effect Stack" };
@@ -79,6 +98,9 @@ public sealed class OfflineEffectController : MonoBehaviour
         AdvanceTweens(time);
         _time = time;
         UpdateMaterial();
+        _gameFilters?.Synchronize(
+            _states.Select(static pair => new GameFilterStateView(pair.Key, pair.Value.Enabled, pair.Value.Values)),
+            time);
     }
 
     private void StartEvent(EffectEvent effectEvent)
@@ -87,12 +109,11 @@ public sealed class OfflineEffectController : MonoBehaviour
 
         var state = GetState(effectEvent.Key);
         var enabled = effectEvent.Data.Value<bool?>("enabled") ?? true;
-        if (!enabled)
-        {
-            state.Enabled = false;
-            return;
-        }
-
+        // ffxSetFilterAdvancedPlus performs ResetFilters before checking the
+        // event's enabled flag. Charts intentionally use a disabled filter
+        // with disableOthers=true as a camera-plane reset. Returning first
+        // left every old advanced effect alive (for example TV_Tiles and
+        // DigitalMatrix survived from floor 1 into the floor-287 scene).
         if (effectEvent.Data.Value<bool?>("disableOthers") == true)
         {
             var prefix = effectEvent.Type == "SetFilter" ? "basic:" : "advanced:";
@@ -104,10 +125,18 @@ public sealed class OfflineEffectController : MonoBehaviour
             }
         }
 
+        if (!enabled)
+        {
+            state.Enabled = false;
+            return;
+        }
+
         var targets = ReadTargets(effectEvent);
-        var starts = new Dictionary<string, float>(StringComparer.Ordinal);
+        var starts = new Dictionary<string, object>(StringComparer.Ordinal);
         foreach (var target in targets)
-            starts[target.Key] = state.Values.TryGetValue(target.Key, out var current) && state.Enabled ? current : 0f;
+            starts[target.Key] = state.Values.TryGetValue(target.Key, out var current) && state.Enabled
+                ? current
+                : ZeroValue(target.Value);
         state.Enabled = true;
 
         var tween = new EffectTween(effectEvent, state, starts, targets);
@@ -122,9 +151,9 @@ public sealed class OfflineEffectController : MonoBehaviour
         }
     }
 
-    private static Dictionary<string, float> ReadTargets(EffectEvent effectEvent)
+    private Dictionary<string, object> ReadTargets(EffectEvent effectEvent)
     {
-        var result = new Dictionary<string, float>(StringComparer.Ordinal);
+        var result = new Dictionary<string, object>(StringComparer.Ordinal);
         switch (effectEvent.Type)
         {
             case "SetFilter":
@@ -135,14 +164,19 @@ public sealed class OfflineEffectController : MonoBehaviour
                 {
                     foreach (var property in properties.Properties())
                     {
-                        if (property.Value.Type is JTokenType.Integer or JTokenType.Float)
-                            result[property.Name] = property.Value.Value<float>() / 100f;
+                        var converted = _gameFilters?.ConvertAdvancedValue(
+                            effectEvent.Key,
+                            property.Name,
+                            property.Value);
+                        if (converted != null) result[property.Name] = converted;
                     }
                 }
                 break;
             case "Bloom":
                 result["Intensity"] = (effectEvent.Data.Value<float?>("intensity") ?? 0f) / 100f;
                 result["Threshold"] = (effectEvent.Data.Value<float?>("threshold") ?? 0f) / 100f;
+                var bloomColor = ParseColor(effectEvent.Data.Value<string>("color"));
+                if (bloomColor != null) result["Color"] = bloomColor.Value;
                 break;
             case "ScreenTile":
             {
@@ -191,13 +225,13 @@ public sealed class OfflineEffectController : MonoBehaviour
         var background = $"advanced:Background:{name}:";
         return _states.Where(pair => pair.Key.StartsWith(foreground, StringComparison.Ordinal) ||
                                      pair.Key.StartsWith(background, StringComparison.Ordinal))
-            .Sum(pair => pair.Value.Enabled && pair.Value.Values.TryGetValue(property, out var value) ? value : 0f);
+            .Sum(pair => pair.Value.Enabled && pair.Value.Values.TryGetValue(property, out var value) ? ToFloat(value) : 0f);
     }
 
     private float Value(string key, string property)
     {
         return _states.TryGetValue(key, out var state) && state.Enabled && state.Values.TryGetValue(property, out var value)
-            ? value
+            ? ToFloat(value)
             : 0f;
     }
 
@@ -269,10 +303,39 @@ public sealed class OfflineEffectController : MonoBehaviour
     }
 
     private static float Get(EffectState state, string key, float fallback = 0f) =>
-        state.Values.TryGetValue(key, out var value) ? value : fallback;
+        state.Values.TryGetValue(key, out var value) ? ToFloat(value) : fallback;
+
+    private static float ToFloat(object value) => value switch
+    {
+        float number => number,
+        int number => number,
+        double number => (float)number,
+        _ => 0f,
+    };
+
+    private static object ZeroValue(object value) => value switch
+    {
+        Color => Color.white,
+        Vector2 => Vector2.zero,
+        int => 0,
+        _ => 0f,
+    };
+
+    private static Color? ParseColor(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = value.Trim().TrimStart('#');
+        if (normalized.Length == 6) normalized += "ff";
+        return ColorUtility.TryParseHtmlString("#" + normalized, out var color) ? color : null;
+    }
 
     private void OnRenderImage(RenderTexture source, RenderTexture destination)
     {
+        if (_gameFilters?.IsAvailable == true)
+        {
+            _gameFilters.Render(source, destination);
+            return;
+        }
         if (_material == null)
         {
             Graphics.Blit(source, destination);
@@ -312,6 +375,8 @@ public sealed class OfflineEffectController : MonoBehaviour
         RenderTexture.ReleaseTemporary(processed);
     }
 
+    public void Render(RenderTexture source, RenderTexture destination) => OnRenderImage(source, destination);
+
     private static Vector2 ReadVector2(JToken? token, Vector2 fallback)
     {
         if (token is not JArray { Count: >= 2 } array) return fallback;
@@ -319,32 +384,12 @@ public sealed class OfflineEffectController : MonoBehaviour
     }
 
     private static float EaseAmount(float amount, string? ease)
-    {
-        amount = Mathf.Clamp01(amount);
-        return ease switch
-        {
-            "InSine" => 1f - Mathf.Cos(amount * Mathf.PI * 0.5f),
-            "OutSine" => Mathf.Sin(amount * Mathf.PI * 0.5f),
-            "InOutSine" => -(Mathf.Cos(Mathf.PI * amount) - 1f) * 0.5f,
-            "InQuad" => amount * amount,
-            "OutQuad" => 1f - (1f - amount) * (1f - amount),
-            "InOutQuad" => amount < 0.5f ? 2f * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 2f) * 0.5f,
-            "InCubic" => amount * amount * amount,
-            "OutCubic" => 1f - Mathf.Pow(1f - amount, 3f),
-            "InOutCubic" => amount < 0.5f ? 4f * amount * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 3f) * 0.5f,
-            "InCirc" => 1f - Mathf.Sqrt(1f - amount * amount),
-            "OutCirc" => Mathf.Sqrt(1f - (amount - 1f) * (amount - 1f)),
-            "InOutCirc" => amount < 0.5f
-                ? (1f - Mathf.Sqrt(1f - Mathf.Pow(2f * amount, 2f))) * 0.5f
-                : (Mathf.Sqrt(1f - Mathf.Pow(-2f * amount + 2f, 2f)) + 1f) * 0.5f,
-            _ => amount,
-        };
-    }
+        => GameEaseBridge.Evaluate(amount, ease);
 
     private sealed class EffectState
     {
         public bool Enabled;
-        public Dictionary<string, float> Values { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, object> Values { get; } = new(StringComparer.Ordinal);
     }
 
     private sealed class EffectEvent
@@ -370,10 +415,10 @@ public sealed class OfflineEffectController : MonoBehaviour
     private sealed class EffectTween
     {
         private readonly EffectState _state;
-        private readonly IReadOnlyDictionary<string, float> _starts;
-        private readonly IReadOnlyDictionary<string, float> _targets;
+        private readonly IReadOnlyDictionary<string, object> _starts;
+        private readonly IReadOnlyDictionary<string, object> _targets;
 
-        public EffectTween(EffectEvent effectEvent, EffectState state, IReadOnlyDictionary<string, float> starts, IReadOnlyDictionary<string, float> targets)
+        public EffectTween(EffectEvent effectEvent, EffectState state, IReadOnlyDictionary<string, object> starts, IReadOnlyDictionary<string, object> targets)
         {
             Event = effectEvent;
             _state = state;
@@ -386,7 +431,18 @@ public sealed class OfflineEffectController : MonoBehaviour
         public void Apply(float amount)
         {
             foreach (var target in _targets)
-                _state.Values[target.Key] = Mathf.LerpUnclamped(_starts[target.Key], target.Value, amount);
+                _state.Values[target.Key] = LerpValue(_starts[target.Key], target.Value, amount);
+        }
+
+        private static object LerpValue(object start, object target, float amount)
+        {
+            if (start is Color startColor && target is Color targetColor)
+                return Color.LerpUnclamped(startColor, targetColor, amount);
+            if (start is Vector2 startVector && target is Vector2 targetVector)
+                return Vector2.LerpUnclamped(startVector, targetVector, amount);
+            if (start is int startInt && target is int targetInt)
+                return Mathf.RoundToInt(Mathf.LerpUnclamped(startInt, targetInt, amount));
+            return Mathf.LerpUnclamped(ToFloat(start), ToFloat(target), amount);
         }
     }
 }

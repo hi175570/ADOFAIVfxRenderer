@@ -23,6 +23,8 @@ var tests = new (string Name, Action Run)[]
     ("Current target timeline when present", CurrentTargetTimeline),
     ("Derived Video VFX ownership", DerivedVideoVfxOwnership),
     ("Derived Video VFX Pro ownership", DerivedVideoVfxProOwnership),
+    ("Derived Video ownership", DerivedVideoOwnership),
+    ("Derived Video Pro ownership", DerivedVideoProOwnership),
     ("Derived chart retains selected decoration", DerivedChartRetainsSelectedDecoration),
     ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
     ("Filter catalog groups by target", FilterCatalogGroupsByTarget),
@@ -148,7 +150,7 @@ static void OutputProfileOwnership()
         VideoPresets.P144,
         15,
         VideoQualityPreset.Balanced).Content.HasFlag(RenderContent.Planets));
-    True(new RenderVariant(
+    False(new RenderVariant(
         OutputProfile.VideoPro,
         VideoPresets.P144,
         15,
@@ -336,6 +338,19 @@ static void DerivedVideoVfxProOwnership() => TestDerivedOwnership(
     expectedDecorationCount: 1,
     expectedRemainingDepth: -10);
 
+static void DerivedVideoOwnership() => TestDerivedOwnership(
+    OutputProfile.Video,
+    expectedDecorationCount: 2,
+    expectedRemainingDepth: null,
+    expectFilterDisabled: true);
+
+static void DerivedVideoProOwnership() => TestDerivedOwnership(
+    OutputProfile.VideoPro,
+    expectedDecorationCount: 2,
+    expectedRemainingDepth: null,
+    expectFilterDisabled: true,
+    expectHiddenGameplayVisuals: true);
+
 static void DerivedChartRetainsSelectedDecoration()
 {
     var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-retained-{Guid.NewGuid():N}");
@@ -484,7 +499,12 @@ static void DerivedChartDisablesSelectedFilters()
     }
 }
 
-static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCount, int? expectedRemainingDepth)
+static void TestDerivedOwnership(
+    OutputProfile profile,
+    int expectedDecorationCount,
+    int? expectedRemainingDepth,
+    bool expectFilterDisabled = false,
+    bool expectHiddenGameplayVisuals = false)
 {
     var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-export-{Guid.NewGuid():N}");
     Directory.CreateDirectory(root);
@@ -498,10 +518,13 @@ static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCo
         File.WriteAllText(chartPath, """
         {
           "angleData": [0, 180],
-          "settings": {"version": 19, "bpm": 120, "countdownTicks": 4, "separateCountdownTime": true},
+          "settings": {"version": 19, "bpm": 120, "countdownTicks": 4, "separateCountdownTime": true, "trackColor": "abcdef", "secondaryTrackColor": "123456ff"},
           "actions": [
             {"floor": 0, "eventType": "CustomBackground", "color": "000000"},
-            {"floor": 0, "eventType": "SetFilter", "filter": "Blur"}
+            {"floor": 0, "eventType": "SetFilter", "filter": "Blur", "enabled": true},
+            {"floor": 0, "eventType": "RecolorTrack", "trackColor": "ffffff", "secondaryTrackColor": "010203ff"},
+            {"floor": 0, "eventType": "MoveTrack", "opacity": 100},
+            {"floor": 0, "eventType": "ScalePlanets", "scale": 100}
           ],
           "decorations": [
             {"floor": 0, "eventType": "AddDecoration", "decorationImage": "bg.png", "depth": 10},
@@ -517,7 +540,9 @@ static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCo
         Equal(0, result.VideoOffsetMilliseconds);
         var derived = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(result.ChartPath))!.AsObject();
         Equal("output/render.mp4", derived["settings"]!["bgVideo"]!.GetValue<string>());
-        True(derived["actions"]!.AsArray().Any(node => node!["eventType"]!.GetValue<string>() == "SetFilter"));
+        var actions = derived["actions"]!.AsArray();
+        var filter = actions.Single(node => node!["eventType"]!.GetValue<string>() == "SetFilter")!;
+        Equal(!expectFilterDisabled, filter["enabled"]!.GetValue<bool>());
         var remaining = derived["decorations"]!.AsArray();
         True(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddText"));
         if (expectedRemainingDepth.HasValue)
@@ -528,6 +553,14 @@ static void TestDerivedOwnership(OutputProfile profile, int expectedDecorationCo
         else
         {
             False(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddDecoration"));
+        }
+        if (expectHiddenGameplayVisuals)
+        {
+            Equal("abcdef00", derived["settings"]!["trackColor"]!.GetValue<string>());
+            Equal("12345600", derived["settings"]!["secondaryTrackColor"]!.GetValue<string>());
+            Equal("ffffff00", actions.Single(node => node!["eventType"]!.GetValue<string>() == "RecolorTrack")!["trackColor"]!.GetValue<string>());
+            Equal(0, actions.Single(node => node!["eventType"]!.GetValue<string>() == "MoveTrack")!["opacity"]!.GetValue<int>());
+            Equal(0, actions.Single(node => node!["eventType"]!.GetValue<string>() == "ScalePlanets")!["scale"]!.GetValue<int>());
         }
     }
     finally

@@ -44,9 +44,9 @@ public static class OutputProfiles
                 OutputProfile.VideoPro,
                 "Video Pro",
                 RenderContent.BackgroundDecorations | RenderContent.ForegroundDecorations | RenderContent.Track |
-                RenderContent.Planets | RenderContent.Effects,
+                RenderContent.Effects,
                 RenderContent.None,
-                "视频包含全部视觉元素；关卡只保留不可见的游玩逻辑。"),
+                "视频包含装饰、轨道与特效；星球默认不录制，派生关卡只保留不可见的游玩逻辑。"),
             [OutputProfile.VideoVfx] = new(
                 OutputProfile.VideoVfx,
                 "Video VFX",

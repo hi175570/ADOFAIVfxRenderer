@@ -800,11 +800,6 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("输出版本、分辨率和 FPS 都至少选择一个。");
             }
 
-            if (profiles.Any(static profile => profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro)))
-            {
-                throw new NotSupportedException("当前可实测的是 Video VFX 与 Video VFX Pro；Video / Video Pro 要等原版滤镜适配完成。");
-            }
-
             if (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var tailSeconds))
             {
                 throw new InvalidOperationException("结束延长秒数无效。");

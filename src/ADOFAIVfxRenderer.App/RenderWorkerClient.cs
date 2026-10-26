@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows.Threading;
@@ -59,11 +61,6 @@ internal sealed class RenderWorkerClient : IDisposable
             throw new InvalidOperationException("已有一个 ADOFAI VFX Worker 正在渲染。");
         }
 
-        if (variant.Profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
-        {
-            throw new NotSupportedException("当前独立 Worker 支持 Video VFX 与 Video VFX Pro；含离线滤镜的版本尚未开放。");
-        }
-
         var workerExecutable = FindStandaloneWorker();
         if (workerExecutable is null)
         {
@@ -73,6 +70,9 @@ internal sealed class RenderWorkerClient : IDisposable
         }
 
         ValidateStandaloneWorker(workerExecutable, installation.RootDirectory);
+        workerExecutable = EnsureGameResourceWorker(
+            workerExecutable,
+            installation.DataDirectory ?? throw new InvalidOperationException("游戏安装缺少 Data 目录。"));
         var ffmpegPath = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe");
         var resolvedBackend = ResolveBackend(renderBackend, ffmpegPath);
 
@@ -111,6 +111,9 @@ internal sealed class RenderWorkerClient : IDisposable
             DurationLimitSeconds = durationLimitSeconds.HasValue ? (float)durationLimitSeconds.Value : 0f,
             RenderStartSeconds = (float)renderStartSeconds,
             FfmpegPath = ffmpegPath,
+            GameManagedDirectory = Path.Combine(
+                installation.DataDirectory ?? throw new InvalidOperationException("游戏安装缺少 Data 目录。"),
+                "Managed"),
             VideoEncoder = resolvedBackend.VideoEncoder,
             EncoderPreset = resolvedBackend.EncoderPreset,
         };
@@ -300,6 +303,111 @@ internal sealed class RenderWorkerClient : IDisposable
         }
     }
 
+    internal static string EnsureGameResourceWorker(string workerExecutable, string gameDataDirectory)
+    {
+        var workerDirectory = Path.GetDirectoryName(Path.GetFullPath(workerExecutable))
+            ?? throw new InvalidOperationException("无法确定独立 Worker 的目录。");
+        var gameData = Path.GetFullPath(gameDataDirectory);
+        var gameResources = Path.Combine(gameData, "resources.assets");
+        if (!File.Exists(gameResources))
+            throw new FileNotFoundException("游戏 Data 目录缺少 resources.assets。", gameResources);
+
+        var patchScriptCandidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "Tools", "Patch-WorkerGameResources.py"),
+            Path.Combine(Path.GetDirectoryName(workerDirectory) ?? workerDirectory, "Tools", "Patch-WorkerGameResources.py"),
+            Path.GetFullPath(Path.Combine(workerDirectory, "..", "..", "scripts", "Patch-WorkerGameResources.py")),
+        };
+        var patchScript = patchScriptCandidates.FirstOrDefault(File.Exists)
+            ?? throw new FileNotFoundException(
+                "找不到本机 Worker 资源准备器 Patch-WorkerGameResources.py。",
+                patchScriptCandidates[0]);
+
+        var workerRuntime = Path.Combine(
+            workerDirectory,
+            Path.GetFileNameWithoutExtension(workerExecutable) + "_Data",
+            "Managed",
+            "ADOFAIVfxWorker.Runtime.dll");
+        var identity = string.Join("|", new[]
+        {
+            FileIdentity(workerExecutable),
+            FileIdentity(workerRuntime),
+            FileIdentity(gameResources),
+            FileIdentity(Path.Combine(gameData, "globalgamemanagers")),
+            FileIdentity(patchScript),
+        });
+        var cacheKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..20];
+        var cacheRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ADOFAIVfxRenderer",
+            "WorkerCache");
+        Directory.CreateDirectory(cacheRoot);
+        var preparedDirectory = Path.Combine(cacheRoot, cacheKey);
+        var preparedExecutable = Path.Combine(preparedDirectory, Path.GetFileName(workerExecutable));
+        if (File.Exists(preparedExecutable)) return preparedExecutable;
+
+        var temporaryDirectory = Path.Combine(cacheRoot, cacheKey + ".tmp-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "python",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            startInfo.ArgumentList.Add(patchScript);
+            startInfo.ArgumentList.Add("--worker");
+            startInfo.ArgumentList.Add(workerDirectory);
+            startInfo.ArgumentList.Add("--game-data");
+            startInfo.ArgumentList.Add(gameData);
+            startInfo.ArgumentList.Add("--output");
+            startInfo.ArgumentList.Add(temporaryDirectory);
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("无法启动 Python Worker 资源准备器。");
+            var standardOutput = process.StandardOutput.ReadToEndAsync();
+            var standardError = process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+            Task.WaitAll(standardOutput, standardError);
+            if (process.ExitCode != 0)
+            {
+                var details = string.Join(Environment.NewLine,
+                    new[] { standardError.Result.Trim(), standardOutput.Result.Trim() }
+                        .Where(static value => value.Length > 0));
+                throw new InvalidOperationException(
+                    "本机 Worker 资源准备失败。请确认 Python 可用且已安装 UnityPy。" +
+                    (details.Length > 0 ? Environment.NewLine + details : ""));
+            }
+
+            var temporaryExecutable = Path.Combine(temporaryDirectory, Path.GetFileName(workerExecutable));
+            if (!File.Exists(temporaryExecutable))
+                throw new InvalidOperationException("资源准备器完成后没有生成 Worker 可执行文件。");
+            try
+            {
+                Directory.Move(temporaryDirectory, preparedDirectory);
+            }
+            catch (IOException) when (File.Exists(preparedExecutable))
+            {
+                Directory.Delete(temporaryDirectory, recursive: true);
+            }
+            return preparedExecutable;
+        }
+        catch
+        {
+            if (Directory.Exists(temporaryDirectory)) Directory.Delete(temporaryDirectory, recursive: true);
+            throw;
+        }
+    }
+
+    private static string FileIdentity(string path)
+    {
+        var file = new FileInfo(path);
+        if (!file.Exists) throw new FileNotFoundException("准备 Worker 所需文件不存在。", path);
+        return $"{file.FullName}|{file.Length}|{file.LastWriteTimeUtc.Ticks}";
+    }
+
     private static ResolvedRenderBackend ResolveBackend(RenderBackend backend, string ffmpegPath)
     {
         if (!File.Exists(ffmpegPath)) throw new FileNotFoundException("游戏目录内缺少 FFmpeg。", ffmpegPath);
@@ -427,6 +535,9 @@ internal sealed class WorkerJob
 
     [JsonPropertyName("ffmpegPath")]
     public string FfmpegPath { get; init; } = "";
+
+    [JsonPropertyName("gameManagedDirectory")]
+    public string GameManagedDirectory { get; init; } = "";
 
     [JsonPropertyName("videoEncoder")]
     public string VideoEncoder { get; init; } = "libopenh264";

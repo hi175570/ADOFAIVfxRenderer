@@ -5,10 +5,12 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityEngine.Rendering;
 using ADOFAIVfxTimeline;
 using Debug = UnityEngine.Debug;
 
@@ -20,9 +22,13 @@ public sealed class WorkerRuntime : MonoBehaviour
     private const float DefaultCameraOrthoSize = 5f;
     private readonly Dictionary<string, Texture2D> _textures = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Sprite> _sprites = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Material> _blendMaterials = new(StringComparer.Ordinal);
     private Material? _tileMaterial;
+    private Type? _gameBlendEffectType;
+    private PropertyInfo? _gameBlendModeProperty;
+    private PropertyInfo? _gameBlendPointSamplingProperty;
     private readonly List<DecorationState> _decorations = new();
+    private readonly List<ParticleState> _particles = new();
+    private readonly List<ParticleControlEvent> _particleEvents = new();
     private readonly List<MoveEvent> _moves = new();
     private readonly List<MoveEvent> _activeMoves = new();
     private readonly List<CameraEvent> _cameraEvents = new();
@@ -32,11 +38,15 @@ public sealed class WorkerRuntime : MonoBehaviour
     private readonly HashSet<int> _unbakedDecorationIndices = new();
     private WorkerJob _job = null!;
     private WorkerStatus _status = null!;
+    private Transform _cameraParent = null!;
     private Camera _camera = null!;
+    private Camera _backgroundCamera = null!;
+    private Camera _staticBackgroundCamera = null!;
     private Process? _ffmpeg;
     private int _nextMove;
     private int _nextCameraEvent;
     private int _nextBackgroundEvent;
+    private int _nextParticleEvent;
     private int _eventSequence;
     private float[] _floorTimes = Array.Empty<float>();
     private float[] _floorBpms = Array.Empty<float>();
@@ -50,12 +60,16 @@ public sealed class WorkerRuntime : MonoBehaviour
     private float _initialZoomRatio = 1f;
     private SpriteRenderer? _backgroundRenderer;
     private OfflineEffectController? _effects;
+    private OfflineEffectController? _backgroundEffects;
+    private GameTrackRenderer? _trackRenderer;
     private bool _cameraFollowsPlayer;
     private Vector2 _lastPlayerFollowPosition;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Boot()
     {
+        if (Environment.GetCommandLineArgs().Contains("--probe-game-resources") ||
+            Environment.GetCommandLineArgs().Contains("--probe-game-scene")) return;
         var host = new GameObject("ADOFAI VFX Worker Runtime");
         DontDestroyOnLoad(host);
         host.AddComponent<WorkerRuntime>();
@@ -107,34 +121,95 @@ public sealed class WorkerRuntime : MonoBehaviour
         var bpm = settings.Value<float?>("bpm") ?? 100f;
         _pitch = Math.Max(0.01f, (settings.Value<float?>("pitch") ?? 100f) / 100f);
         var actions = (JArray?)chart["actions"] ?? new JArray();
+        InitializeGameBlendMode();
         BuildFloorTimeline(chart, actions, bpm);
         _status.chartDurationSeconds = (float)_timeline.DurationSeconds;
 
-        var cameraObject = new GameObject("Render Camera");
-        _camera = cameraObject.AddComponent<Camera>();
+        var cameraParentObject = new GameObject("CamParent");
+        _cameraParent = cameraParentObject.transform;
+        var cameraPrefab = Resources.Load<GameObject>("adofai_camera");
+        GameObject cameraObject;
+        if (cameraPrefab != null)
+        {
+            var prefabWasActive = cameraPrefab.activeSelf;
+            cameraPrefab.SetActive(false);
+            cameraObject = Instantiate(cameraPrefab);
+            cameraPrefab.SetActive(prefabWasActive);
+            cameraObject.name = "Render Camera";
+            cameraObject.SetActive(false);
+            StripInstalledCameraGameplayBehaviours(cameraObject);
+        }
+        else
+        {
+            cameraObject = new GameObject("Render Camera");
+        }
+        cameraObject.transform.SetParent(_cameraParent, false);
+        _camera = cameraObject.GetComponent<Camera>() ?? cameraObject.AddComponent<Camera>();
         _camera.orthographic = true;
         _initialZoomRatio = Math.Max(0.01f, (settings.Value<float?>("zoom") ?? 100f) / 100f);
         _camera.orthographicSize = DefaultCameraOrthoSize * _initialZoomRatio;
         var initialCameraOffset = ReadVector2(settings["position"], Vector2.zero) * TileSize;
         var initialCameraMode = settings.Value<string>("relativeTo") ?? "Player";
-        var initialCameraBase = initialCameraMode == "Tile"
-            ? _floorPositions[0]
-            : Vector2.zero;
-        _camera.transform.position = new Vector3(initialCameraBase.x + initialCameraOffset.x, initialCameraBase.y + initialCameraOffset.y, -10f);
-        _cameraState.Rotation = settings.Value<float?>("rotation") ?? 0f;
-        _camera.transform.rotation = Quaternion.Euler(0f, 0f, _cameraState.Rotation);
-        _camera.clearFlags = CameraClearFlags.SolidColor;
+        _cameraState.Initialize(initialCameraMode, settings.Value<float?>("rotation") ?? 0f);
+        var initialCameraBase = initialCameraMode == "Tile" ? _floorPositions[0] : Vector2.zero;
+        _cameraParent.position = new Vector3(initialCameraBase.x + initialCameraOffset.x, initialCameraBase.y + initialCameraOffset.y, 0f);
+        _camera.transform.localPosition = initialCameraMode == "Player"
+            ? new Vector3(_floorPositions[0].x, _floorPositions[0].y, -10f)
+            : new Vector3(0f, 0f, -10f);
+        _camera.transform.localRotation = Quaternion.Euler(0f, 0f, _cameraState.Rotation);
+        _camera.clearFlags = CameraClearFlags.Nothing;
         _camera.backgroundColor = ParseColor(settings.Value<string>("backgroundColor") ?? "000000ff");
         _camera.aspect = _job.width / (float)_job.height;
+        _camera.cullingMask = MainCameraMask;
+        _camera.depth = -1f;
+        _camera.enabled = false;
+
+        var movingBackgroundTransform = cameraObject.transform.Find("BGMovingCam");
+        var movingBackgroundObject = movingBackgroundTransform != null
+            ? movingBackgroundTransform.gameObject
+            : new GameObject("BGMovingCam");
+        if (movingBackgroundTransform == null) movingBackgroundObject.transform.SetParent(cameraObject.transform, false);
+        _backgroundCamera = movingBackgroundObject.GetComponent<Camera>() ?? movingBackgroundObject.AddComponent<Camera>();
+        ConfigureBackgroundCamera(_camera, _backgroundCamera);
+        _backgroundCamera.clearFlags = CameraClearFlags.Depth;
+        _backgroundCamera.cullingMask = 1 << BackgroundLayer;
+        _backgroundCamera.depth = -1.11f;
+        _backgroundCamera.enabled = false;
+
+        var staticBackgroundTransform = cameraObject.transform.Find("BGStaticCam");
+        var staticBackgroundObject = staticBackgroundTransform != null
+            ? staticBackgroundTransform.gameObject
+            : new GameObject("BGStaticCam");
+        if (staticBackgroundTransform == null) staticBackgroundObject.transform.SetParent(cameraObject.transform, false);
+        _staticBackgroundCamera = staticBackgroundObject.GetComponent<Camera>() ?? staticBackgroundObject.AddComponent<Camera>();
+        ConfigureBackgroundCamera(_camera, _staticBackgroundCamera);
+        _staticBackgroundCamera.clearFlags = CameraClearFlags.SolidColor;
+        _staticBackgroundCamera.backgroundColor = _camera.backgroundColor;
+        _staticBackgroundCamera.cullingMask = 1 << StaticBackgroundLayer;
+        _staticBackgroundCamera.depth = -1.63f;
+        _staticBackgroundCamera.enabled = false;
         if (_job.includeEffects)
         {
             _effects = cameraObject.AddComponent<OfflineEffectController>();
-            _effects.Configure(_job.bakedFilterKeys);
+            _effects.Configure(_job.bakedFilterKeys, _job.gameManagedDirectory, "Foreground", cameraObject);
+            _backgroundEffects = movingBackgroundObject.AddComponent<OfflineEffectController>();
+            _backgroundEffects.Configure(_job.bakedFilterKeys, _job.gameManagedDirectory, "Background", movingBackgroundObject);
         }
-        _cameraFollowsPlayer = initialCameraMode == "Player";
+        _cameraFollowsPlayer = _cameraState.FollowMode;
         _lastPlayerFollowPosition = PlayerFollowPositionAt(0f);
 
+        if (_job.includeTrack)
+            _trackRenderer = GameTrackRenderer.Create(
+                _job.gameManagedDirectory,
+                _floorPositions,
+                _floorTimes,
+                _floorBpms,
+                _pitch,
+                settings,
+                actions);
+
         var backgroundObject = new GameObject("Custom Background");
+        backgroundObject.layer = BackgroundLayer;
         _backgroundRenderer = backgroundObject.AddComponent<SpriteRenderer>();
         _backgroundRenderer.sortingOrder = short.MinValue;
         _backgroundRenderer.enabled = false;
@@ -147,6 +222,10 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (token is JObject decoration && decoration.Value<string>("eventType") == "AddDecoration")
             {
                 if (!retainedDecorationIndices.Contains(decorationIndex)) AddDecoration(decoration, decorationIndex);
+            }
+            else if (token is JObject particle && particle.Value<string>("eventType") == "AddParticle")
+            {
+                if (!retainedDecorationIndices.Contains(decorationIndex)) AddParticle(particle, decorationIndex);
             }
         }
         ResolveMaskingTargets();
@@ -174,19 +253,72 @@ public sealed class WorkerRuntime : MonoBehaviour
                 {
                     AddBackgroundEvent(action, repeat.Floor, repeat.AngleOffset);
                 }
+                else if (eventType is "SetParticle" or "EmitParticle")
+                {
+                    AddParticleEvent(action, repeat.Floor, repeat.AngleOffset);
+                }
+                else if (_trackRenderer != null && GameTrackRenderer.Supports(eventType))
+                {
+                    _trackRenderer.AddEvent(
+                        action,
+                        repeat.Floor,
+                        repeat.AngleOffset,
+                        _timeline,
+                        _pitch,
+                        _eventSequence++);
+                }
                 else if (_effects != null && OfflineEffectController.Supports(eventType))
                 {
                     _effects.AddEvent(action, repeat.Floor, repeat.AngleOffset, _timeline, _pitch, _eventSequence++);
+                    _backgroundEffects?.AddEvent(action, repeat.Floor, repeat.AngleOffset, _timeline, _pitch, _eventSequence++);
                 }
             }
         }
 
         _moves.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
         _cameraEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
-        ResolveCameraModes(initialCameraMode);
         _backgroundEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
+        _particleEvents.Sort(static (left, right) => left.Start != right.Start ? left.Start.CompareTo(right.Start) : left.Order.CompareTo(right.Order));
+        _trackRenderer?.Prepare();
         _effects?.Prepare();
+        _backgroundEffects?.Prepare();
+        cameraObject.SetActive(true);
         ApplyTimeline(0f);
+    }
+
+    private const int ForegroundLayer = 7;
+    private const int PlanetLayer = 8;
+    private const int FloorLayer = 9;
+    private const int BackgroundLayer = 10;
+    private const int StaticBackgroundLayer = 11;
+    private const int CameraLayer = 12;
+    private const int MainCameraMask =
+        (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) |
+        (1 << ForegroundLayer) | (1 << PlanetLayer) | (1 << FloorLayer) |
+        (1 << CameraLayer) | (1 << 13) | (1 << 14) | (1 << 15) |
+        (1 << 16) | (1 << 19);
+
+    private static void ConfigureBackgroundCamera(Camera source, Camera destination)
+    {
+        destination.orthographic = source.orthographic;
+        // This matches the installed game's level scene: BGMovingCam and
+        // BGStaticCam are zero-local-transform children of Camera, but each
+        // keeps its own serialized orthographic size at 5. MoveCamera zoom is
+        // not copied into the background cameras. Copying a chart's initial
+        // zoom here made backgrounds far too wide/tall.
+        destination.orthographicSize = DefaultCameraOrthoSize;
+        destination.aspect = source.aspect;
+        destination.nearClipPlane = source.nearClipPlane;
+        destination.farClipPlane = source.farClipPlane;
+    }
+
+    private static void StripInstalledCameraGameplayBehaviours(GameObject cameraRoot)
+    {
+        foreach (var behaviour in cameraRoot.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (behaviour == null) continue;
+            DestroyImmediate(behaviour);
+        }
     }
 
     private void BuildFloorTimeline(JObject chart, JArray actions, float initialBpm)
@@ -276,6 +408,13 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private void AddDecoration(JObject data, int sourceIndex)
     {
+        var depth = data.Value<int?>("depth") ?? 0;
+        if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
+            (depth < 0 && !_job.includeForegroundDecorations))
+        {
+            _unbakedDecorationIndices.Add(sourceIndex);
+            return;
+        }
         var imageName = data.Value<string>("decorationImage");
         Sprite? sprite = null;
         if (!string.IsNullOrWhiteSpace(imageName))
@@ -288,8 +427,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         var gameObject = new GameObject(imageName);
         var childObject = new GameObject($"{imageName} Sprite");
         childObject.transform.SetParent(gameObject.transform, false);
+        childObject.layer = depth >= 0 ? FloorLayer : ForegroundLayer;
         var renderer = childObject.AddComponent<SpriteRenderer>();
+        renderer.sortingLayerName = depth >= 0 ? "Bg" : "Default";
         renderer.sprite = sprite;
+        renderer.sharedMaterial = GetGameTileMaterial();
         var maskingType = data.Value<string>("maskingType") ?? "None";
         var spriteMask = childObject.AddComponent<SpriteMask>();
         spriteMask.sprite = renderer.sprite;
@@ -298,7 +440,10 @@ public sealed class WorkerRuntime : MonoBehaviour
         renderer.maskInteraction = SpriteMaskInteraction.None;
         if (maskingType is "None" or "")
             ApplyTiling(renderer, ReadVector2(data["tile"], Vector2.one));
-        ApplyBlendMode(renderer, data.Value<string>("blendMode") ?? "None");
+        ApplyBlendMode(
+            renderer,
+            data.Value<string>("blendMode") ?? "None",
+            data.Value<bool?>("imageSmoothing") ?? false);
         var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorPositions.Length - 1);
         var localPosition = ReadVector2(data["position"], Vector2.zero);
         var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
@@ -313,13 +458,6 @@ public sealed class WorkerRuntime : MonoBehaviour
         var scale = ReadVector2(data["scale"], new Vector2(100f, 100f)) / 100f;
         var color = ParseColor(data.Value<string>("color") ?? "ffffffff");
         var opacity = (data.Value<float?>("opacity") ?? 100f) / 100f;
-        var depth = data.Value<int?>("depth") ?? 0;
-        if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
-            (depth < 0 && !_job.includeForegroundDecorations))
-        {
-            _unbakedDecorationIndices.Add(sourceIndex);
-            return;
-        }
         renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
         var visible = data.Value<bool?>("visible") ?? true;
 
@@ -367,6 +505,165 @@ public sealed class WorkerRuntime : MonoBehaviour
         _decorations.Add(state);
     }
 
+    private void AddParticle(JObject data, int sourceIndex)
+    {
+        var depth = data.Value<int?>("depth") ?? 0;
+        if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
+            (depth < 0 && !_job.includeForegroundDecorations))
+        {
+            _unbakedDecorationIndices.Add(sourceIndex);
+            return;
+        }
+
+        var imageName = data.Value<string>("decorationImage") ?? "";
+        Texture2D? texture = null;
+        if (!string.IsNullOrWhiteSpace(imageName))
+        {
+            var imagePath = Path.Combine(_chartDirectory, imageName);
+            if (File.Exists(imagePath)) texture = GetTexture(imagePath);
+            if (texture == null) _unbakedDecorationIndices.Add(sourceIndex);
+        }
+
+        var prefab = Resources.Load<GameObject>("adofai_particledecoration");
+        if (prefab == null)
+            throw new InvalidOperationException("Installed game particle decoration prefab is unavailable.");
+
+        var prefabWasActive = prefab.activeSelf;
+        prefab.SetActive(false);
+        var root = Instantiate(prefab);
+        prefab.SetActive(prefabWasActive);
+        root.name = string.IsNullOrWhiteSpace(imageName) ? $"Particle {sourceIndex}" : imageName;
+        root.SetActive(false);
+        foreach (var behaviour in root.GetComponentsInChildren<MonoBehaviour>(true))
+            if (behaviour != null) DestroyImmediate(behaviour);
+
+        var particleSystem = root.GetComponentInChildren<ParticleSystem>(true)
+            ?? throw new InvalidOperationException("Installed game particle decoration prefab has no ParticleSystem.");
+        var renderer = particleSystem.GetComponent<ParticleSystemRenderer>()
+            ?? throw new InvalidOperationException("Installed game particle decoration prefab has no ParticleSystemRenderer.");
+        if (texture != null) renderer.material.mainTexture = texture;
+        renderer.sortingLayerName = depth >= 0 ? "Bg" : "Default";
+        renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
+        particleSystem.gameObject.layer = depth >= 0 ? FloorLayer : ForegroundLayer;
+
+        var main = particleSystem.main;
+        particleSystem.randomSeed = (uint)Math.Max(0, data.Value<int?>("randomSeed") ?? 0);
+        particleSystem.useAutoRandomSeed = particleSystem.randomSeed == 0;
+        main.duration = Math.Max(0.01f, data.Value<float?>("playDuration") ?? 5f);
+        main.loop = data.Value<bool?>("loop") ?? false;
+        main.maxParticles = Math.Max(0, data.Value<int?>("maxParticles") ?? 1000);
+        main.startLifetime = ToRandomCurve(ReadFloatPair(data["particleLifetime"], new Vector2(1f, 1f)));
+        main.startSize = ToRandomCurve(ReadFloatPair(data["particleSize"], new Vector2(100f, 100f)), 0.01f);
+        main.startRotation = ToRandomCurve(ReadFloatPair(data["startRotation"], Vector2.zero), Mathf.Deg2Rad);
+        main.startColor = ParseMinMaxGradient(data["color"]);
+        main.simulationSpace = (data.Value<string>("simulationSpace") ?? "Local") == "World"
+            ? ParticleSystemSimulationSpace.World
+            : ParticleSystemSimulationSpace.Local;
+        main.simulationSpeed = Math.Max(0f, (data.Value<float?>("simulationSpeed") ?? 100f) / 100f * _pitch);
+
+        var scale = ReadVector2(data["scale"], new Vector2(100f, 100f)) / 100f;
+        var shape = particleSystem.shape;
+        shape.shapeType = (data.Value<string>("shapeType") ?? "Circle") == "Rectangle"
+            ? ParticleSystemShapeType.Rectangle
+            : ParticleSystemShapeType.Circle;
+        shape.radius = (data.Value<float?>("shapeRadius") ?? 1f) * TileSize;
+        shape.scale = scale * TileSize;
+        shape.arc = data.Value<float?>("arc") ?? 360f;
+        if (Enum.TryParse(data.Value<string>("arcMode") ?? "Random", out ParticleSystemShapeMultiModeValue arcMode))
+            shape.arcMode = arcMode;
+
+        var emission = particleSystem.emission;
+        emission.rateOverTime = ToRandomCurve(ReadFloatPair(data["emissionRate"], Vector2.zero));
+
+        var velocity = ReadVelocityPair(data["velocity"]);
+        var velocityOverLifetime = particleSystem.velocityOverLifetime;
+        velocityOverLifetime.enabled = true;
+        velocityOverLifetime.x = new ParticleSystem.MinMaxCurve(velocity.Item1.x * TileSize, velocity.Item2.x * TileSize);
+        velocityOverLifetime.y = new ParticleSystem.MinMaxCurve(velocity.Item1.y * TileSize, velocity.Item2.y * TileSize);
+        velocityOverLifetime.z = new ParticleSystem.MinMaxCurve(0f, 0f);
+
+        var limitVelocity = particleSystem.limitVelocityOverLifetime;
+        limitVelocity.enabled = true;
+        limitVelocity.drag = ToLinearCurve(ReadFloatPair(data["velocityLimitOverLifetime"], Vector2.zero), 0.01f);
+
+        var sizeOverLifetime = particleSystem.sizeOverLifetime;
+        sizeOverLifetime.enabled = HasValue(data, "sizeOverLifetime");
+        if (sizeOverLifetime.enabled)
+            sizeOverLifetime.size = ToLinearCurve(ReadFloatPair(data["sizeOverLifetime"], new Vector2(100f, 100f)), 0.01f);
+
+        var colorOverLifetime = particleSystem.colorOverLifetime;
+        colorOverLifetime.enabled = HasValue(data, "colorOverLifetime");
+        if (colorOverLifetime.enabled) colorOverLifetime.color = ParseMinMaxGradient(data["colorOverLifetime"]);
+
+        var rotationOverLifetime = particleSystem.rotationOverLifetime;
+        rotationOverLifetime.enabled = true;
+        rotationOverLifetime.x = new ParticleSystem.MinMaxCurve(0f, 0f);
+        rotationOverLifetime.y = new ParticleSystem.MinMaxCurve(0f, 0f);
+        rotationOverLifetime.z = ToRandomCurve(ReadFloatPair(data["rotationOverTime"], Vector2.zero));
+
+        var textureSheet = particleSystem.textureSheetAnimation;
+        textureSheet.enabled = true;
+        textureSheet.mode = ParticleSystemAnimationMode.Grid;
+        textureSheet.rowMode = ParticleSystemAnimationRowMode.Random;
+        textureSheet.cycleCount = 0;
+        var tiling = ReadVector2(data["randomTextureTiling"], Vector2.one);
+        textureSheet.numTilesX = Math.Max(1, Mathf.RoundToInt(tiling.x));
+        textureSheet.numTilesY = Math.Max(1, Mathf.RoundToInt(tiling.y));
+        textureSheet.startFrame = new ParticleSystem.MinMaxCurve(0f, 1f);
+
+        var floor = Math.Clamp(data.Value<int?>("floor") ?? 0, 0, _floorPositions.Length - 1);
+        var localPosition = ReadVector2(data["position"], Vector2.zero);
+        var relativeTo = data.Value<string>("relativeTo") ?? "Tile";
+        var startPosition = relativeTo switch
+        {
+            "Tile" or "RedPlanet" or "BluePlanet" or "GreenPlanet" => _floorPositions[floor] + localPosition * TileSize,
+            "Camera" or "CameraAspect" => localPosition,
+            _ => localPosition * TileSize,
+        };
+        var pivotOffset = ReadVector2(data["pivotOffset"], Vector2.zero) *
+                          (relativeTo is "Camera" or "CameraAspect" ? 1f : TileSize);
+        var parallax = ReadVector2(data["parallax"], Vector2.zero) / 100f;
+        var parallaxOffset = parallax == Vector2.zero
+            ? Vector2.zero
+            : ReadVector2(data["parallaxOffset"], Vector2.zero) * TileSize;
+
+        root.SetActive(true);
+        particleSystem.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear);
+        particleSystem.Pause(false);
+        var state = new ParticleState(
+            sourceIndex,
+            root.transform,
+            particleSystem,
+            renderer,
+            SplitTags(data.Value<string>("tag")),
+            relativeTo,
+            startPosition,
+            pivotOffset,
+            parallax,
+            parallaxOffset,
+            data.Value<float?>("rotation") ?? 0f,
+            data.Value<bool?>("lockRotation") ?? false,
+            data.Value<bool?>("lockScale") ?? false,
+            depth,
+            _initialZoomRatio);
+        state.ApplyVisual(_camera);
+        if (data.Value<bool?>("autoPlay") ?? false) state.Start(0f);
+        _particles.Add(state);
+    }
+
+    private void AddParticleEvent(JObject data, int repeatedFloor, float angleOffset)
+    {
+        var floor = Math.Clamp(repeatedFloor, 0, _floorTimes.Length - 1);
+        var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
+        _particleEvents.Add(new ParticleControlEvent(
+            start,
+            data.Value<string>("eventType") ?? "",
+            SplitTags(data.Value<string>("tag")),
+            data.Value<string>("targetMode") ?? "",
+            Math.Max(0, data.Value<int?>("count") ?? 0),
+            _eventSequence++));
+    }
+
     private void ResolveMaskingTargets()
     {
         var masks = _decorations.Where(static decoration => decoration.MaskingType == "Mask").ToArray();
@@ -384,6 +681,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     {
         if (_textures.TryGetValue(imagePath, out var existing)) return existing;
         var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+        texture.name = Path.GetFileName(imagePath);
         if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(imagePath), markNonReadable: true))
         {
             Destroy(texture);
@@ -401,21 +699,13 @@ public sealed class WorkerRuntime : MonoBehaviour
         var texture = GetTexture(imagePath);
         if (texture == null) return null;
         var sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), new Vector2(0.5f, 0.5f), 100f);
+        sprite.name = Path.GetFileName(imagePath);
         _sprites[imagePath] = sprite;
         return sprite;
     }
 
     private void ApplyTiling(SpriteRenderer renderer, Vector2 tile)
     {
-        if (Mathf.Approximately(tile.x, 1f) && Mathf.Approximately(tile.y, 1f)) return;
-        if (_tileMaterial == null)
-        {
-            var shader = Resources.Load<Shader>("ADOFAITile");
-            if (shader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Tile shader resource.");
-            _tileMaterial = new Material(shader) { name = "ADOFAI VFX Tile" };
-        }
-
-        renderer.sharedMaterial = _tileMaterial;
         var properties = new MaterialPropertyBlock();
         renderer.GetPropertyBlock(properties);
         properties.SetFloat("RepeatX", Math.Max(0.000001f, Math.Abs(tile.x)));
@@ -423,25 +713,46 @@ public sealed class WorkerRuntime : MonoBehaviour
         renderer.SetPropertyBlock(properties);
     }
 
-    private void ApplyBlendMode(SpriteRenderer renderer, string blendMode)
+    private Material GetGameTileMaterial()
+    {
+        if (_tileMaterial == null)
+        {
+            var shader = Resources.Load<Shader>("adofai_spritestile");
+            if (shader == null) throw new InvalidOperationException("Installed game shader is unavailable: Sprites/Tile");
+            _tileMaterial = new Material(shader) { name = "ADOFAI Installed Sprites Tile" };
+        }
+        return _tileMaterial;
+    }
+
+    private void InitializeGameBlendMode()
+    {
+        var assemblyPath = Path.Combine(_job.gameManagedDirectory, "Assembly-CSharp.dll");
+        if (!File.Exists(assemblyPath))
+            throw new FileNotFoundException("Installed game blend-mode assembly is unavailable.", assemblyPath);
+        var assembly = Assembly.LoadFrom(assemblyPath);
+        _gameBlendEffectType = assembly.GetType("BlendModes.BlendModeEffect", throwOnError: true)!;
+        _gameBlendModeProperty = _gameBlendEffectType.GetProperty("BlendMode", BindingFlags.Instance | BindingFlags.Public)
+            ?? throw new MissingMemberException(_gameBlendEffectType.FullName, "BlendMode");
+        _gameBlendPointSamplingProperty = _gameBlendEffectType.GetProperty("UsePointSampling", BindingFlags.Instance | BindingFlags.Public)
+            ?? throw new MissingMemberException(_gameBlendEffectType.FullName, "UsePointSampling");
+    }
+
+    private void ApplyBlendMode(SpriteRenderer renderer, string blendMode, bool imageSmoothing)
     {
         if (blendMode is "None" or "Normal" or "") return;
-        if (!_blendMaterials.TryGetValue(blendMode, out var material))
+        if (_gameBlendEffectType == null || _gameBlendModeProperty == null || _gameBlendPointSamplingProperty == null)
+            throw new InvalidOperationException("Installed game BlendModeEffect is not initialized.");
+        try
         {
-            var shader = Resources.Load<Shader>("ADOFAIBlend");
-            if (shader == null) throw new InvalidOperationException("Missing ADOFAI/VFX Blend shader resource.");
-            material = new Material(shader) { name = $"ADOFAI {blendMode} Blend" };
-            material.SetFloat("_BlendMode", blendMode switch
-            {
-                "Difference" => 0f,
-                "Overlay" => 1f,
-                "SoftLight" => 2f,
-                "LinearDodge" => 3f,
-                _ => throw new NotSupportedException($"Unsupported decoration blend mode: {blendMode}"),
-            });
-            _blendMaterials[blendMode] = material;
+            var component = renderer.gameObject.AddComponent(_gameBlendEffectType);
+            var gameBlendMode = Enum.Parse(_gameBlendModeProperty.PropertyType, blendMode, ignoreCase: false);
+            _gameBlendModeProperty.SetValue(component, gameBlendMode);
+            _gameBlendPointSamplingProperty.SetValue(component, !imageSmoothing);
         }
-        renderer.sharedMaterial = material;
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException($"Installed game blend mode could not be applied: {blendMode}", exception);
+        }
     }
 
     private static Dictionary<int, Dictionary<string, RepeatRule>> BuildRepeatRules(JArray actions)
@@ -538,22 +849,8 @@ public sealed class WorkerRuntime : MonoBehaviour
         var bpm = (float)_timeline.BpmAtFloorAngleOffset(floor, angleOffset);
         var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
-        _cameraEvents.Add(new CameraEvent(start, duration, data, _floorPositions[floor], _eventSequence++));
+        _cameraEvents.Add(new CameraEvent(start, duration, data, floor, _floorPositions[floor], _eventSequence++));
     }
-
-    private void ResolveCameraModes(string initialMode)
-    {
-        var mode = IsCameraMode(initialMode) ? initialMode : "Player";
-        foreach (var cameraEvent in _cameraEvents)
-        {
-            if (cameraEvent.RequestedMode is { } requestedMode && IsCameraMode(requestedMode))
-                mode = requestedMode;
-            cameraEvent.ConfigureMode(mode);
-        }
-    }
-
-    private static bool IsCameraMode(string mode) =>
-        mode is "Player" or "Tile" or "Global" or "LastPosition" or "LastPositionNoRotation";
 
     private void AddBackgroundEvent(JObject data, int repeatedFloor, float angleOffset)
     {
@@ -565,6 +862,8 @@ public sealed class WorkerRuntime : MonoBehaviour
     private IEnumerator RenderFrames()
     {
         RenderTexture? target = null;
+        RenderTexture? staticStage = null;
+        RenderTexture? backgroundStage = null;
         Texture2D? frameTexture = null;
         try
         {
@@ -580,23 +879,49 @@ public sealed class WorkerRuntime : MonoBehaviour
             _status.message = "独立 Unity Worker 正在逐帧渲染……";
             WriteStatus();
 
+            // CameraFilterPack advances its own TimeX from Unity's Time.deltaTime.
+            // captureFramerate makes that delta exactly match the requested video
+            // frame interval instead of the worker's wall-clock rendering speed.
+            Time.captureFramerate = _job.framesPerSecond;
             StartEncoder();
             target = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
             target.Create();
+            staticStage = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            staticStage.Create();
+            backgroundStage = new RenderTexture(_job.width, _job.height, 24, RenderTextureFormat.ARGB32);
+            backgroundStage.Create();
             var previousTarget = RenderTexture.active;
             RenderTexture.active = target;
-            GL.Clear(true, true, _camera.backgroundColor);
+            GL.Clear(true, true, _staticBackgroundCamera.backgroundColor);
             RenderTexture.active = previousTarget;
             frameTexture = new Texture2D(_job.width, _job.height, TextureFormat.RGBA32, false, false);
             var watch = Stopwatch.StartNew();
             var previewWatch = Stopwatch.StartNew();
+            var diagnoseRenderFrame = GetArgumentInt("--diagnose-render-frame", -1);
             for (var frame = 0; frame < totalFrames; frame++)
             {
                 var time = _job.renderStartSeconds + frame / (float)_job.framesPerSecond;
                 ApplyTimeline(time);
-                _camera.targetTexture = target;
-                _camera.Render();
-                _camera.targetTexture = null;
+                if (Environment.GetCommandLineArgs().Contains("--diagnose-decorations") && frame % 15 == 0)
+                {
+                    if (frame == 0) LogDecorationPipeline(time);
+                    LogParticlePipeline(time);
+                }
+                var hallOfMirrors = _effects?.HallOfMirrorsEnabled == true;
+                if (!hallOfMirrors) ClearRenderTexture(target, clearDepth: true, _staticBackgroundCamera.backgroundColor);
+                if (frame == diagnoseRenderFrame)
+                {
+                    Debug.Log($"RENDER_PIPELINE frame={frame} time={time:0.000000} hall={_effects?.HallOfMirrorsEnabled == true} staticClear={_staticBackgroundCamera.clearFlags} backgroundClear={_backgroundCamera.clearFlags} mainClear={_camera.clearFlags}");
+                    LogDecorationPipeline(time);
+                    WriteRenderDiagnostic(target, frame, "00-history-or-clear");
+                }
+
+                RenderCameraStackStage(_staticBackgroundCamera, target, staticStage);
+                if (frame == diagnoseRenderFrame) WriteRenderDiagnostic(staticStage, frame, "01-after-static");
+                RenderCameraStackStage(_backgroundCamera, staticStage, backgroundStage);
+                if (frame == diagnoseRenderFrame) WriteRenderDiagnostic(backgroundStage, frame, "02-after-background");
+                RenderCameraStackStage(_camera, backgroundStage, target);
+                if (frame == diagnoseRenderFrame) WriteRenderDiagnostic(target, frame, "03-after-main");
 
                 var previous = RenderTexture.active;
                 RenderTexture.active = target;
@@ -622,7 +947,6 @@ public sealed class WorkerRuntime : MonoBehaviour
                 }
                 yield return null;
             }
-
             _status.state = "encoding";
             _status.message = "正在完成视频编码……";
             WriteStatus();
@@ -643,10 +967,53 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
         finally
         {
+            Time.captureFramerate = 0;
+            _staticBackgroundCamera.enabled = false;
+            _backgroundCamera.enabled = false;
+            _camera.enabled = false;
+            _staticBackgroundCamera.targetTexture = null;
+            _backgroundCamera.targetTexture = null;
+            _camera.targetTexture = null;
             if (target != null) target.Release();
+            if (staticStage != null) staticStage.Release();
+            if (backgroundStage != null) backgroundStage.Release();
             if (frameTexture != null) Destroy(frameTexture);
         }
     }
+
+    private static void RenderCameraStackStage(Camera camera, RenderTexture input, RenderTexture destination)
+    {
+        var oldTarget = camera.targetTexture;
+        var oldClearFlags = camera.clearFlags;
+        var oldBackground = camera.backgroundColor;
+        var restoreInput = new CommandBuffer { name = "ADOFAI Restore Previous Camera Stage" };
+        restoreInput.Blit(input, BuiltinRenderTextureType.CameraTarget);
+        try
+        {
+            camera.targetTexture = destination;
+            camera.clearFlags = CameraClearFlags.SolidColor;
+            camera.backgroundColor = Color.clear;
+            camera.AddCommandBuffer(UnityEngine.Rendering.CameraEvent.BeforeForwardOpaque, restoreInput);
+            camera.Render();
+        }
+        finally
+        {
+            camera.RemoveCommandBuffer(UnityEngine.Rendering.CameraEvent.BeforeForwardOpaque, restoreInput);
+            restoreInput.Release();
+            camera.targetTexture = oldTarget;
+            camera.clearFlags = oldClearFlags;
+            camera.backgroundColor = oldBackground;
+        }
+    }
+
+    private static void ClearRenderTexture(RenderTexture target, bool clearDepth, Color color)
+    {
+        var previous = RenderTexture.active;
+        RenderTexture.active = target;
+        GL.Clear(clearDepth, true, color);
+        RenderTexture.active = previous;
+    }
+
 
     private IEnumerator RunSafely(IEnumerator routine)
     {
@@ -688,18 +1055,18 @@ public sealed class WorkerRuntime : MonoBehaviour
             AdvancePlayerFollow(_cameraEvents[_nextCameraEvent].Start);
             AdvanceCamera(_cameraEvents[_nextCameraEvent].Start);
             var cameraEvent = _cameraEvents[_nextCameraEvent++];
-            if (cameraEvent.ChangesMode) _cameraFollowsPlayer = cameraEvent.IsPlayerMode;
             for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
             {
                 _activeCameraEvents[index].CompleteConflicts(
+                    _cameraParent,
                     _camera,
                     _cameraState,
-                    cameraEvent,
-                    PlayerFollowPositionAt(cameraEvent.Start));
+                    cameraEvent);
                 if (_activeCameraEvents[index].IsComplete) _activeCameraEvents.RemoveAt(index);
             }
-            cameraEvent.Capture(_camera, _cameraState, PlayerFollowPositionAt(cameraEvent.Start));
-            if (!cameraEvent.Apply(_camera, _cameraState, cameraEvent.Start, PlayerFollowPositionAt(cameraEvent.Start)))
+            cameraEvent.Capture(_cameraParent, _camera, _cameraState, PlayerFollowPositionAt(cameraEvent.Start));
+            _cameraFollowsPlayer = _cameraState.FollowMode;
+            if (!cameraEvent.Apply(_cameraParent, _camera, _cameraState, cameraEvent.Start))
                 _activeCameraEvents.Add(cameraEvent);
         }
         AdvancePlayerFollow(time);
@@ -710,10 +1077,27 @@ public sealed class WorkerRuntime : MonoBehaviour
             ApplyBackground(_backgroundEvents[_nextBackgroundEvent++].Data);
         }
 
+        while (_nextParticleEvent < _particleEvents.Count && _particleEvents[_nextParticleEvent].Start <= time)
+        {
+            var particleEvent = _particleEvents[_nextParticleEvent++];
+            foreach (var particle in _particles)
+            {
+                particle.AdvanceTo(particleEvent.Start);
+                if (particleEvent.Tags.Overlaps(particle.Tags)) particleEvent.Apply(particle);
+            }
+        }
+
+        _trackRenderer?.Apply(time);
         foreach (var decoration in _decorations) decoration.ApplyVisual(_camera);
+        foreach (var particle in _particles)
+        {
+            particle.AdvanceTo(time);
+            particle.ApplyVisual(_camera);
+        }
         UpdateBackgroundTransform();
         _effects?.Apply(time);
-        _camera.clearFlags = _effects?.HallOfMirrorsEnabled == true
+        _backgroundEffects?.Apply(time);
+        _staticBackgroundCamera.clearFlags = _effects?.HallOfMirrorsEnabled == true
             ? CameraClearFlags.Depth
             : CameraClearFlags.SolidColor;
     }
@@ -726,12 +1110,62 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
     }
 
+    private void LogDecorationPipeline(float time)
+    {
+        foreach (var decoration in _decorations.OrderBy(static item => item.SourceIndex))
+        {
+            var renderer = decoration.Renderer;
+            var material = renderer.sharedMaterial;
+            Debug.Log(string.Format(
+                CultureInfo.InvariantCulture,
+                "DECORATION_PIPELINE time={0:0.000000} index={1} enabled={2} layer={3} sortingLayer={4}/{5} sortingOrder={6} alpha={7:0.000000} shader={8} sprite={9}",
+                time,
+                decoration.SourceIndex,
+                renderer.enabled,
+                renderer.gameObject.layer,
+                renderer.sortingLayerName,
+                renderer.sortingLayerID,
+                renderer.sortingOrder,
+                renderer.color.a,
+                material != null && material.shader != null ? material.shader.name : "<none>",
+                renderer.sprite != null ? renderer.sprite.name : "<none>"));
+        }
+    }
+
+    private void LogParticlePipeline(float time)
+    {
+        foreach (var particle in _particles.OrderBy(static item => item.SourceIndex))
+        {
+            var renderer = particle.Renderer;
+            var system = particle.System;
+            var material = renderer.sharedMaterial;
+            Debug.Log(string.Format(
+                CultureInfo.InvariantCulture,
+                "PARTICLE_PIPELINE time={0:0.000000} index={1} active={2} enabled={3} count={4} playing={5} paused={6} stopped={7} layer={8} sortingLayer={9}/{10} sortingOrder={11} position={12} scale={13} shader={14} texture={15}",
+                time,
+                particle.SourceIndex,
+                system.gameObject.activeInHierarchy,
+                renderer.enabled,
+                system.particleCount,
+                system.isPlaying,
+                system.isPaused,
+                system.isStopped,
+                system.gameObject.layer,
+                renderer.sortingLayerName,
+                renderer.sortingLayerID,
+                renderer.sortingOrder,
+                system.transform.position,
+                system.transform.lossyScale,
+                material != null && material.shader != null ? material.shader.name : "<none>",
+                material != null && material.mainTexture != null ? material.mainTexture.name : "<none>"));
+        }
+    }
+
     private void AdvanceCamera(float time)
     {
-        var followPosition = PlayerFollowPositionAt(time);
         for (var index = _activeCameraEvents.Count - 1; index >= 0; index--)
         {
-            if (_activeCameraEvents[index].Apply(_camera, _cameraState, time, followPosition))
+            if (_activeCameraEvents[index].Apply(_cameraParent, _camera, _cameraState, time))
                 _activeCameraEvents.RemoveAt(index);
         }
     }
@@ -741,9 +1175,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         var followPosition = PlayerFollowPositionAt(time);
         if (_cameraFollowsPlayer)
         {
-            var delta = followPosition - _lastPlayerFollowPosition;
-            var current = _camera.transform.position;
-            _camera.transform.position = new Vector3(current.x + delta.x, current.y + delta.y, -10f);
+            _camera.transform.localPosition = new Vector3(followPosition.x, followPosition.y, -10f);
         }
         _lastPlayerFollowPosition = followPosition;
     }
@@ -753,6 +1185,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         if (data.Value<string>("color") is { } color)
         {
             _camera.backgroundColor = ParseColor(color);
+            _staticBackgroundCamera.backgroundColor = _camera.backgroundColor;
         }
 
         if (_backgroundRenderer == null) return;
@@ -838,6 +1271,26 @@ public sealed class WorkerRuntime : MonoBehaviour
         return path;
     }
 
+    private void WriteRenderDiagnostic(RenderTexture target, int frame, string label)
+    {
+        var previous = RenderTexture.active;
+        var image = new Texture2D(target.width, target.height, TextureFormat.RGBA32, false, false);
+        try
+        {
+            RenderTexture.active = target;
+            image.ReadPixels(new Rect(0f, 0f, target.width, target.height), 0, 0, false);
+            image.Apply(false, false);
+            File.WriteAllBytes(
+                Path.Combine(_job.previewDirectory, $"render-{frame:D5}-{label}.png"),
+                ImageConversion.EncodeToPNG(image));
+        }
+        finally
+        {
+            RenderTexture.active = previous;
+            Destroy(image);
+        }
+    }
+
     private void WriteStatus()
     {
         if (string.IsNullOrWhiteSpace(_job.statusPath)) return;
@@ -868,6 +1321,14 @@ public sealed class WorkerRuntime : MonoBehaviour
         return Path.GetFullPath(Path.Combine(Application.dataPath, "..", "render-job.json"));
     }
 
+    private static int GetArgumentInt(string name, int fallback)
+    {
+        var arguments = Environment.GetCommandLineArgs();
+        for (var index = 0; index < arguments.Length - 1; index++)
+            if (arguments[index] == name && int.TryParse(arguments[index + 1], out var value)) return value;
+        return fallback;
+    }
+
     private static Vector2 ReadVector2(JToken? token, Vector2 fallback)
     {
         if (token is not JArray { Count: >= 2 } array) return fallback;
@@ -879,6 +1340,69 @@ public sealed class WorkerRuntime : MonoBehaviour
             ? fallback
             : token.Value<float>();
 
+    private static Vector2 ReadFloatPair(JToken? token, Vector2 fallback) => ReadVector2(token, fallback);
+
+    private static Tuple<Vector2, Vector2> ReadVelocityPair(JToken? token)
+    {
+        if (token is not JArray { Count: >= 2 } array)
+            return Tuple.Create(Vector2.zero, Vector2.zero);
+        return Tuple.Create(ReadVector2(array[0], Vector2.zero), ReadVector2(array[1], Vector2.zero));
+    }
+
+    private static ParticleSystem.MinMaxCurve ToRandomCurve(Vector2 pair, float multiplier = 1f) =>
+        new(pair.x * multiplier, pair.y * multiplier);
+
+    private static ParticleSystem.MinMaxCurve ToLinearCurve(Vector2 pair, float multiplier = 1f) =>
+        new(multiplier, AnimationCurve.Linear(0f, pair.x, 1f, pair.y));
+
+    private static ParticleSystem.MinMaxGradient ParseMinMaxGradient(JToken? token)
+    {
+        if (token is JValue value && value.Type == JTokenType.String)
+            return new ParticleSystem.MinMaxGradient(ParseColor(value.Value<string>() ?? "ffffff"));
+        if (token is not JObject data)
+            return new ParticleSystem.MinMaxGradient(Color.white);
+
+        var mode = data.Value<string>("mode") ?? "Color";
+        return mode switch
+        {
+            "TwoColors" => new ParticleSystem.MinMaxGradient(
+                ParseColor(data.Value<string>("color1") ?? "ffffff"),
+                ParseColor(data.Value<string>("color2") ?? "ffffff")),
+            "Gradient" => new ParticleSystem.MinMaxGradient(ParseGradient(data["gradient1"])),
+            "TwoGradients" => new ParticleSystem.MinMaxGradient(
+                ParseGradient(data["gradient1"]), ParseGradient(data["gradient2"])),
+            "RandomColor" => RandomColorGradient(ParseGradient(data["gradient1"])),
+            _ => new ParticleSystem.MinMaxGradient(ParseColor(data.Value<string>("color1") ?? "ffffff")),
+        };
+    }
+
+    private static ParticleSystem.MinMaxGradient RandomColorGradient(Gradient gradient)
+    {
+        var result = new ParticleSystem.MinMaxGradient(gradient) { mode = ParticleSystemGradientMode.RandomColor };
+        return result;
+    }
+
+    private static Gradient ParseGradient(JToken? token)
+    {
+        var data = token as JObject;
+        var gradient = new Gradient
+        {
+            mode = (data?.Value<string>("mode") ?? "Blend") == "Fixed" ? GradientMode.Fixed : GradientMode.Blend,
+        };
+        var colorKeys = data?["colorKeys"] is JArray colors
+            ? colors.OfType<JObject>().Select(key => new GradientColorKey(
+                ParseColor(key.Value<string>("color") ?? "ffffff"),
+                key.Value<float?>("time") ?? 0f)).ToArray()
+            : new[] { new GradientColorKey(Color.white, 0f), new GradientColorKey(Color.white, 1f) };
+        var alphaKeys = data?["alphaKeys"] is JArray alphas
+            ? alphas.OfType<JObject>().Select(key => new GradientAlphaKey(
+                key.Value<float?>("alpha") ?? 1f,
+                key.Value<float?>("time") ?? 0f)).ToArray()
+            : new[] { new GradientAlphaKey(1f, 0f), new GradientAlphaKey(1f, 1f) };
+        gradient.SetKeys(colorKeys, alphaKeys);
+        return gradient;
+    }
+
     private static HashSet<string> SplitTags(string? tags) =>
         new((string.IsNullOrWhiteSpace(tags) ? "NO TAG" : tags)
             .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries), StringComparer.Ordinal);
@@ -887,59 +1411,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         data.TryGetValue(key, out var token) && token.Type is not (JTokenType.Null or JTokenType.Undefined);
 
     private static float EaseAmount(float amount, string? ease)
-    {
-        amount = Mathf.Clamp01(amount);
-        const float back = 1.70158f;
-        const float backInOut = back * 1.525f;
-        var elastic = 2f * Mathf.PI / 3f;
-        var elasticInOut = 2f * Mathf.PI / 4.5f;
-        return ease switch
-        {
-            "InSine" => 1f - Mathf.Cos(amount * Mathf.PI * 0.5f),
-            "OutSine" => Mathf.Sin(amount * Mathf.PI * 0.5f),
-            "InOutSine" => -(Mathf.Cos(Mathf.PI * amount) - 1f) * 0.5f,
-            "InQuad" => amount * amount,
-            "OutQuad" => 1f - (1f - amount) * (1f - amount),
-            "InOutQuad" => amount < 0.5f ? 2f * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 2f) * 0.5f,
-            "InCubic" => amount * amount * amount,
-            "OutCubic" => 1f - Mathf.Pow(1f - amount, 3f),
-            "InOutCubic" => amount < 0.5f ? 4f * amount * amount * amount : 1f - Mathf.Pow(-2f * amount + 2f, 3f) * 0.5f,
-            "InQuart" => Mathf.Pow(amount, 4f),
-            "OutQuart" => 1f - Mathf.Pow(1f - amount, 4f),
-            "InOutQuart" => amount < 0.5f ? 8f * Mathf.Pow(amount, 4f) : 1f - Mathf.Pow(-2f * amount + 2f, 4f) * 0.5f,
-            "InQuint" => Mathf.Pow(amount, 5f),
-            "OutQuint" => 1f - Mathf.Pow(1f - amount, 5f),
-            "InOutQuint" => amount < 0.5f ? 16f * Mathf.Pow(amount, 5f) : 1f - Mathf.Pow(-2f * amount + 2f, 5f) * 0.5f,
-            "InExpo" => amount <= 0f ? 0f : Mathf.Pow(2f, 10f * amount - 10f),
-            "OutExpo" => amount >= 1f ? 1f : 1f - Mathf.Pow(2f, -10f * amount),
-            "InOutExpo" => amount <= 0f ? 0f : amount >= 1f ? 1f : amount < 0.5f
-                ? Mathf.Pow(2f, 20f * amount - 10f) * 0.5f
-                : (2f - Mathf.Pow(2f, -20f * amount + 10f)) * 0.5f,
-            "InCirc" => 1f - Mathf.Sqrt(1f - amount * amount),
-            "OutCirc" => Mathf.Sqrt(1f - Mathf.Pow(amount - 1f, 2f)),
-            "InOutCirc" => amount < 0.5f
-                ? (1f - Mathf.Sqrt(1f - Mathf.Pow(2f * amount, 2f))) * 0.5f
-                : (Mathf.Sqrt(1f - Mathf.Pow(-2f * amount + 2f, 2f)) + 1f) * 0.5f,
-            "InBack" => (back + 1f) * amount * amount * amount - back * amount * amount,
-            "OutBack" => 1f + (back + 1f) * Mathf.Pow(amount - 1f, 3f) + back * Mathf.Pow(amount - 1f, 2f),
-            "InOutBack" => amount < 0.5f
-                ? Mathf.Pow(2f * amount, 2f) * ((backInOut + 1f) * 2f * amount - backInOut) * 0.5f
-                : (Mathf.Pow(2f * amount - 2f, 2f) * ((backInOut + 1f) * (amount * 2f - 2f) + backInOut) + 2f) * 0.5f,
-            "InElastic" => amount <= 0f ? 0f : amount >= 1f ? 1f
-                : -Mathf.Pow(2f, 10f * amount - 10f) * Mathf.Sin((amount * 10f - 10.75f) * elastic),
-            "OutElastic" => amount <= 0f ? 0f : amount >= 1f ? 1f
-                : Mathf.Pow(2f, -10f * amount) * Mathf.Sin((amount * 10f - 0.75f) * elastic) + 1f,
-            "InOutElastic" => amount <= 0f ? 0f : amount >= 1f ? 1f : amount < 0.5f
-                ? -(Mathf.Pow(2f, 20f * amount - 10f) * Mathf.Sin((20f * amount - 11.125f) * elasticInOut)) * 0.5f
-                : Mathf.Pow(2f, -20f * amount + 10f) * Mathf.Sin((20f * amount - 11.125f) * elasticInOut) * 0.5f + 1f,
-            "InBounce" => 1f - EaseOutBounce(1f - amount),
-            "OutBounce" => EaseOutBounce(amount),
-            "InOutBounce" => amount < 0.5f
-                ? (1f - EaseOutBounce(1f - 2f * amount)) * 0.5f
-                : (1f + EaseOutBounce(2f * amount - 1f)) * 0.5f,
-            _ => amount,
-        };
-    }
+        => GameEaseBridge.Evaluate(amount, ease);
 
     private static float EaseOutBounce(float amount)
     {
@@ -986,6 +1458,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public string statusPath = "";
         public string previewDirectory = "";
         public string ffmpegPath = "";
+        public string gameManagedDirectory = "";
         public int width = 640;
         public int height = 360;
         public int framesPerSecond = 30;
@@ -1020,6 +1493,178 @@ public sealed class WorkerRuntime : MonoBehaviour
         public float renderedFramesPerSecond;
         public float secondsPerFrame;
         public float chartDurationSeconds;
+    }
+
+    private sealed class ParticleControlEvent
+    {
+        public ParticleControlEvent(
+            float start,
+            string eventType,
+            HashSet<string> tags,
+            string targetMode,
+            int count,
+            int order)
+        {
+            Start = start;
+            EventType = eventType;
+            Tags = tags;
+            TargetMode = targetMode;
+            Count = count;
+            Order = order;
+        }
+
+        public float Start { get; }
+        public string EventType { get; }
+        public HashSet<string> Tags { get; }
+        public string TargetMode { get; }
+        public int Count { get; }
+        public int Order { get; }
+
+        public void Apply(ParticleState particle)
+        {
+            if (EventType == "EmitParticle")
+            {
+                particle.Emit(Count, Start);
+                return;
+            }
+
+            switch (TargetMode)
+            {
+                case "Start":
+                    particle.Start(Start);
+                    break;
+                case "Stop":
+                    particle.Stop(clear: false, Start);
+                    break;
+                case "Clear":
+                    particle.Stop(clear: true, Start);
+                    break;
+            }
+        }
+    }
+
+    private sealed class ParticleState
+    {
+        private readonly Transform _transform;
+        private readonly ParticleSystem _particleSystem;
+        private readonly string _relativeTo;
+        private readonly Vector2 _startPosition;
+        private readonly Vector2 _pivotOffset;
+        private readonly Vector2 _parallax;
+        private readonly Vector2 _parallaxOffset;
+        private readonly float _startRotation;
+        private readonly bool _lockRotation;
+        private readonly bool _lockScale;
+        private readonly float _initialZoomRatio;
+        private bool _hasSimulation;
+        private float _lastTime;
+
+        public ParticleState(
+            int sourceIndex,
+            Transform transform,
+            ParticleSystem particleSystem,
+            ParticleSystemRenderer renderer,
+            HashSet<string> tags,
+            string relativeTo,
+            Vector2 startPosition,
+            Vector2 pivotOffset,
+            Vector2 parallax,
+            Vector2 parallaxOffset,
+            float startRotation,
+            bool lockRotation,
+            bool lockScale,
+            int depth,
+            float initialZoomRatio)
+        {
+            SourceIndex = sourceIndex;
+            _transform = transform;
+            _particleSystem = particleSystem;
+            Renderer = renderer;
+            Tags = tags;
+            _relativeTo = relativeTo;
+            _startPosition = startPosition;
+            _pivotOffset = pivotOffset;
+            _parallax = parallax;
+            _parallaxOffset = parallaxOffset;
+            _startRotation = startRotation;
+            _lockRotation = lockRotation;
+            _lockScale = lockScale;
+            _initialZoomRatio = initialZoomRatio;
+            Depth = depth;
+        }
+
+        public int SourceIndex { get; }
+        public int Depth { get; }
+        public HashSet<string> Tags { get; }
+        public ParticleSystem System => _particleSystem;
+        public ParticleSystemRenderer Renderer { get; }
+
+        public void Start(float time)
+        {
+            _lastTime = time;
+            _hasSimulation = true;
+            _particleSystem.Play(false);
+            _particleSystem.Pause(false);
+        }
+
+        public void Stop(bool clear, float time)
+        {
+            _lastTime = time;
+            _particleSystem.Stop(false, clear
+                ? ParticleSystemStopBehavior.StopEmittingAndClear
+                : ParticleSystemStopBehavior.StopEmitting);
+            _particleSystem.Pause(false);
+            if (clear) _hasSimulation = false;
+        }
+
+        public void Emit(int count, float time)
+        {
+            _lastTime = time;
+            if (count <= 0) return;
+            _hasSimulation = true;
+            _particleSystem.Emit(count);
+            _particleSystem.Pause(false);
+        }
+
+        public void AdvanceTo(float time)
+        {
+            if (time <= _lastTime) return;
+            var delta = time - _lastTime;
+            _lastTime = time;
+            if (!_hasSimulation) return;
+            _particleSystem.Simulate(delta, false, false, false);
+            _particleSystem.Pause(false);
+            if (!_particleSystem.IsAlive(false)) _hasSimulation = false;
+        }
+
+        public void ApplyVisual(Camera camera)
+        {
+            var cameraScaleRatio = _lockScale
+                ? camera.orthographicSize / (DefaultCameraOrthoSize * _initialZoomRatio)
+                : 1f;
+            Vector2 worldPosition;
+            if (_relativeTo is "Camera" or "CameraAspect")
+            {
+                var screenPosition = _startPosition + _pivotOffset;
+                if (_relativeTo == "CameraAspect") screenPosition.x /= Math.Max(0.001f, camera.aspect);
+                var viewport = screenPosition / 20f + new Vector2(0.5f, 0.5f);
+                worldPosition = camera.ViewportToWorldPoint(new Vector3(viewport.x, viewport.y, 10f));
+            }
+            else
+            {
+                var cameraPosition = (Vector2)camera.transform.position;
+                worldPosition = Vector2.Scale(cameraPosition - _startPosition, _parallax) +
+                                _startPosition + _parallaxOffset + _pivotOffset;
+            }
+
+            _transform.position = new Vector3(worldPosition.x, worldPosition.y, 0f);
+            _transform.rotation = Quaternion.Euler(0f, 0f,
+                _startRotation + (_lockRotation ? camera.transform.eulerAngles.z : 0f));
+            _particleSystem.transform.localScale = Vector3.one * cameraScaleRatio;
+            Renderer.sortingLayerName = Depth >= 0 ? "Bg" : "Default";
+            Renderer.sortingOrder = Math.Clamp(-Depth, short.MinValue + 1, short.MaxValue);
+            _particleSystem.gameObject.layer = Depth >= 0 ? FloorLayer : ForegroundLayer;
+        }
     }
 
     private sealed class DecorationState
@@ -1117,31 +1762,28 @@ public sealed class WorkerRuntime : MonoBehaviour
         public void SetVisible(bool visible)
         {
             Visible = visible;
-            Renderer.enabled = visible && MaskingType != "Mask" &&
-                               (MaskingType != "VisibleInsideMask" || HasMatchingMask);
+            Renderer.enabled = visible && MaskingType != "Mask";
             if (SpriteMask != null)
-                SpriteMask.enabled = visible && MaskingType == "Mask" &&
-                                     !string.IsNullOrWhiteSpace(MaskingTarget) &&
-                                     !string.Equals(MaskingTarget, "NO TAG", StringComparison.Ordinal);
+                SpriteMask.enabled = visible && MaskingType == "Mask";
         }
 
         public void ConfigureMaskRelationship(bool hasMatchingMask)
         {
             HasMatchingMask = hasMatchingMask;
-            Renderer.maskInteraction = !hasMatchingMask
-                ? SpriteMaskInteraction.None
-                : MaskingType switch
-                {
-                    "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
-                    "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
-                    _ => SpriteMaskInteraction.None,
-                };
+            Renderer.maskInteraction = MaskingType switch
+            {
+                "VisibleInsideMask" => SpriteMaskInteraction.VisibleInsideMask,
+                "VisibleOutsideMask" => SpriteMaskInteraction.VisibleOutsideMask,
+                _ => SpriteMaskInteraction.None,
+            };
             SetVisible(Visible);
         }
 
         public void SetDepth(int depth)
         {
             Depth = depth;
+            Renderer.gameObject.layer = depth >= 0 ? FloorLayer : ForegroundLayer;
+            Renderer.sortingLayerName = depth >= 0 ? "Bg" : "Default";
             Renderer.sortingOrder = Math.Clamp(-depth, short.MinValue + 1, short.MaxValue);
             RefreshMaskRange();
         }
@@ -1183,7 +1825,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             SpriteMask.isCustomRangeActive = UseMaskingDepth;
             var front = Math.Min(MaskingFrontDepth, MaskingBackDepth);
             var back = Math.Max(MaskingFrontDepth, MaskingBackDepth);
+            SpriteMask.frontSortingLayerID = SortingLayer.NameToID(front >= 0 ? "Bg" : "Default");
             SpriteMask.frontSortingOrder = Math.Clamp(-front + 1, short.MinValue + 1, short.MaxValue);
+            SpriteMask.backSortingLayerID = SortingLayer.NameToID(back >= 0 ? "Bg" : "Default");
             SpriteMask.backSortingOrder = Math.Clamp(-back, short.MinValue + 1, short.MaxValue);
         }
 
@@ -1471,117 +2115,164 @@ public sealed class WorkerRuntime : MonoBehaviour
         private float _targetRotation;
         private float _size;
         private float _targetSize;
+        private readonly int _floorIndex;
         private readonly Vector2 _floorPosition;
         private Property _active;
         private readonly Property _properties;
-        private string _resolvedMode = "Player";
-        public CameraEvent(float start, float duration, JObject data, Vector2 floorPosition, int order)
+        private readonly bool _positionUsed;
+        private readonly bool _movementTypeUsed;
+        private bool _effectiveMovementTypeUsed;
+        private string _effectiveMode = "Player";
+        public CameraEvent(float start, float duration, JObject data, int floorIndex, Vector2 floorPosition, int order)
         {
             Start = start;
             Duration = duration;
             _data = data;
+            _floorIndex = floorIndex;
             _floorPosition = floorPosition;
             Order = order;
             var position = ReadVector2(data["position"], new Vector2(float.NaN, float.NaN));
-            var relativeUsed = HasValue(data, "relativeTo");
-            if (!float.IsNaN(position.x) || relativeUsed) _properties |= Property.PositionX;
-            if (!float.IsNaN(position.y) || relativeUsed) _properties |= Property.PositionY;
-            if (HasValue(data, "rotation") || (relativeUsed && (data.Value<string>("relativeTo") ?? "") == "LastPosition"))
+            _positionUsed = !float.IsNaN(position.x) || !float.IsNaN(position.y);
+            _movementTypeUsed = HasValue(data, "relativeTo");
+            if (!float.IsNaN(position.x) || _movementTypeUsed) _properties |= Property.PositionX;
+            if (!float.IsNaN(position.y) || _movementTypeUsed) _properties |= Property.PositionY;
+            var requestedMode = data.Value<string>("relativeTo") ?? "";
+            if (HasValue(data, "rotation") || (_movementTypeUsed && requestedMode is "LastPosition" or "LastPositionNoRotation"))
                 _properties |= Property.Rotation;
             if (HasValue(data, "zoom")) _properties |= Property.Zoom;
         }
         public float Start { get; }
         public int Order { get; }
-        public string? RequestedMode => HasValue(_data, "relativeTo") ? _data.Value<string>("relativeTo") : null;
-        public bool ChangesMode => RequestedMode != null;
-        public bool IsPlayerMode => _resolvedMode == "Player";
         private float Duration { get; }
         public bool IsComplete => _active == Property.None;
 
-        public void ConfigureMode(string mode) => _resolvedMode = mode;
-
         public void CompleteConflicts(
+            Transform cameraParent,
             Camera camera,
             CameraLogicalState cameraState,
-            CameraEvent incoming,
-            Vector2 followPosition)
+            CameraEvent incoming)
         {
             var overlap = _active & incoming._properties;
-            var target = WorldPosition(_targetPosition, followPosition);
-            if ((overlap & Property.PositionX) != 0) camera.transform.position = new Vector3(target.x, camera.transform.position.y, -10f);
-            if ((overlap & Property.PositionY) != 0) camera.transform.position = new Vector3(camera.transform.position.x, target.y, -10f);
+            var parentPosition = cameraParent.position;
+            if ((overlap & Property.PositionX) != 0) parentPosition.x = _targetPosition.x;
+            if ((overlap & Property.PositionY) != 0) parentPosition.y = _targetPosition.y;
+            cameraParent.position = new Vector3(parentPosition.x, parentPosition.y, 0f);
             if ((overlap & Property.Rotation) != 0)
             {
                 cameraState.Rotation = _targetRotation;
-                camera.transform.rotation = Quaternion.Euler(0f, 0f, cameraState.Rotation);
+                camera.transform.localRotation = Quaternion.Euler(0f, 0f, cameraState.Rotation);
             }
             if ((overlap & Property.Zoom) != 0) camera.orthographicSize = _targetSize;
             _active &= ~overlap;
         }
 
-        public void Capture(Camera camera, CameraLogicalState cameraState, Vector2 followPosition)
+        public void Capture(
+            Transform cameraParent,
+            Camera camera,
+            CameraLogicalState cameraState,
+            Vector2 followPosition)
         {
             _active = _properties;
-            var cameraPosition = camera.transform.position;
-            _position = IsPlayerMode
-                ? new Vector3(cameraPosition.x - followPosition.x, cameraPosition.y - followPosition.y, -10f)
-                : cameraPosition;
-            _rotation = cameraState.Rotation;
-            _size = camera.orthographicSize;
             var requested = ReadVector2(_data["position"], new Vector2(float.NaN, float.NaN)) * TileSize;
-            if (ChangesMode)
+            _effectiveMovementTypeUsed = _movementTypeUsed;
+            var requestedMode = _data.Value<string>("relativeTo") ?? cameraState.LastUsedMovementType;
+            if (_effectiveMovementTypeUsed && (requestedMode != "Tile" || cameraState.LastTileCamFloor == _floorIndex) &&
+                _positionUsed && (float.IsNaN(requested.x) || float.IsNaN(requested.y)) &&
+                requestedMode == cameraState.LastUsedMovementType && requestedMode is not ("Global" or "LastPosition" or "LastPositionNoRotation"))
+                _effectiveMovementTypeUsed = false;
+            if (_effectiveMovementTypeUsed)
             {
                 if (float.IsNaN(requested.x)) requested.x = 0f;
                 if (float.IsNaN(requested.y)) requested.y = 0f;
             }
-            var target = _resolvedMode switch
+            _effectiveMode = _effectiveMovementTypeUsed ? requestedMode : cameraState.LastUsedMovementType;
+
+            if (_effectiveMode == "Player" && !cameraState.FollowMode)
             {
-                "Player" => requested,
-                "Tile" => _floorPosition + requested,
-                "Global" => requested,
-                _ => new Vector2(_position.x, _position.y) + requested,
+                var oldParent = cameraParent.position;
+                cameraParent.position = new Vector3(oldParent.x - followPosition.x, oldParent.y - followPosition.y, 0f);
+                camera.transform.position = new Vector3(oldParent.x, oldParent.y, -10f);
+                cameraState.FollowMode = true;
+            }
+            else if (_effectiveMode is "Tile" or "Global" && cameraState.FollowMode)
+            {
+                var world = camera.transform.position;
+                cameraParent.position = new Vector3(world.x, world.y, 0f);
+                camera.transform.localPosition = new Vector3(0f, 0f, -10f);
+                cameraState.FollowMode = false;
+            }
+
+            _position = cameraParent.position;
+            _rotation = cameraState.Rotation;
+            _size = camera.orthographicSize;
+            var relative = _positionUsed
+                ? requested
+                : cameraState.LastEventRelativePosition - (Vector2)cameraParent.position;
+            var target = _effectiveMode switch
+            {
+                "Player" => relative,
+                "Tile" => _floorPosition + relative,
+                "Global" => relative,
+                _ => (Vector2)cameraParent.position + (_positionUsed ? requested : Vector2.zero),
             };
             if (float.IsNaN(target.x)) target.x = _position.x;
             if (float.IsNaN(target.y)) target.y = _position.y;
-            _targetPosition = new Vector3(target.x, target.y, -10f);
+            _targetPosition = new Vector3(target.x, target.y, 0f);
+            if (_effectiveMode == "Tile")
+            {
+                cameraState.LastEventRelativePosition = _floorPosition;
+                cameraState.LastTileCamFloor = _floorIndex;
+            }
+            else if (_effectiveMode == "Global")
+                cameraState.LastEventRelativePosition = Vector2.zero;
+            if (_effectiveMovementTypeUsed) cameraState.LastUsedMovementType = requestedMode;
+
+            var rotationBase = _effectiveMode == "LastPosition" ? cameraState.Rotation : 0f;
             _targetRotation = _data.Value<float?>("rotation") is { } requestedRotation
-                ? _resolvedMode == "LastPosition"
-                    ? _rotation + requestedRotation
-                    : requestedRotation
-                : _rotation;
+                ? rotationBase + requestedRotation
+                : (_effectiveMovementTypeUsed && _effectiveMode is "LastPosition" or "LastPositionNoRotation"
+                    ? rotationBase
+                    : _rotation);
             _targetSize = _data.Value<float?>("zoom") is { } zoom
                 ? DefaultCameraOrthoSize * Math.Max(0.01f, zoom / 100f)
                 : _size;
         }
-        public bool Apply(Camera camera, CameraLogicalState cameraState, float time, Vector2 followPosition)
+        public bool Apply(Transform cameraParent, Camera camera, CameraLogicalState cameraState, float time)
         {
             var rawAmount = Duration <= 0f ? 1f : Mathf.Clamp01((time - Start) / Duration);
             var amount = EaseAmount(rawAmount, _data.Value<string>("ease"));
-            var current = camera.transform.position;
-            var logical = Vector3.LerpUnclamped(_position, _targetPosition, amount);
-            var world = WorldPosition(logical, followPosition);
-            if ((_active & Property.PositionX) != 0) current.x = world.x;
-            if ((_active & Property.PositionY) != 0) current.y = world.y;
-            camera.transform.position = new Vector3(current.x, current.y, -10f);
+            var current = cameraParent.position;
+            if ((_active & Property.PositionX) != 0) current.x = Mathf.LerpUnclamped(_position.x, _targetPosition.x, amount);
+            if ((_active & Property.PositionY) != 0) current.y = Mathf.LerpUnclamped(_position.y, _targetPosition.y, amount);
+            cameraParent.position = new Vector3(current.x, current.y, 0f);
             if ((_active & Property.Rotation) != 0)
             {
                 cameraState.Rotation = Mathf.LerpUnclamped(_rotation, _targetRotation, amount);
-                camera.transform.rotation = Quaternion.Euler(0f, 0f, cameraState.Rotation);
+                camera.transform.localRotation = Quaternion.Euler(0f, 0f, cameraState.Rotation);
             }
             if ((_active & Property.Zoom) != 0)
                 camera.orthographicSize = Mathf.LerpUnclamped(_size, _targetSize, amount);
             if (rawAmount >= 1f) _active = Property.None;
             return rawAmount >= 1f || IsComplete;
         }
-
-        private Vector3 WorldPosition(Vector3 logicalPosition, Vector2 followPosition) => IsPlayerMode
-            ? new Vector3(logicalPosition.x + followPosition.x, logicalPosition.y + followPosition.y, -10f)
-            : new Vector3(logicalPosition.x, logicalPosition.y, -10f);
     }
 
     private sealed class CameraLogicalState
     {
         public float Rotation { get; set; }
+        public bool FollowMode { get; set; }
+        public string LastUsedMovementType { get; set; } = "Player";
+        public Vector2 LastEventRelativePosition { get; set; }
+        public int LastTileCamFloor { get; set; } = -1;
+
+        public void Initialize(string initialMode, float rotation)
+        {
+            Rotation = rotation;
+            FollowMode = initialMode == "Player";
+            LastUsedMovementType = initialMode is "Player" or "Tile" or "Global" or "LastPosition" or "LastPositionNoRotation"
+                ? initialMode
+                : "Player";
+        }
     }
 
     private sealed class BackgroundEvent

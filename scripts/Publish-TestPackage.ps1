@@ -8,6 +8,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $publishRoot = Join-Path $projectRoot "artifacts\Publish\ADOFAIVfxRenderer"
 $workerSource = Join-Path $projectRoot "artifacts\UnityWorker"
 $workerDestination = Join-Path $publishRoot "UnityWorker"
+$toolsDestination = Join-Path $publishRoot "Tools"
 
 if (-not $SkipWorkerBuild) {
     & (Join-Path $PSScriptRoot "Build-UnityWorker.ps1") -Configuration $Configuration
@@ -40,6 +41,9 @@ if (Test-Path -LiteralPath $workerDestinationFull) {
     Remove-Item -LiteralPath $workerDestinationFull -Recurse -Force
 }
 Copy-Item -LiteralPath $workerSource -Destination $workerDestinationFull -Recurse -Force
+New-Item -ItemType Directory -Path $toolsDestination -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $projectRoot "scripts\Patch-WorkerGameResources.py") `
+    -Destination (Join-Path $toolsDestination "Patch-WorkerGameResources.py") -Force
 
 $gameAssembly = Join-Path $workerDestination "ADOFAI VFX Worker_Data\Managed\Assembly-CSharp.dll"
 if (Test-Path -LiteralPath $gameAssembly) {

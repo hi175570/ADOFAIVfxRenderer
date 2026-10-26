@@ -27,11 +27,6 @@ public static class DerivedChartExporter
         IReadOnlySet<int>? retainedDecorationIndices = null,
         IReadOnlySet<string>? disabledFilterKeys = null)
     {
-        if (profile is not (OutputProfile.VideoVfx or OutputProfile.VideoVfxPro))
-        {
-            throw new NotSupportedException("派生谱面导出目前只支持 Video VFX 与 Video VFX Pro。");
-        }
-
         sourceChartPath = Path.GetFullPath(sourceChartPath);
         renderedVideoPath = Path.GetFullPath(renderedVideoPath);
         if (!File.Exists(sourceChartPath)) throw new FileNotFoundException("找不到源谱面。", sourceChartPath);
@@ -54,7 +49,8 @@ public static class DerivedChartExporter
 
         var removedDecorations = RemoveBakedDecorations(root, profile, retainedDecorationIndices);
         var removedBackgroundEvents = RemoveBakedBackgroundEvents(root);
-        var disabledFilterEvents = DisableSelectedFilters(root, disabledFilterKeys);
+        var disabledFilterEvents = DisableBakedFilters(root, profile, disabledFilterKeys);
+        if (profile == OutputProfile.VideoPro) HideLiveTrackAndPlanets(root);
 
         var outputFolderName = Path.GetFileName(Path.GetDirectoryName(renderedVideoPath));
         var sourceName = Path.GetFileNameWithoutExtension(sourceChartPath);
@@ -101,13 +97,13 @@ public static class DerivedChartExporter
         for (var index = decorations.Count - 1; index >= 0; index--)
         {
             if (decorations[index] is not JsonObject decoration ||
-                decoration["eventType"]?.GetValue<string>() != "AddDecoration")
+                decoration["eventType"]?.GetValue<string>() is not ("AddDecoration" or "AddParticle"))
             {
                 continue;
             }
 
             var depth = decoration["depth"]?.GetValue<int>() ?? 0;
-            var baked = profile == OutputProfile.VideoVfx || depth >= 0;
+            var baked = profile is OutputProfile.Video or OutputProfile.VideoPro or OutputProfile.VideoVfx || depth >= 0;
             if (!baked || retainedDecorationIndices?.Contains(index) == true) continue;
             decorations.RemoveAt(index);
             removed++;
@@ -159,6 +155,59 @@ public static class DerivedChartExporter
             changed++;
         }
         return changed;
+    }
+
+    private static int DisableBakedFilters(
+        JsonObject root,
+        OutputProfile profile,
+        IReadOnlySet<string>? disabledFilterKeys)
+    {
+        if (profile is not (OutputProfile.Video or OutputProfile.VideoPro))
+            return DisableSelectedFilters(root, disabledFilterKeys);
+        if (root["actions"] is not JsonArray actions) return 0;
+        var allFilterKeys = actions.OfType<JsonObject>()
+            .Select(FilterCatalogReader.CreateKey)
+            .Where(static key => key is not null)
+            .Cast<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        if (disabledFilterKeys != null) allFilterKeys.UnionWith(disabledFilterKeys);
+        return DisableSelectedFilters(root, allFilterKeys);
+    }
+
+    private static void HideLiveTrackAndPlanets(JsonObject root)
+    {
+        if (root["settings"] is JsonObject settings)
+        {
+            settings["trackColor"] = WithZeroAlpha(settings["trackColor"]?.GetValue<string>() ?? "ffffff");
+            settings["secondaryTrackColor"] = WithZeroAlpha(
+                settings["secondaryTrackColor"]?.GetValue<string>() ?? "ffffff");
+        }
+        if (root["actions"] is not JsonArray actions) return;
+        foreach (var action in actions.OfType<JsonObject>())
+        {
+            switch (action["eventType"]?.GetValue<string>())
+            {
+                case "RecolorTrack":
+                    if (action["trackColor"] is JsonValue trackColor)
+                        action["trackColor"] = WithZeroAlpha(trackColor.GetValue<string>());
+                    if (action["secondaryTrackColor"] is JsonValue secondaryTrackColor)
+                        action["secondaryTrackColor"] = WithZeroAlpha(secondaryTrackColor.GetValue<string>());
+                    break;
+                case "MoveTrack":
+                    action["opacity"] = 0;
+                    break;
+                case "ScalePlanets":
+                    action["scale"] = 0;
+                    break;
+            }
+        }
+    }
+
+    private static string WithZeroAlpha(string color)
+    {
+        var normalized = color.Trim().TrimStart('#');
+        if (normalized.Length < 6) normalized = normalized.PadRight(6, 'f');
+        return normalized[..6] + "00";
     }
 
     private static string GetUniquePath(string preferredPath)
