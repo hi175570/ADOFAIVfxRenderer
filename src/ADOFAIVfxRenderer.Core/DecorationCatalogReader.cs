@@ -21,8 +21,7 @@ public static class DecorationCatalogReader
     public static IReadOnlyList<DecorationCatalogItem> Read(string chartPath)
     {
         chartPath = Path.GetFullPath(chartPath);
-        var root = JsonNode.Parse(File.ReadAllText(chartPath)) as JsonObject
-                   ?? throw new InvalidDataException("谱面根节点不是 JSON 对象。");
+        var root = AdoJson.ParseObject(File.ReadAllText(chartPath));
         var decorations = root["decorations"] as JsonArray ?? [];
         var actions = (root["actions"] as JsonArray ?? []).OfType<JsonObject>().ToArray();
         var directory = Path.GetDirectoryName(chartPath)!;

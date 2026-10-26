@@ -325,10 +325,19 @@ internal sealed class GameFilterBridge
         return null;
     }
 
-    private static Shader? LoadInstalledShader(string className)
+    internal static Shader? LoadInstalledShader(string className)
     {
         if (className == "VideoBloom")
             return Resources.Load<Shader>("adofai_videobloom");
+        var coreResource = className switch
+        {
+            "PolarScreen" => "adofai_polarscreen",
+            "ScreenTile" => "adofai_screentile",
+            "ScreenScroll" => "adofai_screenscroll",
+            _ => null,
+        };
+        if (coreResource != null) return Resources.Load<Shader>(coreResource);
+        if (!className.StartsWith("CameraFilterPackLegacy_", StringComparison.Ordinal)) return null;
         var resourceName = className.Replace("CameraFilterPackLegacy_", "CameraFilterPack_", StringComparison.Ordinal)
             .ToLowerInvariant();
         var shaders = Resources.LoadAll<Shader>(resourceName);

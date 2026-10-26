@@ -29,8 +29,7 @@ public static class FilterCatalogReader
 
     public static IReadOnlyList<FilterCatalogItem> Read(string chartPath)
     {
-        var root = JsonNode.Parse(File.ReadAllText(Path.GetFullPath(chartPath))) as JsonObject
-                   ?? throw new InvalidDataException("谱面根节点不是 JSON 对象。");
+        var root = AdoJson.ParseObject(File.ReadAllText(Path.GetFullPath(chartPath)));
         var groups = new Dictionary<string, MutableFilter>(StringComparer.Ordinal);
         foreach (var action in (root["actions"] as JsonArray ?? []).OfType<JsonObject>())
         {

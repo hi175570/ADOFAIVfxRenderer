@@ -18,6 +18,7 @@ var tests = new (string Name, Action Run)[]
     ("Current local game probe when present", CurrentLocalGameProbe),
     ("Derived chart video offset", DerivedChartVideoOffset),
     ("Video sync follows first playable floor", VideoSyncFollowsFirstPlayableFloor),
+    ("Duplicate JSON fields use the last value", DuplicateJsonFieldsUseLastValue),
     ("Timeline handles midspins and tempo", TimelineHandlesMidspinsAndTempo),
     ("Floor geometry uses ADOFAI axis convention", FloorGeometryUsesAdoAxisConvention),
     ("Current target timeline when present", CurrentTargetTimeline),
@@ -152,7 +153,7 @@ static void OutputProfileOwnership()
         VideoPresets.P144,
         15,
         VideoQualityPreset.Balanced).Content.HasFlag(RenderContent.Planets));
-    False(new RenderVariant(
+    True(new RenderVariant(
         OutputProfile.VideoPro,
         VideoPresets.P144,
         15,
@@ -305,6 +306,18 @@ static void VideoSyncFollowsFirstPlayableFloor()
     Equal(250, VideoSynchronizationCalculator.Calculate(Chart(90d)).VideoOffsetMilliseconds);
     Equal(-500, VideoSynchronizationCalculator.Calculate(Chart(0d), 0.5m).VideoOffsetMilliseconds);
 
+    var recommendedRoot = Chart(0d);
+    var recommendedPath = Path.Combine(Path.GetTempPath(), $"adofai-vfx-render-start-{Guid.NewGuid():N}.adofai");
+    try
+    {
+        File.WriteAllText(recommendedPath, recommendedRoot.ToJsonString());
+        Equal(2.0m, DerivedChartExporter.CalculateRecommendedRenderStartSeconds(recommendedPath));
+    }
+    finally
+    {
+        if (File.Exists(recommendedPath)) File.Delete(recommendedPath);
+    }
+
     const string target = @"C:\D\games\ADOFAI\adofai\[------OH_MY_PCCCCCCCC------]\THE STAR SYSTEM'S CALLING\main.adofai";
     if (File.Exists(target))
     {
@@ -326,6 +339,35 @@ static void TimelineHandlesMidspinsAndTempo()
     Equal(5, result.FloorTimesSeconds.Length);
     Equal(999d, result.RotationAngles[1]);
     Near(2d, result.DurationSeconds, 0.000001d);
+}
+
+static void DuplicateJsonFieldsUseLastValue()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"adofai-vfx-duplicate-json-{Guid.NewGuid():N}.adofai");
+    try
+    {
+        File.WriteAllText(path, """
+        {
+          "angleData": [0, 180],
+          "settings": {
+            "bpm": 60,
+            "bpm": 120,
+            "countdownTicks": 4,
+            "separateCountdownTime": true
+          },
+          "actions": [],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "visible": false, "visible": true}
+          ]
+        }
+        """);
+        Equal(2.0m, DerivedChartExporter.CalculateRecommendedRenderStartSeconds(path));
+        Equal(1, DecorationCatalogReader.Read(path).Count);
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
 }
 
 static void FloorGeometryUsesAdoAxisConvention()

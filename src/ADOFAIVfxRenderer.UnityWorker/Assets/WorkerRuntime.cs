@@ -71,7 +71,10 @@ public sealed class WorkerRuntime : MonoBehaviour
     private static void Boot()
     {
         if (Environment.GetCommandLineArgs().Contains("--probe-game-resources") ||
-            Environment.GetCommandLineArgs().Contains("--probe-game-scene")) return;
+            Environment.GetCommandLineArgs().Contains("--probe-game-scene") ||
+            Environment.GetCommandLineArgs().Contains("--probe-game-scene-activate") ||
+            Environment.GetCommandLineArgs().Contains("--probe-game-scene-bootstrap") ||
+            Environment.GetCommandLineArgs().Contains("--render-installed-game")) return;
         var host = new GameObject("ADOFAI VFX Worker Runtime");
         DontDestroyOnLoad(host);
         host.AddComponent<WorkerRuntime>();

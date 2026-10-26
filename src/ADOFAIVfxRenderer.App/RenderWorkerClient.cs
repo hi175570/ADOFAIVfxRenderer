@@ -130,7 +130,9 @@ internal sealed class RenderWorkerClient : IDisposable
         _lastStatusJson = null;
         _activeChartPath = chart.Path;
         _activeProfile = variant.Profile;
-        _activeRenderStartSeconds = renderStartSeconds;
+        // The worker renders from the first playable floor. The exporter parameter is an
+        // additional offset after that floor, so the normal value remains zero.
+        _activeRenderStartSeconds = 0m;
         _activeRetainedDecorationIndices = retainedDecorationIndices is null
             ? new HashSet<int>()
             : new HashSet<int>(retainedDecorationIndices);
@@ -140,17 +142,23 @@ internal sealed class RenderWorkerClient : IDisposable
         _derivedExportAttempted = false;
 
         var workerLogPath = layout.WorkerLogPath;
+        var useInstalledGameRuntime = variant.Profile == OutputProfile.VideoPro;
+        var installedRuntimeArguments = useInstalledGameRuntime
+            ? $" --render-installed-game --chart \"{chart.Path}\""
+            : "";
         var startInfo = new ProcessStartInfo
         {
             FileName = workerExecutable,
-            WorkingDirectory = Path.GetDirectoryName(workerExecutable),
+            WorkingDirectory = useInstalledGameRuntime
+                ? installation.RootDirectory
+                : Path.GetDirectoryName(workerExecutable),
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
             // Unity's normal player mode can create a visible top-level window even when
             // ProcessWindowStyle.Hidden is requested. Batch mode keeps the render device
             // available (unlike -nographics) without opening a second game-like window.
-            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\" -screen-fullscreen 0 -screen-width {internalWidth} -screen-height {internalHeight} {resolvedBackend.UnityArguments}",
+            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\"{installedRuntimeArguments} -screen-fullscreen 0 -screen-width {internalWidth} -screen-height {internalHeight} {resolvedBackend.UnityArguments}",
         };
         _workerProcess = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动独立 Unity Worker。");
         _timer.Start();
@@ -342,16 +350,23 @@ internal sealed class RenderWorkerClient : IDisposable
         if (!File.Exists(gameResources))
             throw new FileNotFoundException("游戏 Data 目录缺少 resources.assets。", gameResources);
 
+        var patchExecutableCandidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "Tools", "Patch-WorkerGameResources.exe"),
+            Path.Combine(Path.GetDirectoryName(workerDirectory) ?? workerDirectory, "Tools", "Patch-WorkerGameResources.exe"),
+        };
         var patchScriptCandidates = new[]
         {
             Path.Combine(AppContext.BaseDirectory, "Tools", "Patch-WorkerGameResources.py"),
             Path.Combine(Path.GetDirectoryName(workerDirectory) ?? workerDirectory, "Tools", "Patch-WorkerGameResources.py"),
             Path.GetFullPath(Path.Combine(workerDirectory, "..", "..", "scripts", "Patch-WorkerGameResources.py")),
         };
-        var patchScript = patchScriptCandidates.FirstOrDefault(File.Exists)
+        var patchExecutable = patchExecutableCandidates.FirstOrDefault(File.Exists);
+        var patchScript = patchScriptCandidates.FirstOrDefault(File.Exists);
+        var patchTool = patchExecutable ?? patchScript
             ?? throw new FileNotFoundException(
-                "找不到本机 Worker 资源准备器 Patch-WorkerGameResources.py。",
-                patchScriptCandidates[0]);
+                "找不到本机 Worker 资源准备器 Patch-WorkerGameResources.exe 或 .py。",
+                patchExecutableCandidates[0]);
 
         var workerRuntime = Path.Combine(
             workerDirectory,
@@ -364,7 +379,7 @@ internal sealed class RenderWorkerClient : IDisposable
             FileIdentity(workerRuntime),
             FileIdentity(gameResources),
             FileIdentity(Path.Combine(gameData, "globalgamemanagers")),
-            FileIdentity(patchScript),
+            FileIdentity(patchTool),
         });
         var cacheKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..20];
         var cacheRoot = Path.Combine(
@@ -381,22 +396,23 @@ internal sealed class RenderWorkerClient : IDisposable
         {
             var startInfo = new ProcessStartInfo
             {
-                FileName = "python",
+                FileName = patchExecutable ?? "python",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
             };
-            startInfo.ArgumentList.Add(patchScript);
+            if (patchExecutable == null) startInfo.ArgumentList.Add(patchScript!);
             startInfo.ArgumentList.Add("--worker");
             startInfo.ArgumentList.Add(workerDirectory);
             startInfo.ArgumentList.Add("--game-data");
             startInfo.ArgumentList.Add(gameData);
             startInfo.ArgumentList.Add("--output");
             startInfo.ArgumentList.Add(temporaryDirectory);
+            startInfo.ArgumentList.Add("--include-game-scene");
             using var process = Process.Start(startInfo)
-                ?? throw new InvalidOperationException("无法启动 Python Worker 资源准备器。");
+                ?? throw new InvalidOperationException("无法启动 Worker 资源准备器。");
             var standardOutput = process.StandardOutput.ReadToEndAsync();
             var standardError = process.StandardError.ReadToEndAsync();
             process.WaitForExit();
@@ -407,7 +423,7 @@ internal sealed class RenderWorkerClient : IDisposable
                     new[] { standardError.Result.Trim(), standardOutput.Result.Trim() }
                         .Where(static value => value.Length > 0));
                 throw new InvalidOperationException(
-                    "本机 Worker 资源准备失败。请确认 Python 可用且已安装 UnityPy。" +
+                    "本机 Worker 资源准备失败。" +
                     (details.Length > 0 ? Environment.NewLine + details : ""));
             }
 

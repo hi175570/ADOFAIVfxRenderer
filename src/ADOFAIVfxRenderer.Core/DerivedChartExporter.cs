@@ -32,8 +32,7 @@ public static class DerivedChartExporter
         if (!File.Exists(sourceChartPath)) throw new FileNotFoundException("找不到源谱面。", sourceChartPath);
         if (!File.Exists(renderedVideoPath)) throw new FileNotFoundException("找不到已渲染的视频。", renderedVideoPath);
 
-        var root = JsonNode.Parse(File.ReadAllText(sourceChartPath, Encoding.UTF8)) as JsonObject
-                   ?? throw new InvalidDataException("谱面根节点不是 JSON 对象。");
+        var root = AdoJson.ParseObject(File.ReadAllText(sourceChartPath, Encoding.UTF8));
         var settings = root["settings"] as JsonObject
                        ?? throw new InvalidDataException("谱面缺少 settings。");
 
@@ -79,11 +78,8 @@ public static class DerivedChartExporter
     public static decimal CalculateRecommendedRenderStartSeconds(string sourceChartPath)
     {
         sourceChartPath = Path.GetFullPath(sourceChartPath);
-        var root = JsonNode.Parse(File.ReadAllText(sourceChartPath, Encoding.UTF8)) as JsonObject
-                   ?? throw new InvalidDataException("谱面根节点不是 JSON 对象。");
-        var settings = root["settings"] as JsonObject
-                       ?? throw new InvalidDataException("谱面缺少 settings。");
-        return 0m;
+        var root = AdoJson.ParseObject(File.ReadAllText(sourceChartPath, Encoding.UTF8));
+        return VideoSynchronizationCalculator.Calculate(root).FirstPlayableFloorSeconds;
     }
 
     private static int RemoveBakedDecorations(
