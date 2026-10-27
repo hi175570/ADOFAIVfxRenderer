@@ -88,6 +88,12 @@ public static class DerivedChartExporter
         IReadOnlySet<int>? retainedDecorationIndices)
     {
         if (root["decorations"] is not JsonArray decorations) return 0;
+        if (profile is OutputProfile.Video or OutputProfile.VideoPro)
+        {
+            var count = decorations.Count;
+            decorations.Clear();
+            return count;
+        }
         var removed = 0;
         for (var index = decorations.Count - 1; index >= 0; index--)
         {
@@ -98,7 +104,7 @@ public static class DerivedChartExporter
             }
 
             var depth = decoration["depth"]?.GetValue<int>() ?? 0;
-            var baked = profile is OutputProfile.Video or OutputProfile.VideoPro or OutputProfile.VideoVfx || depth >= 0;
+            var baked = profile == OutputProfile.VideoVfx || depth >= 0;
             if (!baked || retainedDecorationIndices?.Contains(index) == true) continue;
             decorations.RemoveAt(index);
             removed++;

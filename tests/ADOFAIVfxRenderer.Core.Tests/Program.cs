@@ -469,16 +469,20 @@ static void DerivedVideoVfxProOwnership() => TestDerivedOwnership(
 
 static void DerivedVideoOwnership() => TestDerivedOwnership(
     OutputProfile.Video,
-    expectedDecorationCount: 2,
+    expectedDecorationCount: 4,
     expectedRemainingDepth: null,
-    expectFilterDisabled: true);
+    expectFilterDisabled: true,
+    expectText: false,
+    expectObject: false);
 
 static void DerivedVideoProOwnership() => TestDerivedOwnership(
     OutputProfile.VideoPro,
-    expectedDecorationCount: 2,
+    expectedDecorationCount: 4,
     expectedRemainingDepth: null,
     expectFilterDisabled: true,
-    expectHiddenGameplayVisuals: true);
+    expectHiddenGameplayVisuals: true,
+    expectText: false,
+    expectObject: false);
 
 static void DerivedChartRetainsSelectedDecoration()
 {
@@ -673,7 +677,9 @@ static void TestDerivedOwnership(
     int expectedDecorationCount,
     int? expectedRemainingDepth,
     bool expectFilterDisabled = false,
-    bool expectHiddenGameplayVisuals = false)
+    bool expectHiddenGameplayVisuals = false,
+    bool expectText = true,
+    bool expectObject = true)
 {
     var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-export-{Guid.NewGuid():N}");
     Directory.CreateDirectory(root);
@@ -698,7 +704,8 @@ static void TestDerivedOwnership(
           "decorations": [
             {"floor": 0, "eventType": "AddDecoration", "decorationImage": "bg.png", "depth": 10},
             {"floor": 0, "eventType": "AddDecoration", "decorationImage": "fg.png", "depth": -10},
-            {"floor": 0, "eventType": "AddText", "decText": "keep me", "depth": 0}
+            {"floor": 0, "eventType": "AddText", "decText": "keep me", "depth": 0},
+            {"floor": 0, "eventType": "AddObject", "objectType": "Planet", "depth": 0}
           ]
         }
         """);
@@ -713,7 +720,8 @@ static void TestDerivedOwnership(
         var filter = actions.Single(node => node!["eventType"]!.GetValue<string>() == "SetFilter")!;
         Equal(!expectFilterDisabled, filter["enabled"]!.GetValue<bool>());
         var remaining = derived["decorations"]!.AsArray();
-        True(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddText"));
+        Equal(expectText, remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddText"));
+        Equal(expectObject, remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddObject"));
         if (expectedRemainingDepth.HasValue)
         {
             True(remaining.Any(node => node!["eventType"]!.GetValue<string>() == "AddDecoration" &&

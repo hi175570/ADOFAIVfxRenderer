@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -121,7 +122,7 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private void BuildScene()
     {
-        var originalChart = JObject.Parse(File.ReadAllText(_job.chartPath));
+        var originalChart = JObject.Parse(NormalizeLegacyJson(File.ReadAllText(_job.chartPath)));
         var chart = JObject.Parse(GameChartConverter.LoadCurrentFormat(_job.chartPath, _job.gameManagedDirectory));
         Debug.Log(
             $"GAME_CHART_CONVERTER sourceVersion={originalChart["settings"]?["version"]} " +
@@ -303,6 +304,39 @@ public sealed class WorkerRuntime : MonoBehaviour
         _backgroundEffects?.Prepare();
         cameraObject.SetActive(true);
         ApplyTimeline(0f);
+    }
+
+    private static string NormalizeLegacyJson(string json)
+    {
+        var normalized = new StringBuilder(json.Length);
+        var inString = false;
+        var escaped = false;
+        for (var index = 0; index < json.Length; index++)
+        {
+            var character = json[index];
+            if (inString)
+            {
+                normalized.Append(character);
+                if (escaped) escaped = false;
+                else if (character == '\\') escaped = true;
+                else if (character == '"') inString = false;
+                continue;
+            }
+            if (character == '"')
+            {
+                inString = true;
+                normalized.Append(character);
+                continue;
+            }
+            if (character == ',')
+            {
+                var next = index + 1;
+                while (next < json.Length && char.IsWhiteSpace(json[next])) next++;
+                if (next < json.Length && json[next] == ',') continue;
+            }
+            normalized.Append(character);
+        }
+        return normalized.ToString();
     }
 
     private const int ForegroundLayer = 7;
