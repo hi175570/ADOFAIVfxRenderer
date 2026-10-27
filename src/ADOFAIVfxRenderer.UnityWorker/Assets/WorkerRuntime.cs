@@ -24,6 +24,16 @@ public sealed class WorkerRuntime : MonoBehaviour
     private readonly Dictionary<string, Texture2D> _textures = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Vector2Int> _sourceTextureSizes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Sprite> _sprites = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, TextureResident> _textureResidents = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _pinnedTexturePaths = new(StringComparer.OrdinalIgnoreCase);
+    private long _residentTextureBytes;
+    private long _pinnedTextureBytes;
+    private long _lastOfflineBudgetPressureBytes = -1;
+    private int _lastOfflineBudgetPressureFrame = int.MinValue;
+    private long _peakResidentTextureBytes;
+    private int _textureStreamingFrame;
+    private int _textureLoadCount;
+    private int _textureEvictionCount;
     private Material? _tileMaterial;
     private Type? _gameBlendEffectType;
     private PropertyInfo? _gameBlendModeProperty;
@@ -465,6 +475,7 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     private void AddDecoration(JObject data, int sourceIndex)
     {
+        if (_job.excludedDecorationIndices?.Contains(sourceIndex) == true) return;
         var depth = data.Value<int?>("depth") ?? 0;
         if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
             (depth < 0 && !_job.includeForegroundDecorations))
@@ -473,12 +484,18 @@ public sealed class WorkerRuntime : MonoBehaviour
             return;
         }
         var imageName = data.Value<string>("decorationImage");
+        var imagePath = string.IsNullOrWhiteSpace(imageName)
+            ? ""
+            : Path.Combine(_chartDirectory, imageName);
         Sprite? sprite = null;
-        if (!string.IsNullOrWhiteSpace(imageName))
+        if (!string.IsNullOrWhiteSpace(imagePath))
         {
-            var imagePath = Path.Combine(_chartDirectory, imageName);
-            if (File.Exists(imagePath)) sprite = GetSprite(imagePath);
-            if (sprite == null) _unbakedDecorationIndices.Add(sourceIndex);
+            if (!File.Exists(imagePath))
+            {
+                _unbakedDecorationIndices.Add(sourceIndex);
+                imagePath = "";
+            }
+            else if (_job.textureMemoryBudgetBytes <= 0) sprite = GetSprite(imagePath);
         }
 
         var gameObject = new GameObject(imageName);
@@ -528,10 +545,14 @@ public sealed class WorkerRuntime : MonoBehaviour
         var scaleMultiplier = data.Value<float?>("scaleMultiplier") ?? 1f;
         var originalSize = ReadVector2(data["originalSize"], Vector2.zero);
         var textureScaleMultiplier = sprite != null && originalSize.x != 0f && originalSize.y != 0f
-            ? new Vector2(originalSize.x / sprite.texture.width, originalSize.y / sprite.texture.height)
+            ? new Vector2(
+                originalSize.x / Math.Max(1, _sourceTextureSizes[imagePath].x),
+                originalSize.y / Math.Max(1, _sourceTextureSizes[imagePath].y))
             : Vector2.one;
         var state = new DecorationState(
             sourceIndex,
+            imagePath,
+            originalSize,
             gameObject.transform,
             childObject.transform,
             renderer,
@@ -558,12 +579,15 @@ public sealed class WorkerRuntime : MonoBehaviour
             data.Value<int?>("maskingFrontDepth") ?? depth,
             data.Value<int?>("maskingBackDepth") ?? depth,
             _initialZoomRatio);
+        if (sprite != null && _sourceTextureSizes.TryGetValue(imagePath, out var initialSourceSize))
+            state.ApplyStreamedSprite(sprite, initialSourceSize);
         state.ApplyVisual(_camera);
         _decorations.Add(state);
     }
 
     private void AddParticle(JObject data, int sourceIndex)
     {
+        if (_job.excludedDecorationIndices?.Contains(sourceIndex) == true) return;
         var depth = data.Value<int?>("depth") ?? 0;
         if ((depth >= 0 && !_job.includeBackgroundDecorations) ||
             (depth < 0 && !_job.includeForegroundDecorations))
@@ -573,12 +597,18 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
 
         var imageName = data.Value<string>("decorationImage") ?? "";
+        var imagePath = string.IsNullOrWhiteSpace(imageName)
+            ? ""
+            : Path.Combine(_chartDirectory, imageName);
         Texture2D? texture = null;
-        if (!string.IsNullOrWhiteSpace(imageName))
+        if (!string.IsNullOrWhiteSpace(imagePath))
         {
-            var imagePath = Path.Combine(_chartDirectory, imageName);
-            if (File.Exists(imagePath)) texture = GetTexture(imagePath);
-            if (texture == null) _unbakedDecorationIndices.Add(sourceIndex);
+            if (!File.Exists(imagePath))
+            {
+                _unbakedDecorationIndices.Add(sourceIndex);
+                imagePath = "";
+            }
+            else if (_job.textureMemoryBudgetBytes <= 0) texture = GetTexture(imagePath);
         }
 
         var prefab = Resources.Load<GameObject>("adofai_particledecoration");
@@ -689,6 +719,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         particleSystem.Pause(false);
         var state = new ParticleState(
             sourceIndex,
+            imagePath,
             root.transform,
             particleSystem,
             renderer,
@@ -734,9 +765,30 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
     }
 
-    private Texture2D? GetTexture(string imagePath)
+    private Texture2D? GetTexture(string imagePath, bool pin = false)
     {
-        if (_textures.TryGetValue(imagePath, out var existing)) return existing;
+        var newlyPinned = false;
+        var movedResidentToPinned = false;
+        if (pin)
+        {
+            newlyPinned = _pinnedTexturePaths.Add(imagePath);
+            if (_textureResidents.TryGetValue(imagePath, out var previouslyStreamed))
+            {
+                _textureResidents.Remove(imagePath);
+                _residentTextureBytes -= previouslyStreamed.Bytes;
+                _pinnedTextureBytes += previouslyStreamed.Bytes;
+                movedResidentToPinned = true;
+            }
+        }
+        if (_textures.TryGetValue(imagePath, out var existing))
+        {
+            if (newlyPinned && !movedResidentToPinned && !_textureResidents.ContainsKey(imagePath))
+                _pinnedTextureBytes += Math.Max(
+                    (long)existing.width * existing.height * 4L,
+                    UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(existing));
+            if (_textureResidents.TryGetValue(imagePath, out var cached)) cached.LastUsedFrame = _textureStreamingFrame;
+            return existing;
+        }
         var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
         texture.name = Path.GetFileName(imagePath);
         if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(imagePath), markNonReadable: false))
@@ -745,44 +797,30 @@ public sealed class WorkerRuntime : MonoBehaviour
             return null;
         }
         _sourceTextureSizes[imagePath] = new Vector2Int(texture.width, texture.height);
-        if (_job.textureMaximumSide > 0 &&
-            Math.Max(texture.width, texture.height) > _job.textureMaximumSide)
-        {
-            texture = ResizeTexture(texture, _job.textureMaximumSide);
-            texture.name = Path.GetFileName(imagePath);
-        }
         texture.Apply(updateMipmaps: false, makeNoLongerReadable: true);
         texture.wrapMode = TextureWrapMode.Repeat;
         texture.filterMode = FilterMode.Bilinear;
         _textures[imagePath] = texture;
+        var bytes = Math.Max(
+            (long)texture.width * texture.height * 4L,
+            UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(texture));
+        if (_job.textureMemoryBudgetBytes > 0 && !_pinnedTexturePaths.Contains(imagePath))
+        {
+            _textureResidents[imagePath] = new TextureResident(imagePath, texture, bytes, _textureStreamingFrame);
+            _residentTextureBytes += bytes;
+            _peakResidentTextureBytes = Math.Max(
+                _peakResidentTextureBytes,
+                _residentTextureBytes + _pinnedTextureBytes);
+            _textureLoadCount++;
+        }
+        else if (newlyPinned)
+        {
+            _pinnedTextureBytes += bytes;
+            _peakResidentTextureBytes = Math.Max(
+                _peakResidentTextureBytes,
+                _residentTextureBytes + _pinnedTextureBytes);
+        }
         return texture;
-    }
-
-    private static Texture2D ResizeTexture(Texture2D source, int maximumSide)
-    {
-        var scale = maximumSide / (float)Math.Max(source.width, source.height);
-        var width = Math.Max(1, Mathf.RoundToInt(source.width * scale));
-        var height = Math.Max(1, Mathf.RoundToInt(source.height * scale));
-        var temporary = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
-        var previous = RenderTexture.active;
-        try
-        {
-            Graphics.Blit(source, temporary);
-            RenderTexture.active = temporary;
-            var resized = new Texture2D(width, height, TextureFormat.RGBA32, false);
-            resized.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
-            resized.Apply(false, false);
-            // Texture loading happens synchronously before the first rendered frame.
-            // Destroy would defer every full-resolution source until frame end and defeat
-            // the low-memory budget on charts with thousands of images.
-            DestroyImmediate(source);
-            return resized;
-        }
-        finally
-        {
-            RenderTexture.active = previous;
-            RenderTexture.ReleaseTemporary(temporary);
-        }
     }
 
     private Sprite? GetSprite(string imagePath)
@@ -922,13 +960,22 @@ public sealed class WorkerRuntime : MonoBehaviour
         var start = (float)_timeline.TimeAtFloorAngleOffset(floor, angleOffset);
         var duration = Math.Max(0f, (data.Value<float?>("duration") ?? 0f) * 60f / (bpm * _pitch));
         var replaceSprite = HasValue(data, "decorationImage");
-        Sprite? sprite = null;
+        var replacementPath = "";
+        Sprite? replacementSprite = null;
+        var replacementSourceSize = Vector2Int.zero;
         var replacementFailed = false;
         if (replaceSprite && data.Value<string>("decorationImage") is { Length: > 0 } imageName)
         {
-            var imagePath = Path.Combine(_chartDirectory, imageName);
-            if (File.Exists(imagePath)) sprite = GetSprite(imagePath);
-            replacementFailed = sprite == null;
+            replacementPath = Path.Combine(_chartDirectory, imageName);
+            replacementFailed = !File.Exists(replacementPath);
+            if (replacementFailed) replacementPath = "";
+            if (!replacementFailed && _job.textureMemoryBudgetBytes <= 0)
+            {
+                replacementSprite = GetSprite(replacementPath);
+                if (_sourceTextureSizes.TryGetValue(replacementPath, out var sourceSize))
+                    replacementSourceSize = sourceSize;
+                replacementFailed = replacementSprite == null;
+            }
         }
         _moves.Add(new MoveEvent(
             start,
@@ -936,7 +983,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             SplitTags(data.Value<string>("tag")),
             data,
             replaceSprite,
-            sprite,
+            replacementPath,
+            replacementSprite,
+            replacementSourceSize,
             replacementFailed,
             index => _unbakedDecorationIndices.Add(index),
             ResolveMaskingTargets,
@@ -1190,6 +1239,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             }
         }
 
+        UpdateTextureStreaming();
         _trackRenderer?.Apply(time);
         foreach (var decoration in _decorations) decoration.ApplyVisual(_camera);
         foreach (var particle in _particles)
@@ -1203,6 +1253,79 @@ public sealed class WorkerRuntime : MonoBehaviour
         _staticBackgroundCamera.clearFlags = _effects?.HallOfMirrorsEnabled == true
             ? CameraClearFlags.Depth
             : CameraClearFlags.SolidColor;
+    }
+
+    private void UpdateTextureStreaming()
+    {
+        if (_job.textureMemoryBudgetBytes <= 0) return;
+        _textureStreamingFrame++;
+        var required = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var decoration in _decorations)
+            if (decoration.NeedsTexture) required.Add(decoration.ImagePath);
+        foreach (var particle in _particles)
+            if (particle.NeedsTexture) required.Add(particle.ImagePath);
+
+        // Drop the previous scene before decoding the next scene so the transient
+        // transition peak also respects the full-resolution texture budget.
+        foreach (var candidate in _textureResidents.Values
+                     .Where(item => !required.Contains(item.Path))
+                     .OrderBy(item => item.LastUsedFrame)
+                     .ToArray())
+            EvictTexture(candidate);
+
+        foreach (var decoration in _decorations)
+        {
+            if (!decoration.NeedsTexture) continue;
+            var sprite = GetSprite(decoration.ImagePath);
+            if (sprite != null && _sourceTextureSizes.TryGetValue(decoration.ImagePath, out var sourceSize))
+                decoration.ApplyStreamedSprite(sprite, sourceSize);
+        }
+        foreach (var particle in _particles)
+        {
+            if (!particle.NeedsTexture) continue;
+            var texture = GetTexture(particle.ImagePath);
+            if (texture != null) particle.ApplyStreamedTexture(texture);
+        }
+        foreach (var path in required)
+            if (_textureResidents.TryGetValue(path, out var resident)) resident.LastUsedFrame = _textureStreamingFrame;
+
+        var streamingBudget = Math.Max(0L, _job.textureMemoryBudgetBytes - _pinnedTextureBytes);
+        foreach (var candidate in _textureResidents.Values
+                     .Where(item => !required.Contains(item.Path))
+                     .OrderBy(item => item.LastUsedFrame)
+                     .ToArray())
+        {
+            if (_residentTextureBytes <= streamingBudget) break;
+            EvictTexture(candidate);
+        }
+        if (_residentTextureBytes > streamingBudget &&
+            (_residentTextureBytes != _lastOfflineBudgetPressureBytes ||
+             _textureStreamingFrame - _lastOfflineBudgetPressureFrame >= 600))
+        {
+            _lastOfflineBudgetPressureBytes = _residentTextureBytes;
+            _lastOfflineBudgetPressureFrame = _textureStreamingFrame;
+            Debug.LogWarning(
+                $"OFFLINE_TEXTURE_BUDGET_PRESSURE resident={_residentTextureBytes} pinned={_pinnedTextureBytes} " +
+                $"budget={_job.textureMemoryBudgetBytes} required={required.Count}; all current-frame textures are required.");
+        }
+        if (_textureStreamingFrame == 1 || _textureStreamingFrame % 600 == 0)
+            Debug.Log(
+                $"OFFLINE_TEXTURE_STREAM frame={_textureStreamingFrame} resident={_textureResidents.Count} " +
+                $"bytes={_residentTextureBytes} pinned={_pinnedTextureBytes} peak={_peakResidentTextureBytes} " +
+                $"required={required.Count} " +
+                $"loads={_textureLoadCount} evictions={_textureEvictionCount}");
+    }
+
+    private void EvictTexture(TextureResident resident)
+    {
+        if (!_textureResidents.Remove(resident.Path)) return;
+        foreach (var decoration in _decorations) decoration.ClearStreamedSprite(resident.Path);
+        foreach (var particle in _particles) particle.ClearStreamedTexture(resident.Path);
+        if (_sprites.Remove(resident.Path, out var sprite) && sprite != null) Destroy(sprite);
+        _textures.Remove(resident.Path);
+        _residentTextureBytes -= resident.Bytes;
+        Destroy(resident.Texture);
+        _textureEvictionCount++;
     }
 
     private void AdvanceMoves(float time)
@@ -1307,7 +1430,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             return;
         }
 
-        var texture = GetTexture(path);
+        var texture = GetTexture(path, pin: true);
         if (texture == null) return;
         _backgroundRenderer.sprite = Sprite.Create(
             texture,
@@ -1625,9 +1748,11 @@ public sealed class WorkerRuntime : MonoBehaviour
         public bool includeBackgroundDecorations = true;
         public bool includeForegroundDecorations = true;
         public int[]? retainedDecorationIndices;
+        public int[]? excludedDecorationIndices;
         public string? videoEncoder;
         public string? encoderPreset;
-        public int textureMaximumSide;
+        public int placeholderMaximumSide;
+        public long textureMemoryBudgetBytes;
     }
 
     [Serializable]
@@ -1696,6 +1821,22 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
     }
 
+    private sealed class TextureResident
+    {
+        public TextureResident(string path, Texture2D texture, long bytes, int lastUsedFrame)
+        {
+            Path = path;
+            Texture = texture;
+            Bytes = bytes;
+            LastUsedFrame = lastUsedFrame;
+        }
+
+        public string Path { get; }
+        public Texture2D Texture { get; }
+        public long Bytes { get; }
+        public int LastUsedFrame { get; set; }
+    }
+
     private sealed class ParticleState
     {
         private readonly Transform _transform;
@@ -1714,6 +1855,7 @@ public sealed class WorkerRuntime : MonoBehaviour
 
         public ParticleState(
             int sourceIndex,
+            string imagePath,
             Transform transform,
             ParticleSystem particleSystem,
             ParticleSystemRenderer renderer,
@@ -1730,6 +1872,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             float initialZoomRatio)
         {
             SourceIndex = sourceIndex;
+            ImagePath = imagePath;
             _transform = transform;
             _particleSystem = particleSystem;
             Renderer = renderer;
@@ -1747,10 +1890,26 @@ public sealed class WorkerRuntime : MonoBehaviour
         }
 
         public int SourceIndex { get; }
+        public string ImagePath { get; }
         public int Depth { get; }
         public HashSet<string> Tags { get; }
         public ParticleSystem System => _particleSystem;
         public ParticleSystemRenderer Renderer { get; }
+        public bool NeedsTexture => !string.IsNullOrWhiteSpace(ImagePath) &&
+                                    (_particleSystem.isPlaying || _particleSystem.isEmitting ||
+                                     _particleSystem.particleCount > 0);
+
+        public void ApplyStreamedTexture(Texture2D texture)
+        {
+            if (Renderer.sharedMaterial.mainTexture != texture)
+                Renderer.material.mainTexture = texture;
+        }
+
+        public void ClearStreamedTexture(string path)
+        {
+            if (!string.Equals(ImagePath, path, StringComparison.OrdinalIgnoreCase)) return;
+            Renderer.material.mainTexture = null;
+        }
 
         public void Start(float time)
         {
@@ -1824,6 +1983,8 @@ public sealed class WorkerRuntime : MonoBehaviour
     {
         public DecorationState(
             int sourceIndex,
+            string imagePath,
+            Vector2 pendingOriginalSize,
             Transform transform,
             Transform childTransform,
             SpriteRenderer renderer,
@@ -1852,6 +2013,8 @@ public sealed class WorkerRuntime : MonoBehaviour
             float initialZoomRatio)
         {
             SourceIndex = sourceIndex;
+            ImagePath = imagePath;
+            _pendingOriginalSize = pendingOriginalSize;
             Transform = transform;
             ChildTransform = childTransform;
             Renderer = renderer;
@@ -1882,6 +2045,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             RefreshMaskRange();
         }
         public int SourceIndex { get; }
+        public string ImagePath { get; private set; }
         public Transform Transform { get; }
         public Transform ChildTransform { get; }
         public SpriteRenderer Renderer { get; }
@@ -1911,6 +2075,28 @@ public sealed class WorkerRuntime : MonoBehaviour
         public int MaskingFrontDepth { get; private set; }
         public int MaskingBackDepth { get; private set; }
         public float InitialZoomRatio { get; }
+        private Vector2Int _sourceTextureSize;
+        private Vector2 _pendingOriginalSize;
+        public bool NeedsTexture
+        {
+            get
+            {
+                if (!Visible || string.IsNullOrWhiteSpace(ImagePath)) return false;
+
+                // A SpriteMask still consumes its source texture even though its
+                // SpriteRenderer is disabled and its decoration color is irrelevant.
+                // Every other decoration is needed only when it can contribute at
+                // least one pixel to the current frame. This never changes the source
+                // resolution; it only delays decoding fully transparent/zero-scale
+                // ordinary decorations until an event makes them drawable.
+                var effectiveScale = ScaleMultiplier * TextureScaleMultiplier;
+                var hasArea = Math.Abs(Scale.x * effectiveScale.x) > 0.000001f &&
+                              Math.Abs(Scale.y * effectiveScale.y) > 0.000001f;
+                if (!hasArea) return false;
+                if (MaskingType == "Mask") return SpriteMask != null && SpriteMask.enabled;
+                return Color.a * Opacity > 0.000001f;
+            }
+        }
 
         public void SetVisible(bool visible)
         {
@@ -1963,13 +2149,41 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (SpriteMask != null) SpriteMask.sprite = sprite;
         }
 
+        public void SetImagePath(string path)
+        {
+            ImagePath = path;
+            _sourceTextureSize = Vector2Int.zero;
+            SetSprite(null);
+        }
+
+        public void ApplyStreamedSprite(Sprite sprite, Vector2Int sourceSize)
+        {
+            if (Renderer.sprite != sprite) SetSprite(sprite);
+            _sourceTextureSize = sourceSize;
+            if (_pendingOriginalSize.x == 0f || _pendingOriginalSize.y == 0f) return;
+            TextureScaleMultiplier = new Vector2(
+                _pendingOriginalSize.x / Math.Max(1, sourceSize.x),
+                _pendingOriginalSize.y / Math.Max(1, sourceSize.y));
+            _pendingOriginalSize = Vector2.zero;
+        }
+
+        public void ClearStreamedSprite(string path)
+        {
+            if (!string.Equals(ImagePath, path, StringComparison.OrdinalIgnoreCase)) return;
+            SetSprite(null);
+        }
+
         public void SetOriginalSize(Vector2 originalSize)
         {
-            var sprite = Renderer.sprite;
-            if (sprite == null || originalSize.x == 0f || originalSize.y == 0f) return;
+            if (originalSize.x == 0f || originalSize.y == 0f) return;
+            if (_sourceTextureSize == Vector2Int.zero)
+            {
+                _pendingOriginalSize = originalSize;
+                return;
+            }
             TextureScaleMultiplier = new Vector2(
-                originalSize.x / sprite.texture.width,
-                originalSize.y / sprite.texture.height);
+                originalSize.x / Math.Max(1, _sourceTextureSize.x),
+                originalSize.y / Math.Max(1, _sourceTextureSize.y));
         }
 
         private void RefreshMaskRange()
@@ -2058,7 +2272,9 @@ public sealed class WorkerRuntime : MonoBehaviour
         private readonly List<Snapshot> _targets = new();
         private readonly Property _properties;
         private readonly bool _replaceSprite;
+        private readonly string _replacementPath;
         private readonly Sprite? _replacementSprite;
+        private readonly Vector2Int _replacementSourceSize;
         private readonly bool _replacementFailed;
         private readonly Action<int> _markUnbaked;
         private readonly Action _refreshMasks;
@@ -2068,7 +2284,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             HashSet<string> tags,
             JObject data,
             bool replaceSprite,
+            string replacementPath,
             Sprite? replacementSprite,
+            Vector2Int replacementSourceSize,
             bool replacementFailed,
             Action<int> markUnbaked,
             Action refreshMasks,
@@ -2080,7 +2298,9 @@ public sealed class WorkerRuntime : MonoBehaviour
             _data = data;
             _properties = GetProperties(data);
             _replaceSprite = replaceSprite;
+            _replacementPath = replacementPath;
             _replacementSprite = replacementSprite;
+            _replacementSourceSize = replacementSourceSize;
             _replacementFailed = replacementFailed;
             _markUnbaked = markUnbaked;
             _refreshMasks = refreshMasks;
@@ -2117,7 +2337,9 @@ public sealed class WorkerRuntime : MonoBehaviour
                 if (HasValue(_data, "depth")) decoration.SetDepth(_data.Value<int>("depth"));
                 if (_replaceSprite)
                 {
-                    decoration.SetSprite(_replacementSprite);
+                    decoration.SetImagePath(_replacementPath);
+                    if (_replacementSprite != null)
+                        decoration.ApplyStreamedSprite(_replacementSprite, _replacementSourceSize);
                     if (_replacementFailed) _markUnbaked(decoration.SourceIndex);
                 }
                 if (HasValue(_data, "originalSize"))

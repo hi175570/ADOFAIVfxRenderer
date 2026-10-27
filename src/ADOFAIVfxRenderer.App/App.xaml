@@ -12,6 +12,7 @@
         <SolidColorBrush x:Key="TextPrimary" Color="#F2F5FA" />
         <SolidColorBrush x:Key="TextSecondary" Color="#AAB4C4" />
         <SolidColorBrush x:Key="Accent" Color="#5AA7FF" />
+        <SolidColorBrush x:Key="WarningText" Color="#FF8C8C" />
         <DrawingBrush x:Key="TransparencyGrid"
                       TileMode="Tile"
                       Viewport="0,0,24,24"

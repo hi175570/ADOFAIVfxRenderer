@@ -125,6 +125,19 @@ public partial class MainWindow : Window
                     .First(static item => item.Value == MemoryStrategy.Limited);
                 MemoryLimitGbBox.Text = memoryGb.ToString(CultureInfo.InvariantCulture);
             }
+            if (arguments.Any(static argument => argument.Equals("--unlimited-memory", StringComparison.OrdinalIgnoreCase)))
+            {
+                MemoryStrategyBox.SelectedItem = MemoryStrategyBox.Items
+                    .OfType<Choice<MemoryStrategy>>()
+                    .First(static item => item.Value == MemoryStrategy.Unlimited);
+            }
+            var excludedIndices = (GetArgumentValue(arguments, "--exclude-decoration-indices") ?? "")
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(static value => int.TryParse(value, out var index) ? index : -1)
+                .Where(static index => index >= 0)
+                .ToHashSet();
+            foreach (var choice in _decorationChoices)
+                choice.IsExcluded = excludedIndices.Contains(choice.Item.Index);
             AddToQueue_Click(this, new RoutedEventArgs());
             if (_lastQueueError is not null) throw _lastQueueError;
             StartQueue_Click(this, new RoutedEventArgs());
@@ -445,6 +458,7 @@ public partial class MainWindow : Window
         _chart = ChartMetadataReader.Read(path);
         LoadDecorationCatalog(path);
         LoadFilterCatalog(path);
+        LoadVisualRisks(path);
         SaveRememberedPaths(chartPath: path);
         UpdateChartCompatibilityText();
     }
@@ -526,6 +540,15 @@ public partial class MainWindow : Window
         RefreshFilterOwnershipSummary();
     }
 
+    private void LoadVisualRisks(string chartPath)
+    {
+        var issues = VisualRiskAnalyzer.Analyze(chartPath);
+        VisualRiskSummaryText.Text = issues.Count == 0
+            ? "未发现明显的拆层风险；仍建议用参考视频抽查。"
+            : "可能需要人工对照：\n" + string.Join("\n", issues.Select(static issue =>
+                $"• {(issue.FirstFloor.HasValue ? $"格 {issue.FirstFloor.Value} · " : "")}{issue.Title}：{issue.Detail}"));
+    }
+
     private IReadOnlySet<string> GetBakedFilterKeys() => _filterChoices
         .Where(static item => item.Ownership == FilterOwnership.BakeIntoVideo)
         .Select(static item => item.Item.Key)
@@ -542,11 +565,12 @@ public partial class MainWindow : Window
         var realtime = _filterChoices.Count(static item => item.Ownership == FilterOwnership.Realtime);
         var baked = _filterChoices.Count(static item => item.Ownership == FilterOwnership.BakeIntoVideo);
         var ignored = _filterChoices.Count(static item => item.Ownership == FilterOwnership.Ignore);
+        var risky = _filterChoices.Count(static item => !string.IsNullOrWhiteSpace(item.RiskHint));
         var unsupportedBake = _filterChoices.Count(static item =>
             item.Ownership == FilterOwnership.BakeIntoVideo && !item.Item.OfflineSupported);
         FilterOwnershipSummaryText.Text = _chart is null
             ? "尚未载入谱面。"
-            : $"共 {_filterChoices.Count:N0} 组 · 保留实时 {realtime:N0} · 烤入视频 {baked:N0} · 忽略 {ignored:N0}" +
+            : $"共 {_filterChoices.Count:N0} 组 · 可能需人工对照 {risky:N0} 组 · 保留实时 {realtime:N0} · 烤入视频 {baked:N0} · 忽略 {ignored:N0}" +
               (unsupportedBake > 0 ? $" · 有 {unsupportedBake:N0} 组尚无离线实现，开始渲染时会阻止并指出。" : "");
     }
 
@@ -576,21 +600,27 @@ public partial class MainWindow : Window
     private IReadOnlySet<int> GetRetainedDecorationIndices()
     {
         IEnumerable<DecorationRetentionItem> retained = CurrentRetentionMode == DecorationRetentionMode.Whitelist
-            ? _decorationChoices.Where(static item => item.IsListed)
-            : _decorationChoices.Where(static item => !item.IsListed);
+            ? _decorationChoices.Where(static item => item.IsListed && !item.IsExcluded)
+            : _decorationChoices.Where(static item => !item.IsListed && !item.IsExcluded);
         return retained.Select(static item => item.Item.Index).ToHashSet();
     }
+
+    private IReadOnlySet<int> GetExcludedDecorationIndices() => _decorationChoices
+        .Where(static item => item.IsExcluded)
+        .Select(static item => item.Item.Index)
+        .ToHashSet();
 
     private void RefreshRetentionSummary()
     {
         if (RetentionExplanationText is null || RetentionCountText is null) return;
         var retainedCount = GetRetainedDecorationIndices().Count;
+        var excludedCount = GetExcludedDecorationIndices().Count;
         RetentionExplanationText.Text = CurrentRetentionMode == DecorationRetentionMode.Whitelist
             ? "勾选的贴图不烘焙进 Video VFX，而是在派生谱面中继续实时显示。"
             : "勾选的贴图仍烘焙进视频；未勾选的贴图留在派生谱面中实时显示。";
         RetentionCountText.Text = _chart is null
             ? "尚未载入谱面"
-            : $"实时保留 {retainedCount:N0} / {_decorationChoices.Count:N0} 个";
+            : $"实时保留 {retainedCount:N0} · 完全隐藏 {excludedCount:N0} / {_decorationChoices.Count:N0} 个";
     }
 
     private void DecorationRetentionList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -970,6 +1000,7 @@ public partial class MainWindow : Window
             }
 
             var retainedDecorationIndices = GetRetainedDecorationIndices();
+            var excludedDecorationIndices = GetExcludedDecorationIndices();
             var bakedFilterKeys = GetBakedFilterKeys();
             var disabledFilterKeys = GetDisabledFilterKeys();
             var unsupportedBake = _filterChoices
@@ -1001,6 +1032,7 @@ public partial class MainWindow : Window
                     TailExtension.FromSeconds(tailSeconds),
                     _durationLimitSeconds,
                     retainedDecorationIndices,
+                    excludedDecorationIndices,
                     bakedFilterKeys,
                     disabledFilterKeys,
                     renderBackend,
@@ -1063,6 +1095,7 @@ public partial class MainWindow : Window
             task.Tail,
             task.DurationLimitSeconds,
             task.RetainedDecorationIndices,
+            task.ExcludedDecorationIndices,
             task.BakedFilterKeys,
             task.DisabledFilterKeys,
             task.RenderBackend,
@@ -1082,8 +1115,8 @@ public partial class MainWindow : Window
         var memoryText = status.WorkingSetBytes > 0
             ? $" · 内存 {status.WorkingSetBytes / 1073741824d:0.00} GB" +
               (status.MemoryLimitBytes > 0
-                  ? $" · 贴图估算 {status.EstimatedTextureBytes / 1073741824d:0.00}/{status.MemoryLimitBytes / 1073741824d:0.##} GB" +
-                    $"（{status.TextureCount:N0} 张，最长边 ≤{status.TextureMaximumSide}px）"
+                  ? $" · 源贴图 {status.EstimatedTextureBytes / 1073741824d:0.00} GB" +
+                    $" · 驻留预算 {status.MemoryLimitBytes / 1073741824d:0.##} GB（{status.TextureCount:N0} 张，原尺寸按需载入）"
                   : " · 贴图不限制") +
               $" · 峰值 {status.PeakWorkingSetBytes / 1073741824d:0.00} GB"
             : "";
@@ -1244,6 +1277,7 @@ public partial class MainWindow : Window
         TailExtension Tail,
         decimal? DurationLimitSeconds,
         IReadOnlySet<int> RetainedDecorationIndices,
+        IReadOnlySet<int> ExcludedDecorationIndices,
         IReadOnlySet<string> BakedFilterKeys,
         IReadOnlySet<string> DisabledFilterKeys,
         RenderBackend RenderBackend,
@@ -1277,6 +1311,7 @@ public partial class MainWindow : Window
     private sealed class DecorationRetentionItem : INotifyPropertyChanged
     {
         private bool _isListed;
+        private bool _isExcluded;
         private BitmapSource? _thumbnail;
         private BitmapSource? _fullImage;
 
@@ -1302,7 +1337,28 @@ public partial class MainWindow : Window
             {
                 if (_isListed == value) return;
                 _isListed = value;
+                if (value && _isExcluded)
+                {
+                    _isExcluded = false;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsExcluded)));
+                }
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsListed)));
+            }
+        }
+
+        public bool IsExcluded
+        {
+            get => _isExcluded;
+            set
+            {
+                if (_isExcluded == value) return;
+                _isExcluded = value;
+                if (value && _isListed)
+                {
+                    _isListed = false;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsListed)));
+                }
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsExcluded)));
             }
         }
     }
@@ -1335,6 +1391,7 @@ public partial class MainWindow : Window
             : $"{Item.TargetType} · {Item.TargetTag}";
         public int FirstFloor => Item.FirstFloor;
         public int InvocationCount => Item.InvocationCount;
+        public string RiskHint => Item.RiskHint;
         public string OfflineStatus => Item.OfflineSupported ? "可离线近似；建议对照确认" : "尚未实现，只能实时或忽略";
         public IReadOnlyList<FilterOwnershipOption> OwnershipChoices => Options;
         public FilterOwnership Ownership

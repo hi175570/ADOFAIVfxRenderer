@@ -25,6 +25,7 @@ public static class DerivedChartExporter
         OutputProfile profile,
         decimal renderStartSeconds = 0m,
         IReadOnlySet<int>? retainedDecorationIndices = null,
+        IReadOnlySet<int>? excludedDecorationIndices = null,
         IReadOnlySet<string>? disabledFilterKeys = null)
     {
         sourceChartPath = Path.GetFullPath(sourceChartPath);
@@ -46,7 +47,11 @@ public static class DerivedChartExporter
         settings["loopVideo"] = false;
         settings["showDefaultBGIfNoImage"] = false;
 
-        var removedDecorations = RemoveBakedDecorations(root, profile, retainedDecorationIndices);
+        var removedDecorations = RemoveBakedDecorations(
+            root,
+            profile,
+            retainedDecorationIndices,
+            excludedDecorationIndices);
         var removedBackgroundEvents = RemoveBakedBackgroundEvents(root);
         var disabledFilterEvents = DisableBakedFilters(root, profile, disabledFilterKeys);
         if (profile == OutputProfile.VideoPro) HideLiveTrackAndPlanets(root);
@@ -85,7 +90,8 @@ public static class DerivedChartExporter
     private static int RemoveBakedDecorations(
         JsonObject root,
         OutputProfile profile,
-        IReadOnlySet<int>? retainedDecorationIndices)
+        IReadOnlySet<int>? retainedDecorationIndices,
+        IReadOnlySet<int>? excludedDecorationIndices)
     {
         if (root["decorations"] is not JsonArray decorations) return 0;
         if (profile is OutputProfile.Video or OutputProfile.VideoPro)
@@ -97,6 +103,12 @@ public static class DerivedChartExporter
         var removed = 0;
         for (var index = decorations.Count - 1; index >= 0; index--)
         {
+            if (excludedDecorationIndices?.Contains(index) == true)
+            {
+                decorations.RemoveAt(index);
+                removed++;
+                continue;
+            }
             if (decorations[index] is not JsonObject decoration ||
                 decoration["eventType"]?.GetValue<string>() is not ("AddDecoration" or "AddParticle"))
             {

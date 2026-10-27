@@ -347,6 +347,7 @@
                                     <Grid Margin="4">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="Auto" />
+                                             <ColumnDefinition Width="Auto" />
                                             <ColumnDefinition Width="76" />
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
@@ -355,7 +356,16 @@
                                                   IsChecked="{Binding IsListed, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                                   Checked="RetentionItem_Checked"
                                                   Unchecked="RetentionItem_Checked" />
-                                        <Border Grid.Column="1"
+                                         <CheckBox Grid.Column="1"
+                                                   Margin="0,0,10,0"
+                                                   VerticalAlignment="Center"
+                                                   Foreground="{StaticResource WarningText}"
+                                                   IsChecked="{Binding IsExcluded, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                   Checked="RetentionItem_Checked"
+                                                   Unchecked="RetentionItem_Checked"
+                                                   ToolTip="完全隐藏：不渲染进视频，也不保留在派生谱面"
+                                                   Content="隐藏" />
+                                         <Border Grid.Column="2"
                                                 Width="68"
                                                 Height="48"
                                                 Background="{StaticResource TransparencyGrid}"
@@ -366,7 +376,7 @@
                                                    Stretch="Uniform"
                                                    RenderOptions.BitmapScalingMode="HighQuality" />
                                         </Border>
-                                        <StackPanel Grid.Column="2" Margin="10,0,0,0">
+                                         <StackPanel Grid.Column="3" Margin="10,0,0,0">
                                             <TextBlock FontWeight="SemiBold"
                                                        Text="{Binding DisplayName}"
                                                        TextTrimming="CharacterEllipsis" />
@@ -551,6 +561,11 @@
                                        Foreground="{StaticResource TextSecondary}"
                                        TextWrapping="Wrap"
                                        Text="默认保留实时：滤镜仍由游戏处理。烤入视频：独立 Worker 预渲染，并在派生谱面中自动关闭。忽略：不渲染，并在派生谱面中关闭。原谱永不修改。" />
+                             <TextBlock x:Name="VisualRiskSummaryText"
+                                        Margin="0,10,0,0"
+                                        Foreground="{StaticResource WarningText}"
+                                        TextWrapping="Wrap"
+                                        Text="尚未载入谱面。" />
                         </StackPanel>
                         <Border Grid.Row="2"
                                 Background="{StaticResource PanelBackground}"
@@ -574,6 +589,7 @@
                                     <DataGridTextColumn Width="150" Header="作用对象" Binding="{Binding TargetDescription}" IsReadOnly="True" />
                                     <DataGridTextColumn Width="80" Header="首次格" Binding="{Binding FirstFloor}" IsReadOnly="True" />
                                     <DataGridTextColumn Width="70" Header="次数" Binding="{Binding InvocationCount}" IsReadOnly="True" />
+                                    <DataGridTextColumn Width="250" Header="可能出问题的位置" Binding="{Binding RiskHint}" IsReadOnly="True" />
                                     <DataGridTemplateColumn Width="180" Header="处理方式">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -622,7 +638,7 @@
                                 <TextBlock Margin="0,7,0,0"
                                            Foreground="{StaticResource TextSecondary}"
                                            TextWrapping="Wrap"
-                                           Text="不限制会保留原版完整贴图。限制模式按当前谱面引用的贴图尺寸计算统一缩放上限，只修改临时 Worker 缓存，不改游戏文件或源谱；任务逐张载入，不会先把全部素材解码到内存。" />
+                                           Text="两种模式都保留原图分辨率。限制模式用小型不可见占位图建立场景，只在贴图进入当前画面时解码原图，并按预算回收离场贴图；不改游戏文件或源谱，也不会预先把全部素材解码到内存。" />
                             </StackPanel>
                             <StackPanel Grid.Column="2">
                                 <TextBlock Text="贴图预算（GB）" />
@@ -632,7 +648,7 @@
                                 <TextBlock Margin="0,7,0,0"
                                            Foreground="{StaticResource TextSecondary}"
                                            TextWrapping="Wrap"
-                                           Text="默认 4 GB。这里只计算常驻解码贴图；进程、场景和编码器内存另计，并在任务状态单独显示实际峰值。" />
+                                           Text="默认 4 GB。这里只限制当前常驻的全分辨率解码贴图；若同一帧必需贴图超过预算会明确报警，不会偷偷降画质。进程、场景和编码器内存另计。" />
                             </StackPanel>
                         </Grid>
                     </GroupBox>

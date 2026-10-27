@@ -20,12 +20,14 @@ internal sealed class RenderWorkerClient : IDisposable
     private OutputProfile _activeProfile;
     private decimal _activeRenderStartSeconds;
     private IReadOnlySet<int> _activeRetainedDecorationIndices = new HashSet<int>();
+    private IReadOnlySet<int> _activeExcludedDecorationIndices = new HashSet<int>();
     private IReadOnlySet<string> _activeDisabledFilterKeys = new HashSet<string>();
     private bool _derivedExportAttempted;
     private long _activeMemoryLimitBytes;
     private long _activeEstimatedTextureBytes;
     private int _activeTextureCount;
-    private int _activeTextureMaximumSide;
+    private int _activePlaceholderMaximumSide;
+    private string? _temporaryRenderChartPath;
     private string _activeJobId = "";
 
     public RenderWorkerClient()
@@ -53,6 +55,7 @@ internal sealed class RenderWorkerClient : IDisposable
         TailExtension tail,
         decimal? durationLimitSeconds = null,
         IReadOnlySet<int>? retainedDecorationIndices = null,
+        IReadOnlySet<int>? excludedDecorationIndices = null,
         IReadOnlySet<string>? bakedFilterKeys = null,
         IReadOnlySet<string>? disabledFilterKeys = null,
         RenderBackend renderBackend = RenderBackend.Automatic,
@@ -78,16 +81,13 @@ internal sealed class RenderWorkerClient : IDisposable
 
         ValidateStandaloneWorker(workerExecutable, installation.RootDirectory);
         var textureBudgetPlan = memoryLimitMb > 0
-            ? TextureBudgetCalculator.Calculate(
-                chart.Path,
-                memoryLimitMb,
-                Math.Max(variant.Resolution.Width, variant.Resolution.Height))
+            ? TextureBudgetCalculator.Calculate(chart.Path, memoryLimitMb)
             : null;
-        var textureMaximumSide = textureBudgetPlan?.MaximumSide ?? 0;
+        var placeholderMaximumSide = textureBudgetPlan?.PlaceholderMaximumSide ?? 0;
         workerExecutable = EnsureGameResourceWorker(
             workerExecutable,
             installation.DataDirectory ?? throw new InvalidOperationException("游戏安装缺少 Data 目录。"),
-            textureMaximumSide);
+            placeholderMaximumSide);
         var ffmpegPath = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe");
         var resolvedBackend = ResolveBackend(renderBackend, ffmpegPath);
         var usesOfflineFilters = variant.Content.HasFlag(RenderContent.Filters) || bakedFilterKeys?.Count > 0;
@@ -100,6 +100,12 @@ internal sealed class RenderWorkerClient : IDisposable
         }
 
         var renderStartSeconds = DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
+        CleanupTemporaryRenderChart();
+        var renderChartPath = variant.Profile == OutputProfile.VideoPro
+            ? RenderChartSanitizer.CreateTemporaryCopy(chart.Path, excludedDecorationIndices)
+            : chart.Path;
+        if (!Path.GetFullPath(renderChartPath).Equals(Path.GetFullPath(chart.Path), StringComparison.OrdinalIgnoreCase))
+            _temporaryRenderChartPath = renderChartPath;
         var layout = RenderOutputLayout.Create(chart.Path, variant.Profile);
         var outputDirectory = layout.OutputDirectory;
         var previewDirectory = layout.PreviewDirectory;
@@ -111,7 +117,7 @@ internal sealed class RenderWorkerClient : IDisposable
         var job = new WorkerJob
         {
             JobId = Guid.NewGuid().ToString("N"),
-            ChartPath = chart.Path,
+            ChartPath = renderChartPath,
             OutputPath = outputPath,
             StatusPath = _statusPath,
             PreviewDirectory = previewDirectory,
@@ -129,6 +135,7 @@ internal sealed class RenderWorkerClient : IDisposable
             IncludeBackgroundDecorations = variant.Content.HasFlag(RenderContent.BackgroundDecorations),
             IncludeForegroundDecorations = variant.Content.HasFlag(RenderContent.ForegroundDecorations),
             RetainedDecorationIndices = retainedDecorationIndices?.OrderBy(static index => index).ToArray() ?? [],
+            ExcludedDecorationIndices = excludedDecorationIndices?.OrderBy(static index => index).ToArray() ?? [],
             BitrateKbps = variant.BitrateKbps,
             DurationLimitSeconds = durationLimitSeconds.HasValue ? (float)durationLimitSeconds.Value : 0f,
             RenderStartSeconds = (float)renderStartSeconds,
@@ -138,7 +145,8 @@ internal sealed class RenderWorkerClient : IDisposable
                 "Managed"),
             VideoEncoder = resolvedBackend.VideoEncoder,
             EncoderPreset = resolvedBackend.EncoderPreset,
-            TextureMaximumSide = textureMaximumSide,
+            PlaceholderMaximumSide = placeholderMaximumSide,
+            TextureMemoryBudgetBytes = memoryLimitMb > 0 ? memoryLimitMb * 1024L * 1024L : 0L,
         };
         var jobPath = layout.JobPath;
         if (File.Exists(_statusPath)) File.Delete(_statusPath);
@@ -153,19 +161,25 @@ internal sealed class RenderWorkerClient : IDisposable
         _activeRetainedDecorationIndices = retainedDecorationIndices is null
             ? new HashSet<int>()
             : new HashSet<int>(retainedDecorationIndices);
+        _activeExcludedDecorationIndices = excludedDecorationIndices is null
+            ? new HashSet<int>()
+            : new HashSet<int>(excludedDecorationIndices);
         _activeDisabledFilterKeys = disabledFilterKeys is null
             ? new HashSet<string>()
             : new HashSet<string>(disabledFilterKeys, StringComparer.Ordinal);
         _derivedExportAttempted = false;
         _activeMemoryLimitBytes = memoryLimitMb > 0 ? memoryLimitMb * 1024L * 1024L : 0L;
-        _activeEstimatedTextureBytes = textureBudgetPlan?.EstimatedBytes ?? 0L;
+        _activeEstimatedTextureBytes = textureBudgetPlan?.FullResolutionBytes ?? 0L;
         _activeTextureCount = textureBudgetPlan?.TextureCount ?? 0;
-        _activeTextureMaximumSide = textureMaximumSide;
+        _activePlaceholderMaximumSide = placeholderMaximumSide;
 
         var workerLogPath = layout.WorkerLogPath;
         var useInstalledGameRuntime = variant.Profile == OutputProfile.VideoPro;
         var installedRuntimeArguments = useInstalledGameRuntime
-            ? $" --render-installed-game --chart \"{chart.Path}\""
+            ? $" --render-installed-game --chart \"{renderChartPath}\""
+            : "";
+        var memoryDiagnosticArguments = Environment.GetCommandLineArgs().Contains("--diagnose-memory")
+            ? " --diagnose-memory"
             : "";
         var startInfo = new ProcessStartInfo
         {
@@ -179,7 +193,7 @@ internal sealed class RenderWorkerClient : IDisposable
             // Unity's normal player mode can create a visible top-level window even when
             // ProcessWindowStyle.Hidden is requested. Batch mode keeps the render device
             // available (unlike -nographics) without opening a second game-like window.
-            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\"{installedRuntimeArguments} -screen-fullscreen 0 -screen-width {internalWidth} -screen-height {internalHeight} {resolvedBackend.UnityArguments}",
+            Arguments = $"-batchmode -logFile \"{workerLogPath}\" --job \"{jobPath}\"{installedRuntimeArguments}{memoryDiagnosticArguments} -screen-fullscreen 0 -screen-width {internalWidth} -screen-height {internalHeight} {resolvedBackend.UnityArguments}",
         };
         _workerProcess = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动独立 Unity Worker。");
         _timer.Start();
@@ -191,7 +205,7 @@ internal sealed class RenderWorkerClient : IDisposable
             MemoryLimitBytes = _activeMemoryLimitBytes,
             EstimatedTextureBytes = _activeEstimatedTextureBytes,
             TextureCount = _activeTextureCount,
-            TextureMaximumSide = _activeTextureMaximumSide,
+            PlaceholderMaximumSide = _activePlaceholderMaximumSide,
         });
         return outputPath;
     }
@@ -219,6 +233,7 @@ internal sealed class RenderWorkerClient : IDisposable
         _timer.Stop();
         _timer.Tick -= PollStatus;
         _workerProcess?.Dispose();
+        CleanupTemporaryRenderChart();
     }
 
     private void PollStatus(object? sender, EventArgs e)
@@ -243,7 +258,7 @@ internal sealed class RenderWorkerClient : IDisposable
                         status.MemoryLimitBytes = _activeMemoryLimitBytes;
                         status.EstimatedTextureBytes = _activeEstimatedTextureBytes;
                         status.TextureCount = _activeTextureCount;
-                        status.TextureMaximumSide = _activeTextureMaximumSide;
+                        status.PlaceholderMaximumSide = _activePlaceholderMaximumSide;
                         if (_workerProcess is { HasExited: false })
                         {
                             _workerProcess.Refresh();
@@ -263,6 +278,7 @@ internal sealed class RenderWorkerClient : IDisposable
                                     _activeProfile,
                                     _activeRenderStartSeconds,
                                     retainedDecorationIndices,
+                                    _activeExcludedDecorationIndices,
                                     _activeDisabledFilterKeys);
                                 status.DerivedChartPath = derived.ChartPath;
                                 status.VideoOffsetMilliseconds = derived.VideoOffsetMilliseconds;
@@ -280,6 +296,7 @@ internal sealed class RenderWorkerClient : IDisposable
                         if (status.State is "complete" or "failed" or "cancelled")
                         {
                             _timer.Stop();
+                            CleanupTemporaryRenderChart();
                             if (status.State is "failed" or "cancelled")
                                 CleanupTemporaryVideos(status.OutputPath);
                         }
@@ -306,6 +323,24 @@ internal sealed class RenderWorkerClient : IDisposable
         {
             // Worker 可能正在原子替换状态文件；下一次轮询会重新读取。
         }
+    }
+
+    private void CleanupTemporaryRenderChart()
+    {
+        if (string.IsNullOrWhiteSpace(_temporaryRenderChartPath)) return;
+        try
+        {
+            if (File.Exists(_temporaryRenderChartPath)) File.Delete(_temporaryRenderChartPath);
+        }
+        catch (IOException)
+        {
+            return;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return;
+        }
+        _temporaryRenderChartPath = null;
     }
 
     private static void CleanupTemporaryVideos(string? outputPath)
@@ -380,7 +415,7 @@ internal sealed class RenderWorkerClient : IDisposable
     internal static string EnsureGameResourceWorker(
         string workerExecutable,
         string gameDataDirectory,
-        int textureMaximumSide = 0)
+        int placeholderMaximumSide = 0)
     {
         var workerDirectory = Path.GetDirectoryName(Path.GetFullPath(workerExecutable))
             ?? throw new InvalidOperationException("无法确定独立 Worker 的目录。");
@@ -419,7 +454,7 @@ internal sealed class RenderWorkerClient : IDisposable
             FileIdentity(gameResources),
             FileIdentity(Path.Combine(gameData, "globalgamemanagers")),
             FileIdentity(patchTool),
-            textureMaximumSide.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            placeholderMaximumSide.ToString(System.Globalization.CultureInfo.InvariantCulture),
         });
         var cacheKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..20];
         var cacheRoot = Path.Combine(
@@ -470,14 +505,13 @@ internal sealed class RenderWorkerClient : IDisposable
             var temporaryExecutable = Path.Combine(temporaryDirectory, Path.GetFileName(workerExecutable));
             if (!File.Exists(temporaryExecutable))
                 throw new InvalidOperationException("资源准备器完成后没有生成 Worker 可执行文件。");
-            if (textureMaximumSide > 0)
+            if (placeholderMaximumSide > 0)
             {
-                ManagedGameAssemblyPatcher.ApplyTextureLimit(
+                ManagedGameAssemblyPatcher.ApplyDynamicTextureStreaming(
                     Path.Combine(
                         temporaryDirectory,
                         Path.GetFileNameWithoutExtension(workerExecutable) + "_Data",
-                        "Managed"),
-                    textureMaximumSide);
+                        "Managed"));
             }
             try
             {
@@ -665,6 +699,9 @@ internal sealed class WorkerJob
     [JsonPropertyName("retainedDecorationIndices")]
     public int[] RetainedDecorationIndices { get; init; } = [];
 
+    [JsonPropertyName("excludedDecorationIndices")]
+    public int[] ExcludedDecorationIndices { get; init; } = [];
+
     [JsonPropertyName("bitrateKbps")]
     public int BitrateKbps { get; init; }
 
@@ -686,8 +723,11 @@ internal sealed class WorkerJob
     [JsonPropertyName("encoderPreset")]
     public string EncoderPreset { get; init; } = "";
 
-    [JsonPropertyName("textureMaximumSide")]
-    public int TextureMaximumSide { get; init; }
+    [JsonPropertyName("placeholderMaximumSide")]
+    public int PlaceholderMaximumSide { get; init; }
+
+    [JsonPropertyName("textureMemoryBudgetBytes")]
+    public long TextureMemoryBudgetBytes { get; init; }
 }
 
 internal sealed class WorkerStatus
@@ -745,5 +785,5 @@ internal sealed class WorkerStatus
 
     public int TextureCount { get; set; }
 
-    public int TextureMaximumSide { get; set; }
+    public int PlaceholderMaximumSide { get; set; }
 }

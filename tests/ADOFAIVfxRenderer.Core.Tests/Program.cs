@@ -28,8 +28,11 @@ var tests = new (string Name, Action Run)[]
     ("Derived Video ownership", DerivedVideoOwnership),
     ("Derived Video Pro ownership", DerivedVideoProOwnership),
     ("Derived chart retains selected decoration", DerivedChartRetainsSelectedDecoration),
+    ("Derived chart completely hides selected decoration", DerivedChartCompletelyHidesSelectedDecoration),
+    ("Render chart sanitizer removes only selected decoration", RenderChartSanitizerRemovesOnlySelectedDecoration),
     ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
     ("Filter catalog groups by target", FilterCatalogGroupsByTarget),
+    ("Visual risk analyzer finds missing assets and split effects", VisualRiskAnalyzerFindsMissingAssetsAndSplitEffects),
     ("Texture catalog finds unique referenced files", TextureCatalogFindsUniqueReferencedFiles),
     ("Derived chart disables selected filters", DerivedChartDisablesSelectedFilters),
     ("Canonical render output layout", CanonicalRenderOutputLayout),
@@ -519,6 +522,84 @@ static void DerivedChartRetainsSelectedDecoration()
     }
 }
 
+static void DerivedChartCompletelyHidesSelectedDecoration()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-excluded-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var videoPath = Path.Combine(root, "render.mp4");
+        File.WriteAllBytes(videoPath, [1]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "warning.png", "depth": 5},
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "keep-live.png", "depth": -5}
+          ]
+        }
+        """);
+
+        var result = DerivedChartExporter.Export(
+            chartPath,
+            videoPath,
+            OutputProfile.VideoVfx,
+            retainedDecorationIndices: new HashSet<int> { 0, 1 },
+            excludedDecorationIndices: new HashSet<int> { 0 });
+        Equal(1, result.RemovedDecorations);
+        var derived = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(result.ChartPath))!.AsObject();
+        var remaining = derived["decorations"]!.AsArray();
+        False(remaining.Any(node => node?["decorationImage"]?.GetValue<string>() == "warning.png"));
+        True(remaining.Any(node => node?["decorationImage"]?.GetValue<string>() == "keep-live.png"));
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void RenderChartSanitizerRemovesOnlySelectedDecoration()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-sanitized-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var source = """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [],
+          "decorations": [
+            {"eventType": "AddDecoration", "decorationImage": "keep.png"},
+            {"eventType": "AddDecoration", "decorationImage": "warning.png"},
+            {"eventType": "AddText", "decText": "keep text"}
+          ]
+        }
+        """;
+        File.WriteAllText(chartPath, source);
+
+        var temporary = RenderChartSanitizer.CreateTemporaryCopy(chartPath, new HashSet<int> { 1 });
+        True(File.Exists(temporary));
+        Equal(root, Path.GetDirectoryName(temporary));
+        Equal(source, File.ReadAllText(chartPath));
+        var sanitized = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(temporary))!.AsObject();
+        var decorations = sanitized["decorations"]!.AsArray();
+        Equal(2, decorations.Count);
+        True(decorations.Any(node => node?["decorationImage"]?.GetValue<string>() == "keep.png"));
+        False(decorations.Any(node => node?["decorationImage"]?.GetValue<string>() == "warning.png"));
+        True(decorations.Any(node => node?["eventType"]?.GetValue<string>() == "AddText"));
+        File.Delete(temporary);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
 static void DecorationCatalogUsesFirstInvocation()
 {
     var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-catalog-{Guid.NewGuid():N}");
@@ -547,6 +628,40 @@ static void DecorationCatalogUsesFirstInvocation()
         var shown = items.Single(item => item.Tag == "shown");
         Equal(0, shown.ReferenceFloor);
         Near(0d, shown.TimeSeconds, 0.000001d);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void VisualRiskAnalyzerFindsMissingAssetsAndSplitEffects()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-risk-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 2, "eventType": "SetFilterAdvanced", "filter": "A", "plane": "Background"},
+            {"floor": 3, "eventType": "SetFilterAdvanced", "filter": "B", "plane": "Foreground", "targetType": "Decoration", "targetTag": "x"},
+            {"floor": 4, "eventType": "HallOfMirrors", "enabled": true}
+          ],
+          "decorations": [
+            {"floor": 1, "eventType": "AddDecoration", "decorationImage": "missing.png", "maskingType": "Mask"}
+          ]
+        }
+        """);
+
+        var issues = VisualRiskAnalyzer.Analyze(chartPath);
+        True(issues.Any(issue => issue.Title.Contains("缺少", StringComparison.Ordinal)));
+        True(issues.Any(issue => issue.Title.Contains("遮罩", StringComparison.Ordinal)));
+        True(issues.Any(issue => issue.Title.Contains("局部", StringComparison.Ordinal)));
+        True(issues.Any(issue => issue.Title.Contains("Hall", StringComparison.Ordinal)));
     }
     finally
     {

@@ -24,7 +24,7 @@ Video Pro 使用所选游戏安装中的原版 `scnGame` 场景、事件组件�
 - 支持质量预设与自定义码率。
 - 支持结束后继续渲染秒数或帧数，两个输入会自动换算。
 - 支持跨谱面任务队列：当前谱面加入队列后可以立即切换路径，继续加入另一张谱；每项都会冻结自己的游戏目录、谱面、版本、分辨率、帧率、尾帧、滤镜归属和内存策略，再按顺序执行。
-- 支持“不限制”与“限制贴图预算”两种内存策略。限制模式先扫描谱面实际引用素材，只对临时 Worker 中的解码贴图统一缩放；Video Pro 与 Video VFX 都受同一预算控制，不修改游戏文件或源谱。任务状态会把贴图估算和整个进程的实际峰值分开显示。
+- 支持“不限制”与“限制贴图预算”两种内存策略。两种模式都使用原始分辨率贴图；限制模式用小型不可见占位图建立场景，只在贴图进入当前画面时解码原图，并按 LRU 回收离场贴图。Video Pro 与 Video VFX 共用这套驻留预算，不修改游戏文件或源谱；若同一帧的必需贴图本身超过预算，会明确报警而不是偷偷降画质。任务状态会把源贴图总量、驻留预算和整个进程实际峰值分开显示。
 - 支持自动、CPU/WARP、普通 GPU 和 NVIDIA RTX/NVENC 后端。自动模式会实际试编码一帧，依次选择可用的 NVENC、QSV 或 AMF，均不可用时才回到 CPU；显式硬件模式失败时不会静默降级。
 - 界面为深色模式，包含大尺寸实时预览、可滚动任务列表、进度、速度和输出路径。
 - UI 永远不会进入正式输出；Video Pro 可以包含轨道和星球。
@@ -59,7 +59,7 @@ Video Pro 使用所选游戏安装中的原版 `scnGame` 场景、事件组件�
 pwsh -File .\scripts\Build-UnityWorker.ps1
 pwsh -File .\scripts\Build-ResourcePatcher.ps1
 pwsh -File .\scripts\Publish-TestPackage.ps1 -SelfContained
-pwsh -File .\scripts\Build-ReleasePackages.ps1 -Version 0.1.0
+pwsh -File .\scripts\Build-ReleasePackages.ps1 -Version 0.1.3
 dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core.Tests.csproj
 ```
 
@@ -67,17 +67,28 @@ dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core
 
 ## 已验证谱面
 
-当前原版运行时 Video Pro 路径已用以下类型的谱面进行短片段实测：
+当前版本已用以下谱面实测；其中标注“完整”的项目不是短片抽样，而是从第一格到结尾的正式输出：
 
-- INVERSION：大量 `AddObject`、对象动画、轨道、滤镜与玩家星球。
-- Friday：高密度逐帧贴图与图形动画。
-- Camellia - Seagull：横向宽屏滤镜、遮罩、开场聚合线条与运镜。
-- THE STAR SYSTEM'S CALLING：轨道、粒子、复杂高级滤镜和相机效果。
-- 996：Hall of Mirrors、`SetObject` 与遮罩组合。
-- Our Life：高密度遮罩与多组 Hall of Mirrors。
-- MEGAMIX 1：1 GB 贴图预算、1920×1080、60 FPS 的 10 秒原版场景压力测试；600 帧完整输出，H.264 成片参数经 FFprobe 核验。该测试只约束解码贴图预算，进程和场景内存仍会单独增长。
+- [INVERSION](https://tuforums.com/levels/17017)：大量 `AddObject`、对象动画、轨道、滤镜与玩家星球。
+- [Friday](https://tuforums.com/levels/17111)：高密度逐帧贴图与图形动画。
+- [Camellia - Seagull](https://tuforums.com/levels/12421)：横向宽屏滤镜、遮罩、开场聚合线条与运镜。
+- [THE STAR SYSTEM'S CALLING](https://tuforums.com/levels/15708)：轨道、粒子、复杂高级滤镜和相机效果。已对 327 Combo 附近做 35 秒闭环：先生成 Video VFX 与派生谱面，再由原版运行时逐帧播放背景视频并合成实时轨道、粒子和滤镜；蓝色隧道、环状残影与碎片均保留，没有再出现黑底或整屏炸白。原版 `VideoPlayer` 在离线渲染时会按谱面时间逐帧定位，而不是按墙钟速度播放。
+- [Our Life](https://tuforums.com/levels/12613)：高密度遮罩与多组 Hall of Mirrors。
+- [PLUM MEGAMIX](https://tuforums.com/levels/6337)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 599.683 秒和 598.183 秒；另以 1 GB 贴图预算做原版场景压力测试，并用本机案例视频按场景时序对照，不只与渲染器旧输出互比。
+- [PLUM MEGAMIX 2](https://tuforums.com/levels/840)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 694.000 秒和 692.500 秒。
+- [Megamix 2.5](https://tuforums.com/levels/2163)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 740.367 秒和 738.867 秒。
+- [Megamix 2.7（Ciforance remake）](https://tuforums.com/levels/12465)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 611.567 秒和 609.967 秒。
+- [A School of Fish](https://tuforums.com/levels/4148)：Video Pro 与 Video VFX 的 1080p60 短片段实测。
+- [Black Knife（nerdexample remix）](https://tuforums.com/levels/16914)：Video Pro 与 Video VFX 的 1080p60 短片段实测；人工将游玩警告图设为“完全隐藏”后，视频与派生谱面均不再包含该装饰。
+- [Circles In Ruin](https://tuforums.com/levels/8978)：Video Pro 与 Video VFX 的 1080p60、1 GB 贴图预算、30 秒压力片段及派生谱闭环实测。当前 TUF CDN 包与页面所列旧 Google Drive 包字节完全相同，但都缺少谱面实际引用的 70 个素材文件；程序会在开始前列出缺失数量与首个风险格，现有包中不存在的画面不冒充已经还原。
 
-逐帧热点优化采用同一 MM1 10 秒、1 GB、1080p60、QSV 条件做 A/B：Video Pro 从 34.72 提升到 43.90 帧/秒（约 +26.4%），Video VFX 从 31.91 提升到 33.07 帧/秒（约 +3.6%）。Video VFX 两条短片解码后 SSIM 为 1.000000；Video Pro 含原版运行时非确定性粒子与反馈，抽帧构图一致，但不同运行之间不承诺逐像素相同。具体速度仍取决于谱面和硬件。
+以下 TUF 页面已收录为后续回归参考，但本版本不把它们写成已经逐一复验：
+
+- [Parallel Universe Shifter](https://tuforums.com/levels/6066)
+
+逐帧热点优化采用同一 MM1 10 秒、1 GB、1080p60、QSV 条件做 A/B：Video Pro 从 34.72 提升到 43.90 帧/秒（约 +26.4%），Video VFX 从 31.91 提升到 33.07 帧/秒（约 +3.6%）。最新的全分辨率动态载入复验中，Video Pro 的流式贴图峰值为 537,459,052 字节，另有 59,484,816 字节初始化遮罩常驻，Worker 峰值工作集为 2.364 GiB；Video VFX 的贴图峰值为 446,586,260 字节，Worker 峰值工作集为 1.287 GiB。两条路径都没有触发 1 GiB 贴图预算警报。Video VFX 修改前后短片的解码 SSIM 为 0.999800；Video Pro 含原版运行时非确定性粒子与反馈，抽帧构图一致，但不同运行之间不承诺逐像素相同。贴图预算不是进程硬上限，具体速度与峰值仍取决于谱面和硬件。
+
+跨谱面队列已用 A School of Fish 的 Video Pro 和 Black Knife 的 Video VFX 顺序实跑：第一张完成后自动切换第二张，两个任务使用各自冻结的谱面路径与渲染参数，队列结束后程序自动退出。
 
 构建成功和自动测试通过只代表工程门槛通过；复杂谱面仍应将生成片段与同一游戏安装的原版画面对照确认。
 

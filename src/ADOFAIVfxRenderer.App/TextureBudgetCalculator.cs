@@ -5,17 +5,20 @@ using ADOFAIVfxRenderer.Core;
 namespace ADOFAIVfxRenderer.App;
 
 internal sealed record TextureBudgetPlan(
-    int MaximumSide,
+    int PlaceholderMaximumSide,
     int TextureCount,
-    long EstimatedBytes,
+    long FullResolutionBytes,
     long BudgetBytes);
 
 internal static class TextureBudgetCalculator
 {
+    // Placeholders are never written to the video. They only let the original game
+    // instantiate a decoration without decoding its source image up front.
+    private const int PlaceholderMaximumSide = 16;
+
     public static TextureBudgetPlan Calculate(
         string chartPath,
-        int budgetMb,
-        int outputMaximumSide)
+        int budgetMb)
     {
         if (budgetMb <= 0)
             return new TextureBudgetPlan(0, 0, 0, 0);
@@ -24,22 +27,12 @@ internal static class TextureBudgetCalculator
             .ToArray();
         var budgetBytes = budgetMb * 1024L * 1024L;
         if (textures.Length == 0)
-            return new TextureBudgetPlan(outputMaximumSide, 0, 0, budgetBytes);
+            return new TextureBudgetPlan(PlaceholderMaximumSide, 0, 0, budgetBytes);
 
-        var usableBudget = (long)(budgetBytes * 0.9d);
-        var low = 1;
-        var high = Math.Max(low, outputMaximumSide);
-        while (low < high)
-        {
-            var middle = low + (high - low + 1) / 2;
-            if (EstimateBytes(textures, middle) <= usableBudget) low = middle;
-            else high = middle - 1;
-        }
-        var aligned = low >= 16 ? low / 16 * 16 : low;
         return new TextureBudgetPlan(
-            aligned,
+            PlaceholderMaximumSide,
             textures.Length,
-            EstimateBytes(textures, aligned),
+            EstimateFullResolutionBytes(textures),
             budgetBytes);
     }
 
@@ -62,16 +55,19 @@ internal static class TextureBudgetCalculator
         }
     }
 
-    private static long EstimateBytes(IEnumerable<(int Width, int Height)> textures, int maximumSide)
+    private static long EstimateFullResolutionBytes(IEnumerable<(int Width, int Height)> textures)
     {
         long total = 0;
         foreach (var texture in textures)
         {
-            var sourceMaximum = Math.Max(texture.Width, texture.Height);
-            var scale = sourceMaximum <= maximumSide ? 1d : maximumSide / (double)sourceMaximum;
-            var width = Math.Max(1, (int)Math.Round(texture.Width * scale));
-            var height = Math.Max(1, (int)Math.Round(texture.Height * scale));
-            total = checked(total + (long)width * height * 4L);
+            try
+            {
+                total = checked(total + (long)texture.Width * texture.Height * 4L);
+            }
+            catch (OverflowException)
+            {
+                return long.MaxValue;
+            }
         }
         return total;
     }

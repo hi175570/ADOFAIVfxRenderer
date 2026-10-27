@@ -39,6 +39,7 @@ dotnet publish `
     -c $Configuration `
     -r win-x64 `
     --self-contained $selfContainedValue `
+    -p:NuGetAudit=false `
     -o $publishRoot
 if ($LASTEXITCODE -ne 0) {
     throw "Desktop publish failed with exit code $LASTEXITCODE."

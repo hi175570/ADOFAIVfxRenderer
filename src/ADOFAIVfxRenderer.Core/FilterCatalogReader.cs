@@ -18,7 +18,8 @@ public sealed record FilterCatalogItem(
     string TargetTag,
     int FirstFloor,
     int InvocationCount,
-    bool OfflineSupported);
+    bool OfflineSupported,
+    string RiskHint);
 
 public static class FilterCatalogReader
 {
@@ -30,6 +31,13 @@ public static class FilterCatalogReader
     public static IReadOnlyList<FilterCatalogItem> Read(string chartPath)
     {
         var root = AdoJson.ParseObject(File.ReadAllText(Path.GetFullPath(chartPath)));
+        var hasMasking = (root["decorations"] as JsonArray ?? [])
+            .OfType<JsonObject>()
+            .Any(static decoration =>
+            {
+                var masking = Text(decoration, "maskingType", "None");
+                return !masking.Equals("None", StringComparison.OrdinalIgnoreCase) && masking.Length > 0;
+            });
         var groups = new Dictionary<string, MutableFilter>(StringComparer.Ordinal);
         foreach (var action in (root["actions"] as JsonArray ?? []).OfType<JsonObject>())
         {
@@ -70,9 +78,10 @@ public static class FilterCatalogReader
             .OrderBy(static group => group.FirstFloor)
             .ThenBy(static group => group.EventType, StringComparer.Ordinal)
             .ThenBy(static group => group.DisplayName, StringComparer.Ordinal)
-            .Select(static group => new FilterCatalogItem(
+            .Select(group => new FilterCatalogItem(
                 group.Key, group.EventType, group.DisplayName, group.Plane, group.TargetType,
-                group.TargetTag, group.FirstFloor, group.InvocationCount, group.OfflineSupported))
+                group.TargetTag, group.FirstFloor, group.InvocationCount, group.OfflineSupported,
+                CreateRiskHint(group, hasMasking)))
             .ToArray();
     }
 
@@ -104,6 +113,28 @@ public static class FilterCatalogReader
         if (eventType != "SetFilterAdvanced") return true;
         return Text(action, "targetType", "Camera").Equals("Camera", StringComparison.OrdinalIgnoreCase) &&
                string.IsNullOrWhiteSpace(Text(action, "targetTag"));
+    }
+
+    private static string CreateRiskHint(MutableFilter filter, bool hasMasking)
+    {
+        var hints = new List<string>();
+        if (filter.EventType == "HallOfMirrors")
+            hints.Add("历史帧反馈");
+        if (filter.EventType == "SetFilterAdvanced")
+        {
+            if (filter.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase))
+                hints.Add("背景层滤镜");
+            else if (filter.Plane.Equals("Foreground", StringComparison.OrdinalIgnoreCase))
+                hints.Add("前景层滤镜");
+            if (!filter.TargetType.Equals("Camera", StringComparison.OrdinalIgnoreCase) ||
+                !string.IsNullOrWhiteSpace(filter.TargetTag))
+                hints.Add("局部/标签目标");
+            if (hasMasking) hints.Add("谱面含遮罩，需检查合成顺序");
+        }
+        if (filter.EventType is "ScreenTile" or "ScreenScroll")
+            hints.Add("画面坐标变换");
+        if (!filter.OfflineSupported) hints.Add("无法单独离线近似");
+        return string.Join("；", hints.Distinct(StringComparer.Ordinal));
     }
 
     private sealed class MutableFilter

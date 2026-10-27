@@ -6,7 +6,9 @@ using System.Linq;
 using System.Reflection;
 using Newtonsoft.Json;
 using UnityEngine;
+using UnityEngine.Profiling;
 using UnityEngine.SceneManagement;
+using UnityEngine.Video;
 using Debug = UnityEngine.Debug;
 
 namespace ADOFAIVfxWorker
@@ -16,6 +18,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
     private static Canvas[]? _canvasCache;
     private static Camera[]? _originalCameraCache;
     private static OriginalTimelineAccess? _timelineAccess;
+    private static int _videoSyncDiagnostics;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Boot()
@@ -55,6 +58,24 @@ internal sealed class GameSceneProbe : MonoBehaviour
     private IEnumerator StartCore()
     {
         PrepareInstalledRuntime();
+        var configuredChartPath = GetArgument("--chart");
+        if (!string.IsNullOrWhiteSpace(configuredChartPath))
+        {
+            var configuredPlaceholderMaximumSide = 0;
+            long configuredBudgetBytes = 0;
+            var configuredJobPath = GetArgument("--job");
+            if (!string.IsNullOrWhiteSpace(configuredJobPath) && File.Exists(configuredJobPath))
+            {
+                var configuredJob = JsonConvert.DeserializeObject<InstalledWorkerJob>(
+                    File.ReadAllText(configuredJobPath));
+                configuredPlaceholderMaximumSide = configuredJob?.placeholderMaximumSide ?? 0;
+                configuredBudgetBytes = configuredJob?.textureMemoryBudgetBytes ?? 0;
+            }
+            DynamicTextureStreaming.Configure(
+                configuredChartPath,
+                configuredPlaceholderMaximumSide,
+                configuredBudgetBytes);
+        }
         var operation = SceneManager.LoadSceneAsync(1, LoadSceneMode.Additive);
         if (operation == null) throw new InvalidOperationException("Installed scnGame scene was not registered at build index 1.");
         operation.allowSceneActivation = false;
@@ -163,7 +184,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
                     ? parsedTime
                     : 0f;
                 yield return StartOriginalPlayback(assembly, 60);
-                yield return AdvanceOriginalPlayback(scene, assembly, frameTime, 60);
+                yield return AdvanceOriginalPlayback(scene, assembly, null, frameTime, 60);
                 foreach (var canvas in FindObjectsByType<Canvas>(FindObjectsInactive.Include, FindObjectsSortMode.None))
                     canvas.enabled = false;
                 LogOriginalFrameState(assembly, frameTime);
@@ -371,26 +392,114 @@ internal sealed class GameSceneProbe : MonoBehaviour
         Debug.Log("GAME_SCENE_PLAYBACK original load/play/start lifecycle ready");
     }
 
-    private static IEnumerator AdvanceOriginalPlayback(Scene scene, Assembly assembly, float targetSeconds, int framesPerSecond)
+    private static IEnumerator AdvanceOriginalPlayback(
+        Scene scene,
+        Assembly assembly,
+        DynamicTextureStreaming? textureStreaming,
+        float targetSeconds,
+        int framesPerSecond)
     {
         var frameCount = Math.Max(0, Mathf.CeilToInt(targetSeconds * framesPerSecond));
         var endOfFrame = new WaitForEndOfFrame();
         for (var frame = 0; frame < frameCount; frame++)
         {
-            DriveOriginalTimeline(assembly, frame / (double)framesPerSecond);
+            var time = frame / (double)framesPerSecond;
+            DriveOriginalTimeline(assembly, time);
+            yield return SynchronizeBackgroundVideo(assembly, time);
             DisableAllCanvases();
             yield return endOfFrame;
+            textureStreaming?.Update();
             RenderOriginalScene(scene);
+            textureStreaming?.CaptureVisibility();
         }
         DriveOriginalTimeline(assembly, targetSeconds);
+        yield return SynchronizeBackgroundVideo(assembly, targetSeconds);
         DisableAllCanvases();
         yield return endOfFrame;
+        textureStreaming?.Update();
         RenderOriginalScene(scene);
+        textureStreaming?.CaptureVisibility();
     }
 
     private static void DriveOriginalTimeline(Assembly assembly, double songTimeSeconds)
     {
         (_timelineAccess ??= new OriginalTimelineAccess(assembly)).Seek(songTimeSeconds);
+    }
+
+    private static IEnumerator SynchronizeBackgroundVideo(Assembly assembly, double songTimeSeconds)
+    {
+        var timeline = _timelineAccess ??= new OriginalTimelineAccess(assembly);
+        if (!timeline.TryGetBackgroundVideoTime(songTimeSeconds, out var video, out var videoTime))
+            yield break;
+
+        if (!video.isPrepared)
+        {
+            video.Prepare();
+            for (var frame = 0; frame < 600 && !video.isPrepared; frame++) yield return null;
+            if (!video.isPrepared)
+                throw new InvalidOperationException($"Background video did not prepare: {video.url}");
+        }
+
+        if (videoTime < 0d)
+        {
+            if (video.isPlaying || video.isPaused) video.Stop();
+            yield break;
+        }
+
+        if (video.isLooping && video.length > 0d)
+            videoTime %= video.length;
+        else if (video.length > 0d)
+            videoTime = Math.Min(videoTime, Math.Max(0d, video.length - 0.000001d));
+
+        if (video.isPlaying) video.Pause();
+        var targetFrame = video.frameRate > 0f
+            ? (long)Math.Floor(videoTime * video.frameRate + 0.000001d)
+            : -1L;
+        if (video.texture != null && targetFrame >= 0L && video.frame >= 0L &&
+            Math.Abs(video.frame - targetFrame) <= 1L)
+        {
+            LogVideoSync(video, songTimeSeconds, videoTime, targetFrame);
+            yield break;
+        }
+
+        var decodedFrameReady = false;
+        void OnFrameReady(VideoPlayer _, long __) => decodedFrameReady = true;
+        video.sendFrameReadyEvents = true;
+        video.frameReady += OnFrameReady;
+        try
+        {
+            video.time = videoTime;
+            video.Play();
+            for (var frame = 0; frame < 180; frame++)
+            {
+                if (decodedFrameReady || (video.texture != null && targetFrame >= 0L && video.frame >= 0L &&
+                                          Math.Abs(video.frame - targetFrame) <= 1L))
+                {
+                    video.Pause();
+                    LogVideoSync(video, songTimeSeconds, videoTime, targetFrame);
+                    yield break;
+                }
+                yield return null;
+            }
+            throw new InvalidOperationException(
+                $"Background video seek timed out at song={songTimeSeconds:0.###}, video={videoTime:0.###}, frame={video.frame}, targetFrame={targetFrame}.");
+        }
+        finally
+        {
+            video.frameReady -= OnFrameReady;
+            if (video.isPlaying) video.Pause();
+        }
+    }
+
+    private static void LogVideoSync(VideoPlayer video, double songTime, double videoTime, long targetFrame)
+    {
+        if (_videoSyncDiagnostics++ > 0) return;
+        Debug.Log(
+            $"GAME_VIDEO_SYNC song={songTime:0.###} video={videoTime:0.###} frame={video.frame}/{targetFrame} " +
+            $"prepared={video.isPrepared} playing={video.isPlaying} paused={video.isPaused} " +
+            $"mode={video.renderMode} camera={video.targetCamera?.name ?? "<null>"} " +
+            $"texture={video.texture?.name ?? "<null>"}:{video.texture?.width}x{video.texture?.height} " +
+            $"targetTexture={video.targetTexture?.name ?? "<null>"} aspect={video.aspectRatio}");
     }
 
     private static void DisableAllCanvases(bool refresh = false)
@@ -605,6 +714,14 @@ internal sealed class GameSceneProbe : MonoBehaviour
         };
         WriteInstalledStatus(job.statusPath, status);
         yield return StartOriginalPlayback(assembly, job.framesPerSecond);
+        using var textureStreaming = DynamicTextureStreaming.Create(
+            assembly,
+            job.chartPath,
+            job.textureMemoryBudgetBytes,
+            job.placeholderMaximumSide);
+        textureStreaming?.Update();
+        if (Environment.GetCommandLineArgs().Contains("--diagnose-memory"))
+            LogMemoryBreakdown("level-ready");
         Directory.CreateDirectory(Path.GetDirectoryName(job.outputPath)!);
         Directory.CreateDirectory(job.previewDirectory);
         var chartDuration = floorCount > 0 && floors != null
@@ -635,14 +752,22 @@ internal sealed class GameSceneProbe : MonoBehaviour
         var endOfFrame = new WaitForEndOfFrame();
         Time.captureFramerate = job.framesPerSecond;
         if (job.renderStartSeconds > 0f)
-            yield return AdvanceOriginalPlayback(scene, assembly, job.renderStartSeconds, job.framesPerSecond);
+            yield return AdvanceOriginalPlayback(
+                scene,
+                assembly,
+                textureStreaming,
+                job.renderStartSeconds,
+                job.framesPerSecond);
         for (var frame = 0; frame < totalFrames; frame++)
         {
             var time = job.renderStartSeconds + frame / (float)job.framesPerSecond;
             DriveOriginalTimeline(assembly, time);
+            yield return SynchronizeBackgroundVideo(assembly, time);
             DisableAllCanvases();
             yield return endOfFrame;
+            textureStreaming?.Update();
             originalTarget = RenderOriginalScene(scene);
+            textureStreaming?.CaptureVisibility();
             var previousActive = RenderTexture.active;
             RenderTexture.active = originalTarget;
             frameTexture.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0, false);
@@ -650,6 +775,8 @@ internal sealed class GameSceneProbe : MonoBehaviour
             var raw = frameTexture.GetRawTextureData();
             ffmpeg.StandardInput.BaseStream.Write(raw, 0, raw.Length);
             var completed = frame + 1;
+            if (Environment.GetCommandLineArgs().Contains("--diagnose-memory") && completed % 600 == 0)
+                LogMemoryBreakdown($"frame-{completed}");
             var speed = completed / Math.Max(0.001, watch.Elapsed.TotalSeconds);
             status.currentFrame = completed;
             status.percent = completed * 100f / totalFrames;
@@ -704,10 +831,68 @@ internal sealed class GameSceneProbe : MonoBehaviour
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
+                RedirectStandardError = true,
             },
         };
         if (!process.Start()) throw new InvalidOperationException("Unable to start FFmpeg.");
+        process.ErrorDataReceived += static (_, args) =>
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data)) Debug.LogWarning("FFMPEG " + args.Data);
+        };
+        process.BeginErrorReadLine();
         return process;
+    }
+
+    private static void LogMemoryBreakdown(string phase)
+    {
+        Debug.Log(
+            $"MEMORY_TOTAL phase={phase} " +
+            $"allocated={Profiler.GetTotalAllocatedMemoryLong()} " +
+            $"reserved={Profiler.GetTotalReservedMemoryLong()} " +
+            $"unusedReserved={Profiler.GetTotalUnusedReservedMemoryLong()} " +
+            $"monoUsed={Profiler.GetMonoUsedSizeLong()} " +
+            $"monoHeap={Profiler.GetMonoHeapSizeLong()} " +
+            $"graphics={Profiler.GetAllocatedMemoryForGraphicsDriver()}");
+        LogObjectMemory<Texture2D>(phase, "Texture2D");
+        LogObjectMemory<RenderTexture>(phase, "RenderTexture");
+        var renderTextureGroups = Resources.FindObjectsOfTypeAll<RenderTexture>()
+            .Where(static item => item != null)
+            .GroupBy(static item => $"{item.name}|{item.width}x{item.height}|{item.format}")
+            .Select(static group => new
+            {
+                Name = group.Key,
+                Count = group.Count(),
+                Bytes = group.Sum(static item => Profiler.GetRuntimeMemorySizeLong(item)),
+            })
+            .OrderByDescending(static group => group.Bytes)
+            .Take(12);
+        foreach (var group in renderTextureGroups)
+            Debug.Log($"MEMORY_RT_GROUP phase={phase} count={group.Count} bytes={group.Bytes} key={group.Name}");
+        LogObjectMemory<Sprite>(phase, "Sprite");
+        LogObjectMemory<Mesh>(phase, "Mesh");
+        LogObjectMemory<Material>(phase, "Material");
+        var materialGroups = Resources.FindObjectsOfTypeAll<Material>()
+            .Where(static item => item != null)
+            .GroupBy(static item => item.shader?.name ?? item.name)
+            .Select(static group => new { Name = group.Key, Count = group.Count() })
+            .OrderByDescending(static group => group.Count)
+            .Take(12);
+        foreach (var group in materialGroups)
+            Debug.Log($"MEMORY_MATERIAL_GROUP phase={phase} count={group.Count} key={group.Name}");
+        LogObjectMemory<AudioClip>(phase, "AudioClip");
+        var transforms = Resources.FindObjectsOfTypeAll<Transform>();
+        Debug.Log($"MEMORY_OBJECTS phase={phase} type=Transform count={transforms.Length}");
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+
+    private static void LogObjectMemory<T>(string phase, string label) where T : UnityEngine.Object
+    {
+        var objects = Resources.FindObjectsOfTypeAll<T>();
+        long bytes = 0;
+        foreach (var item in objects)
+            if (item != null) bytes += Profiler.GetRuntimeMemorySizeLong(item);
+        Debug.Log($"MEMORY_OBJECTS phase={phase} type={label} count={objects.Length} bytes={bytes}");
     }
 
     private static string WriteInstalledPreview(string directory, Texture2D texture, int frame)
@@ -736,6 +921,19 @@ internal sealed class GameSceneProbe : MonoBehaviour
         private readonly FieldInfo? _addOffsetField;
         private readonly FieldInfo? _dspTimeSongField;
         private readonly PropertyInfo? _calibrationProperty;
+        private readonly FieldInfo? _separateCountdownTimeField;
+        private readonly FieldInfo? _crotchetAtStartField;
+        private readonly FieldInfo? _adjustedCountdownTicksField;
+        private readonly PropertyInfo? _adjustedCountdownTicksProperty;
+        private readonly Type _vfxType;
+        private readonly PropertyInfo? _vfxInstanceProperty;
+        private readonly FieldInfo? _vfxInstanceField;
+        private readonly FieldInfo? _videoBackgroundField;
+        private readonly FieldInfo? _videoOffsetField;
+        private readonly Type _customLevelType;
+        private readonly PropertyInfo? _customLevelInstanceProperty;
+        private readonly FieldInfo? _customLevelInstanceField;
+        private readonly FieldInfo? _customLevelVideoBackgroundField;
         private PropertyInfo? _pitchProperty;
 
         public OriginalTimelineAccess(Assembly assembly)
@@ -753,6 +951,35 @@ internal sealed class GameSceneProbe : MonoBehaviour
             _calibrationProperty = conductorType.GetProperty(
                 "calibration_i",
                 BindingFlags.Static | BindingFlags.Public);
+            _separateCountdownTimeField = conductorType.GetField(
+                "separateCountdownTime",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _crotchetAtStartField = conductorType.GetField(
+                "crotchetAtStart",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _adjustedCountdownTicksField = conductorType.GetField(
+                "adjustedCountdownTicks",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _adjustedCountdownTicksProperty = conductorType.GetProperty(
+                "adjustedCountdownTicks",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            _vfxType = assembly.GetType("scrVfxPlus", true)!;
+            _vfxInstanceProperty = _vfxType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public);
+            _vfxInstanceField = _vfxType.GetField("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            _videoBackgroundField = _vfxType.GetField(
+                "videoBG",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _videoOffsetField = _vfxType.GetField(
+                "vidOffset",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _customLevelType = assembly.GetType("scnGame", true)!;
+            _customLevelInstanceProperty = _customLevelType.GetProperty(
+                "instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            _customLevelInstanceField = _customLevelType.GetField(
+                "instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            _customLevelVideoBackgroundField = _customLevelType.GetField(
+                "videoBG", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         }
 
         public void Seek(double songTimeSeconds)
@@ -765,6 +992,41 @@ internal sealed class GameSceneProbe : MonoBehaviour
             _dspTimeSongField?.SetValue(
                 _conductor,
                 AudioSettings.dspTime - calibration - (songTimeSeconds + addOffset) / pitch);
+        }
+
+        public bool TryGetBackgroundVideoTime(
+            double songTimeSeconds,
+            out VideoPlayer video,
+            out double videoTimeSeconds)
+        {
+            var vfx = _vfxInstanceProperty?.GetValue(null) ?? _vfxInstanceField?.GetValue(null);
+            video = _videoBackgroundField?.GetValue(vfx) as VideoPlayer;
+            if (video == null)
+            {
+                var customLevel = _customLevelInstanceProperty?.GetValue(null) ??
+                                  _customLevelInstanceField?.GetValue(null);
+                video = _customLevelVideoBackgroundField?.GetValue(customLevel) as VideoPlayer;
+            }
+            videoTimeSeconds = 0d;
+            if (video == null || !video.gameObject.activeSelf ||
+                (video.clip == null && string.IsNullOrWhiteSpace(video.url)))
+                return false;
+
+            var separateCountdown = Convert.ToBoolean(
+                _separateCountdownTimeField?.GetValue(_conductor) ?? false);
+            var countdownSeconds = 0d;
+            if (separateCountdown)
+            {
+                var crotchetAtStart = Convert.ToDouble(
+                    _crotchetAtStartField?.GetValue(_conductor) ?? 0d);
+                var countdownTicks = Convert.ToDouble(
+                    _adjustedCountdownTicksProperty?.GetValue(_conductor) ??
+                    _adjustedCountdownTicksField?.GetValue(_conductor) ?? 0d);
+                countdownSeconds = crotchetAtStart * countdownTicks;
+            }
+            var videoOffset = Convert.ToDouble(_videoOffsetField?.GetValue(vfx) ?? 0d);
+            videoTimeSeconds = songTimeSeconds - countdownSeconds + videoOffset;
+            return true;
         }
     }
 
@@ -825,6 +1087,8 @@ internal sealed class GameSceneProbe : MonoBehaviour
         public float durationLimitSeconds;
         public float renderStartSeconds;
         public string? videoEncoder;
+        public long textureMemoryBudgetBytes;
+        public int placeholderMaximumSide;
     }
 
     [Serializable]

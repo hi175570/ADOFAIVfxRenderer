@@ -43,7 +43,7 @@ if ($unityProcess.ExitCode -ne 0) {
     throw "Unity Worker build failed with exit code $($unityProcess.ExitCode). See $log"
 }
 
-dotnet build (Join-Path $projectRoot "ADOFAIVfxRenderer.slnx") -c $Configuration
+dotnet build (Join-Path $projectRoot "ADOFAIVfxRenderer.slnx") -c $Configuration -p:NuGetAudit=false
 if ($LASTEXITCODE -ne 0) {
     throw "Desktop build failed with exit code $LASTEXITCODE."
 }
