@@ -60,7 +60,7 @@ public static class FilterCatalogReader
             }
             group.InvocationCount++;
             var active = eventType is "ScreenTile" or "ScreenScroll" ||
-                         action["enabled"]?.GetValue<bool>() != false;
+                         AdoJson.ReadBoolean(action["enabled"], true);
             group.EverActive |= active;
             if (active) group.FirstFloor = Math.Min(group.FirstFloor, action["floor"]?.GetValue<int>() ?? 0);
         }

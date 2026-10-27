@@ -169,18 +169,25 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="10" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="10" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <Button x:Name="StartRenderButton"
+                    <Button x:Name="AddQueueButton"
                             Style="{StaticResource RenderActionButtonStyle}"
-                            Click="StartRender_Click"
-                            Content="开始离线渲染（首测 Video VFX）" />
-                    <Button x:Name="CancelRenderButton"
+                            Click="AddToQueue_Click"
+                            Content="加入渲染队列" />
+                    <Button x:Name="StartRenderButton"
                             Grid.Column="2"
+                            Style="{StaticResource RenderActionButtonStyle}"
+                            Click="StartQueue_Click"
+                            Content="开始队列" />
+                    <Button x:Name="CancelRenderButton"
+                            Grid.Column="4"
                             Padding="16,11"
                             IsEnabled="False"
                             Click="CancelRender_Click"
-                            Content="取消" />
+                            Content="停止当前任务" />
                 </Grid>
             </StackPanel>
         </ScrollViewer>
@@ -224,6 +231,7 @@
                 <TextBlock Text="输出矩阵" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,10" />
                 <ListView x:Name="OutputList"
                           Grid.Row="1"
+                          DisplayMemberPath="Display"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
                           ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                           VirtualizingPanel.IsVirtualizing="True"
@@ -598,7 +606,36 @@
                                Text="设置" />
                     <TextBlock Margin="0,5,0,18"
                                Foreground="{StaticResource TextSecondary}"
-                               Text="后续功能设置会继续放在这个独立页面。" />
+                               Text="队列与低内存渲染会记住这里的设置；加入队列后可切换到其他谱面继续添加。" />
+                    <GroupBox Header="内存策略" Margin="0,0,0,14">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="18" />
+                                <ColumnDefinition Width="160" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Text="Video Pro / Video VFX 贴图内存" />
+                                <ComboBox x:Name="MemoryStrategyBox"
+                                          Margin="0,7,0,0"
+                                          SelectionChanged="MemoryStrategyBox_SelectionChanged" />
+                                <TextBlock Margin="0,7,0,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           TextWrapping="Wrap"
+                                           Text="不限制会保留原版完整贴图。限制模式按当前谱面引用的贴图尺寸计算统一缩放上限，只修改临时 Worker 缓存，不改游戏文件或源谱；任务逐张载入，不会先把全部素材解码到内存。" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="贴图预算（GB）" />
+                                <TextBox x:Name="MemoryLimitGbBox"
+                                         Margin="0,7,0,0"
+                                         Text="4" />
+                                <TextBlock Margin="0,7,0,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           TextWrapping="Wrap"
+                                           Text="默认 4 GB。这里只计算常驻解码贴图；进程、场景和编码器内存另计，并在任务状态单独显示实际峰值。" />
+                            </StackPanel>
+                        </Grid>
+                    </GroupBox>
                     <GroupBox Header="预渲染缓存">
                         <Grid>
                             <Grid.ColumnDefinitions>

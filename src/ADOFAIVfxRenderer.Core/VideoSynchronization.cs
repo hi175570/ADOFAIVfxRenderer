@@ -20,7 +20,7 @@ public static class VideoSynchronizationCalculator
         if (bpm <= 0m) throw new InvalidDataException("settings.bpm 必须大于零。");
 
         var countdownTicks = settings["countdownTicks"]?.GetValue<int>() ?? 4;
-        var separateCountdown = settings["separateCountdownTime"]?.GetValue<bool>() ?? false;
+        var separateCountdown = ReadBoolean(settings["separateCountdownTime"], false);
         var crotchet = 60m / bpm;
         var gameVideoStart = separateCountdown ? Math.Max(0, countdownTicks) * crotchet : 0m;
         var firstAngle = ReadFirstAngle(chart);
@@ -105,6 +105,17 @@ public static class VideoSynchronizationCalculator
         return decimal.TryParse(node.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
             ? value
             : fallback;
+    }
+
+    private static bool ReadBoolean(JsonNode? node, bool fallback)
+    {
+        if (node == null) return fallback;
+        if (node is JsonValue value && value.TryGetValue<bool>(out var boolean)) return boolean;
+        var text = node.ToString().Trim();
+        if (bool.TryParse(text, out boolean)) return boolean;
+        if (string.Equals(text, "Enabled", StringComparison.OrdinalIgnoreCase) || text == "1") return true;
+        if (string.Equals(text, "Disabled", StringComparison.OrdinalIgnoreCase) || text == "0") return false;
+        return fallback;
     }
 
     private static decimal PositiveModulo(decimal value, decimal modulus)

@@ -656,7 +656,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
             status.percent = completed * 100f / totalFrames;
             status.renderedFramesPerSecond = (float)speed;
             status.secondsPerFrame = (float)(1d / speed);
-            if (previewWatch.Elapsed.TotalSeconds >= 0.1 || completed == totalFrames)
+            if (previewWatch.Elapsed.TotalSeconds >= 0.5 || completed == totalFrames)
             {
                 status.previewPath = WriteInstalledPreview(job.previewDirectory, frameTexture, completed);
                 status.message = $"已完成 {completed:N0} / {totalFrames:N0} 帧";

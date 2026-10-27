@@ -19,6 +19,7 @@ var tests = new (string Name, Action Run)[]
     ("Derived chart video offset", DerivedChartVideoOffset),
     ("Video sync follows first playable floor", VideoSyncFollowsFirstPlayableFloor),
     ("Duplicate JSON fields use the last value", DuplicateJsonFieldsUseLastValue),
+    ("Legacy JSON spellings remain readable", LegacyJsonSpellingsRemainReadable),
     ("Timeline handles midspins and tempo", TimelineHandlesMidspinsAndTempo),
     ("Floor geometry uses ADOFAI axis convention", FloorGeometryUsesAdoAxisConvention),
     ("Current target timeline when present", CurrentTargetTimeline),
@@ -29,6 +30,7 @@ var tests = new (string Name, Action Run)[]
     ("Derived chart retains selected decoration", DerivedChartRetainsSelectedDecoration),
     ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
     ("Filter catalog groups by target", FilterCatalogGroupsByTarget),
+    ("Texture catalog finds unique referenced files", TextureCatalogFindsUniqueReferencedFiles),
     ("Derived chart disables selected filters", DerivedChartDisablesSelectedFilters),
     ("Canonical render output layout", CanonicalRenderOutputLayout),
     ("Derived chart replaces canonical profile output", DerivedChartReplacesCanonicalOutput),
@@ -370,6 +372,37 @@ static void DuplicateJsonFieldsUseLastValue()
     }
 }
 
+static void LegacyJsonSpellingsRemainReadable()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"adofai-vfx-legacy-json-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "level.adofai");
+    var video = Path.Combine(directory, "video.mp4");
+    try
+    {
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(path, """
+        {
+          "angleData": [0, 180],
+          "settings": {
+            "bpm": 120,
+            "countdownTicks": 4,
+            "separateCountdownTime": "Enabled",
+            "requiredMods": [],,
+          },
+          "actions": [],,
+          "decorations": []
+        }
+        """);
+        File.WriteAllBytes(video, [0]);
+        Equal(2.0m, DerivedChartExporter.CalculateRecommendedRenderStartSeconds(path));
+        Equal(0, DerivedChartExporter.Export(path, video, OutputProfile.VideoVfx).VideoOffsetMilliseconds);
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
 static void FloorGeometryUsesAdoAxisConvention()
 {
     var positions = AdoGeometryCalculator.BuildFloorPositions([0d, 90d, 999d], 1.5d);
@@ -550,6 +583,46 @@ static void FilterCatalogGroupsByTarget()
         False(items.Any(item => item.DisplayName == "Unused"));
         False(items.Single(item => item.Key.EndsWith(":Decoration:mask-a", StringComparison.Ordinal)).OfflineSupported);
         False(items.Single(item => item.Key == "builtin:HallOfMirrors").OfflineSupported);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void TextureCatalogFindsUniqueReferencedFiles()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-textures-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var background = Path.Combine(root, "background.png");
+        var decoration = Path.Combine(root, "decoration.png");
+        var track = Path.Combine(root, "track.png");
+        File.WriteAllBytes(background, [1]);
+        File.WriteAllBytes(decoration, [2]);
+        File.WriteAllBytes(track, [3]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"bgImage": "background.png", "trackTexture": "track.png"},
+          "actions": [
+            {"floor": 1, "eventType": "MoveDecorations", "decorationImage": "decoration.png"},
+            {"floor": 1, "eventType": "MoveDecorations", "decorationImage": "decoration.png"}
+          ],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "decoration.png"},
+            {"floor": 0, "eventType": "AddDecoration", "decorationImage": "prefab:built-in"}
+          ]
+        }
+        """);
+
+        var files = ChartTextureCatalogReader.ReadReferencedFiles(chartPath);
+        Equal(3, files.Count);
+        True(files.Contains(background, StringComparer.OrdinalIgnoreCase));
+        True(files.Contains(decoration, StringComparer.OrdinalIgnoreCase));
+        True(files.Contains(track, StringComparer.OrdinalIgnoreCase));
     }
     finally
     {

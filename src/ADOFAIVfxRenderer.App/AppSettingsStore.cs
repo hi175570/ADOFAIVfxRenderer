@@ -6,7 +6,9 @@ namespace ADOFAIVfxRenderer.App;
 internal sealed record AppSettings(
     string GameDirectory = "",
     string LastChartPath = "",
-    string LastChartDirectory = "");
+    string LastChartDirectory = "",
+    bool LimitMemory = true,
+    int MemoryLimitMb = 4096);
 
 internal static class AppSettingsStore
 {

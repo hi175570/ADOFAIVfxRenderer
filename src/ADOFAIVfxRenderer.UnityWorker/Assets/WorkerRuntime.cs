@@ -21,6 +21,7 @@ public sealed class WorkerRuntime : MonoBehaviour
     private const float TileSize = 1.5f;
     private const float DefaultCameraOrthoSize = 5f;
     private readonly Dictionary<string, Texture2D> _textures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Vector2Int> _sourceTextureSizes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Sprite> _sprites = new(StringComparer.OrdinalIgnoreCase);
     private Material? _tileMaterial;
     private Type? _gameBlendEffectType;
@@ -704,15 +705,50 @@ public sealed class WorkerRuntime : MonoBehaviour
         if (_textures.TryGetValue(imagePath, out var existing)) return existing;
         var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
         texture.name = Path.GetFileName(imagePath);
-        if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(imagePath), markNonReadable: true))
+        if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(imagePath), markNonReadable: false))
         {
             Destroy(texture);
             return null;
         }
+        _sourceTextureSizes[imagePath] = new Vector2Int(texture.width, texture.height);
+        if (_job.textureMaximumSide > 0 &&
+            Math.Max(texture.width, texture.height) > _job.textureMaximumSide)
+        {
+            texture = ResizeTexture(texture, _job.textureMaximumSide);
+            texture.name = Path.GetFileName(imagePath);
+        }
+        texture.Apply(updateMipmaps: false, makeNoLongerReadable: true);
         texture.wrapMode = TextureWrapMode.Repeat;
         texture.filterMode = FilterMode.Bilinear;
         _textures[imagePath] = texture;
         return texture;
+    }
+
+    private static Texture2D ResizeTexture(Texture2D source, int maximumSide)
+    {
+        var scale = maximumSide / (float)Math.Max(source.width, source.height);
+        var width = Math.Max(1, Mathf.RoundToInt(source.width * scale));
+        var height = Math.Max(1, Mathf.RoundToInt(source.height * scale));
+        var temporary = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+        var previous = RenderTexture.active;
+        try
+        {
+            Graphics.Blit(source, temporary);
+            RenderTexture.active = temporary;
+            var resized = new Texture2D(width, height, TextureFormat.RGBA32, false);
+            resized.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+            resized.Apply(false, false);
+            // Texture loading happens synchronously before the first rendered frame.
+            // Destroy would defer every full-resolution source until frame end and defeat
+            // the low-memory budget on charts with thousands of images.
+            DestroyImmediate(source);
+            return resized;
+        }
+        finally
+        {
+            RenderTexture.active = previous;
+            RenderTexture.ReleaseTemporary(temporary);
+        }
     }
 
     private Sprite? GetSprite(string imagePath)
@@ -720,7 +756,15 @@ public sealed class WorkerRuntime : MonoBehaviour
         if (_sprites.TryGetValue(imagePath, out var existing)) return existing;
         var texture = GetTexture(imagePath);
         if (texture == null) return null;
-        var sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), new Vector2(0.5f, 0.5f), 100f);
+        var sourceSize = _sourceTextureSizes.TryGetValue(imagePath, out var dimensions)
+            ? dimensions
+            : new Vector2Int(texture.width, texture.height);
+        var pixelsPerUnit = 100f * texture.width / Math.Max(1, sourceSize.x);
+        var sprite = Sprite.Create(
+            texture,
+            new Rect(0, 0, texture.width, texture.height),
+            new Vector2(0.5f, 0.5f),
+            pixelsPerUnit);
         sprite.name = Path.GetFileName(imagePath);
         _sprites[imagePath] = sprite;
         return sprite;
@@ -962,7 +1006,7 @@ public sealed class WorkerRuntime : MonoBehaviour
                 _status.percent = completed * 100f / totalFrames;
                 _status.renderedFramesPerSecond = (float)speed;
                 _status.secondsPerFrame = (float)(1d / speed);
-                if (previewWatch.Elapsed.TotalSeconds >= 0.1d || completed == totalFrames)
+                if (previewWatch.Elapsed.TotalSeconds >= 0.5d || completed == totalFrames)
                 {
                     _status.previewPath = WritePreview(ImageConversion.EncodeToJPG(frameTexture, 85), completed);
                     _status.message = $"已完成 {completed:N0} / {totalFrames:N0} 帧";
@@ -1550,6 +1594,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         public int[]? retainedDecorationIndices;
         public string? videoEncoder;
         public string? encoderPreset;
+        public int textureMaximumSide;
     }
 
     [Serializable]

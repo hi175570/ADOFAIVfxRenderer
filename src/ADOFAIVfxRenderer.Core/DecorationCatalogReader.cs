@@ -37,7 +37,7 @@ public static class DecorationCatalogReader
 
             var imageName = decoration["decorationImage"]?.GetValue<string>() ?? "";
             var floor = decoration["floor"]?.GetValue<int>() ?? 0;
-            var initiallyVisible = decoration["visible"]?.GetValue<bool>() ?? true;
+            var initiallyVisible = AdoJson.ReadBoolean(decoration["visible"], true);
             var tag = decoration["tag"]?.GetValue<string>() ?? "";
             var reference = FindFirstReference(actions, tag, floor, index, initiallyVisible);
             result.Add(new DecorationCatalogItem(
@@ -84,7 +84,7 @@ public static class DecorationCatalogReader
 
             // A MoveDecorations image swap is a real first reference even when the event omits
             // `visible`; an explicit visible=false event is not an invocation.
-            if (action["visible"]?.GetValue<bool>() == false && action["decorationImage"] is null) continue;
+            if (!AdoJson.ReadBoolean(action["visible"], true) && action["decorationImage"] is null) continue;
             var floor = action["floor"]?.GetValue<int>() ?? declarationFloor;
             return (floor, order, action["angleOffset"]?.GetValue<double>() ?? 0d);
         }
