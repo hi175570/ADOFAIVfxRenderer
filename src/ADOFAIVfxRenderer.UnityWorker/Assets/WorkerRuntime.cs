@@ -1028,7 +1028,6 @@ public sealed class WorkerRuntime : MonoBehaviour
                 var previous = RenderTexture.active;
                 RenderTexture.active = target;
                 frameTexture.ReadPixels(new Rect(0f, 0f, RenderWidth, RenderHeight), 0, 0, false);
-                frameTexture.Apply(false, false);
                 RenderTexture.active = previous;
                 var raw = frameTexture.GetRawTextureData();
                 _ffmpeg!.StandardInput.BaseStream.Write(raw, 0, raw.Length);

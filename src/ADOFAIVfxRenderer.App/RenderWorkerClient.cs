@@ -529,8 +529,7 @@ internal sealed class RenderWorkerClient : IDisposable
         if (!File.Exists(ffmpegPath)) throw new FileNotFoundException("游戏目录内缺少 FFmpeg。", ffmpegPath);
         return backend switch
         {
-            RenderBackend.Automatic => new ResolvedRenderBackend(
-                backend, "libopenh264", "", "-force-d3d11", "GPU 光栅 + CPU H.264 编码"),
+            RenderBackend.Automatic => ResolveAutomaticEncoder(ffmpegPath),
             RenderBackend.CpuCompatibility => new ResolvedRenderBackend(
                 backend, "libopenh264", "", "-force-d3d11 -force-driver-type-warp", "CPU WARP 光栅 + CPU H.264 编码"),
             RenderBackend.HardwareGpu => ResolveFirstHardwareEncoder(ffmpegPath),
@@ -540,6 +539,26 @@ internal sealed class RenderWorkerClient : IDisposable
                 "当前机器或 FFmpeg 无法实际启动 NVIDIA NVENC；RTX 模式没有静默回退。请选择自动、CPU 或普通 GPU。"),
             _ => throw new ArgumentOutOfRangeException(nameof(backend)),
         };
+    }
+
+    private static ResolvedRenderBackend ResolveAutomaticEncoder(string ffmpegPath)
+    {
+        foreach (var encoder in new[] { "h264_nvenc", "h264_qsv", "h264_amf" })
+        {
+            if (!CanEncode(ffmpegPath, encoder)) continue;
+            return new ResolvedRenderBackend(
+                RenderBackend.Automatic,
+                encoder,
+                encoder == "h264_nvenc" ? "p4" : "",
+                "-force-d3d11",
+                $"自动：GPU 光栅 + {encoder} 硬件编码");
+        }
+        return new ResolvedRenderBackend(
+            RenderBackend.Automatic,
+            "libopenh264",
+            "",
+            "-force-d3d11",
+            "自动：GPU 光栅 + CPU H.264 编码（无可用硬件编码器）");
     }
 
     private static ResolvedRenderBackend ResolveFirstHardwareEncoder(string ffmpegPath)

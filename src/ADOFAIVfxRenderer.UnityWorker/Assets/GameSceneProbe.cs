@@ -13,6 +13,10 @@ namespace ADOFAIVfxWorker
 {
 internal sealed class GameSceneProbe : MonoBehaviour
 {
+    private static Canvas[]? _canvasCache;
+    private static Camera[]? _originalCameraCache;
+    private static OriginalTimelineAccess? _timelineAccess;
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Boot()
     {
@@ -334,7 +338,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
         var ready = false;
         for (var frame = 0; frame < 1800; frame++)
         {
-            DisableAllCanvases();
+            DisableAllCanvases(refresh: true);
             if (isLoadingField?.GetValue(customLevel) is bool isLoading && !isLoading)
             {
                 ready = true;
@@ -353,7 +357,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
         var started = false;
         for (var frame = 0; frame < 600; frame++)
         {
-            DisableAllCanvases();
+            DisableAllCanvases(refresh: true);
             if (hasSongStartedField?.GetValue(conductor) is true)
             {
                 started = true;
@@ -363,50 +367,39 @@ internal sealed class GameSceneProbe : MonoBehaviour
         }
         if (!started) throw new InvalidOperationException("Original level did not enter playback.");
         DriveOriginalTimeline(assembly, 0d);
-        DisableAllCanvases();
+        DisableAllCanvases(refresh: true);
         Debug.Log("GAME_SCENE_PLAYBACK original load/play/start lifecycle ready");
     }
 
     private static IEnumerator AdvanceOriginalPlayback(Scene scene, Assembly assembly, float targetSeconds, int framesPerSecond)
     {
         var frameCount = Math.Max(0, Mathf.CeilToInt(targetSeconds * framesPerSecond));
+        var endOfFrame = new WaitForEndOfFrame();
         for (var frame = 0; frame < frameCount; frame++)
         {
             DriveOriginalTimeline(assembly, frame / (double)framesPerSecond);
             DisableAllCanvases();
-            yield return new WaitForEndOfFrame();
+            yield return endOfFrame;
             RenderOriginalScene(scene);
         }
         DriveOriginalTimeline(assembly, targetSeconds);
         DisableAllCanvases();
-        yield return new WaitForEndOfFrame();
+        yield return endOfFrame;
         RenderOriginalScene(scene);
     }
 
     private static void DriveOriginalTimeline(Assembly assembly, double songTimeSeconds)
     {
-        var conductor = assembly.GetType("scrConductor", true)!
-            .GetProperty("instance", BindingFlags.Static | BindingFlags.Public)?.GetValue(null)
-            ?? throw new InvalidOperationException("Original conductor is unavailable while rendering.");
-        var conductorType = conductor.GetType();
-        var song = conductorType.GetField("song", BindingFlags.Instance | BindingFlags.Public)?.GetValue(conductor);
-        var pitch = Math.Max(0.01, Convert.ToDouble(song?.GetType()
-            .GetProperty("pitch", BindingFlags.Instance | BindingFlags.Public)?.GetValue(song) ?? 1f));
-        var addOffset = Convert.ToDouble(conductorType
-            .GetField("addoffset", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?.GetValue(conductor) ?? 0d);
-        var calibration = Convert.ToDouble(conductorType
-            .GetProperty("calibration_i", BindingFlags.Static | BindingFlags.Public)
-            ?.GetValue(null) ?? 0d);
-        conductorType.GetField("dspTimeSong", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?.SetValue(conductor, AudioSettings.dspTime - calibration - (songTimeSeconds + addOffset) / pitch);
+        (_timelineAccess ??= new OriginalTimelineAccess(assembly)).Seek(songTimeSeconds);
     }
 
-    private static void DisableAllCanvases()
+    private static void DisableAllCanvases(bool refresh = false)
     {
-        foreach (var canvas in FindObjectsByType<Canvas>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        if (refresh || _canvasCache == null)
+            _canvasCache = FindObjectsByType<Canvas>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (var canvas in _canvasCache)
         {
-            canvas.enabled = false;
+            if (canvas != null) canvas.enabled = false;
         }
     }
 
@@ -571,10 +564,8 @@ internal sealed class GameSceneProbe : MonoBehaviour
 
     private static RenderTexture GetOriginalSceneTarget(Scene scene)
     {
-        return scene.GetRootGameObjects()
-                   .SelectMany(root => root.GetComponentsInChildren<Camera>(true))
+        return GetOriginalSceneCameras(scene)
                    .Where(camera => camera != null && camera.enabled && camera.gameObject.activeInHierarchy && camera.targetTexture != null)
-                   .OrderBy(camera => camera.depth)
                    .Select(camera => camera.targetTexture)
                    .LastOrDefault()
                ?? throw new InvalidOperationException("Original scene camera RenderTexture is unavailable.");
@@ -582,15 +573,23 @@ internal sealed class GameSceneProbe : MonoBehaviour
 
     private static RenderTexture RenderOriginalScene(Scene scene)
     {
-        var cameras = scene.GetRootGameObjects()
-            .SelectMany(root => root.GetComponentsInChildren<Camera>(true))
-            .Where(camera => camera != null && camera.enabled && camera.gameObject.activeInHierarchy && camera.targetTexture != null)
-            .OrderBy(camera => camera.depth)
-            .ToArray();
-        if (cameras.Length == 0) throw new InvalidOperationException("Original scene has no enabled internal cameras.");
-        foreach (var camera in cameras) camera.Render();
-        return cameras[^1].targetTexture;
+        RenderTexture? finalTarget = null;
+        foreach (var camera in GetOriginalSceneCameras(scene))
+        {
+            if (camera == null || !camera.enabled || !camera.gameObject.activeInHierarchy || camera.targetTexture == null)
+                continue;
+            camera.Render();
+            finalTarget = camera.targetTexture;
+        }
+        return finalTarget ?? throw new InvalidOperationException("Original scene has no enabled internal cameras.");
     }
+
+    private static Camera[] GetOriginalSceneCameras(Scene scene) => _originalCameraCache ??=
+        scene.GetRootGameObjects()
+            .SelectMany(root => root.GetComponentsInChildren<Camera>(true))
+            .Where(static camera => camera != null)
+            .OrderBy(static camera => camera.depth)
+            .ToArray();
 
     private IEnumerator RenderInstalledVideo(Scene scene, Assembly assembly, IList? floors, int floorCount)
     {
@@ -633,6 +632,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
         using var ffmpeg = StartInstalledEncoder(job, captureWidth, captureHeight, temporaryOutput);
         var watch = Stopwatch.StartNew();
         var previewWatch = Stopwatch.StartNew();
+        var endOfFrame = new WaitForEndOfFrame();
         Time.captureFramerate = job.framesPerSecond;
         if (job.renderStartSeconds > 0f)
             yield return AdvanceOriginalPlayback(scene, assembly, job.renderStartSeconds, job.framesPerSecond);
@@ -641,12 +641,11 @@ internal sealed class GameSceneProbe : MonoBehaviour
             var time = job.renderStartSeconds + frame / (float)job.framesPerSecond;
             DriveOriginalTimeline(assembly, time);
             DisableAllCanvases();
-            yield return new WaitForEndOfFrame();
+            yield return endOfFrame;
             originalTarget = RenderOriginalScene(scene);
             var previousActive = RenderTexture.active;
             RenderTexture.active = originalTarget;
             frameTexture.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0, false);
-            frameTexture.Apply(false, false);
             RenderTexture.active = previousActive;
             var raw = frameTexture.GetRawTextureData();
             ffmpeg.StandardInput.BaseStream.Write(raw, 0, raw.Length);
@@ -728,6 +727,45 @@ internal sealed class GameSceneProbe : MonoBehaviour
         File.WriteAllText(temporary, JsonConvert.SerializeObject(status, Formatting.Indented));
         if (File.Exists(path)) File.Replace(temporary, path, null);
         else File.Move(temporary, path);
+    }
+
+    private sealed class OriginalTimelineAccess
+    {
+        private readonly object _conductor;
+        private readonly FieldInfo? _songField;
+        private readonly FieldInfo? _addOffsetField;
+        private readonly FieldInfo? _dspTimeSongField;
+        private readonly PropertyInfo? _calibrationProperty;
+        private PropertyInfo? _pitchProperty;
+
+        public OriginalTimelineAccess(Assembly assembly)
+        {
+            var conductorType = assembly.GetType("scrConductor", true)!;
+            _conductor = conductorType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public)?.GetValue(null)
+                         ?? throw new InvalidOperationException("Original conductor is unavailable while rendering.");
+            _songField = conductorType.GetField("song", BindingFlags.Instance | BindingFlags.Public);
+            _addOffsetField = conductorType.GetField(
+                "addoffset",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _dspTimeSongField = conductorType.GetField(
+                "dspTimeSong",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _calibrationProperty = conductorType.GetProperty(
+                "calibration_i",
+                BindingFlags.Static | BindingFlags.Public);
+        }
+
+        public void Seek(double songTimeSeconds)
+        {
+            var song = _songField?.GetValue(_conductor);
+            _pitchProperty ??= song?.GetType().GetProperty("pitch", BindingFlags.Instance | BindingFlags.Public);
+            var pitch = Math.Max(0.01, Convert.ToDouble(_pitchProperty?.GetValue(song) ?? 1f));
+            var addOffset = Convert.ToDouble(_addOffsetField?.GetValue(_conductor) ?? 0d);
+            var calibration = Convert.ToDouble(_calibrationProperty?.GetValue(null) ?? 0d);
+            _dspTimeSongField?.SetValue(
+                _conductor,
+                AudioSettings.dspTime - calibration - (songTimeSeconds + addOffset) / pitch);
+        }
     }
 
     private static void WriteFatalStatus(Exception exception)

@@ -304,7 +304,7 @@ public partial class MainWindow : Window
 
         RenderBackendBox.ItemsSource = new[]
         {
-            new Choice<RenderBackend>("自动（GPU 画面 + CPU 编码，推荐）", RenderBackend.Automatic),
+            new Choice<RenderBackend>("自动（优先硬件编码，不可用时 CPU，推荐）", RenderBackend.Automatic),
             new Choice<RenderBackend>("CPU 兼容（WARP 软件光栅 + CPU 编码）", RenderBackend.CpuCompatibility),
             new Choice<RenderBackend>("普通 GPU（自动硬件 H.264 编码）", RenderBackend.HardwareGpu),
             new Choice<RenderBackend>("NVIDIA / RTX（NVENC 高质量）", RenderBackend.NvidiaRtx),
