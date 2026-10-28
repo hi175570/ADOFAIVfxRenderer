@@ -18,6 +18,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
 {
     private static Canvas[]? _canvasCache;
     private static Camera[]? _originalCameraCache;
+    private static Camera[]? _manualOriginalCameras;
     private static OriginalTimelineAccess? _timelineAccess;
     private static int _videoSyncDiagnostics;
 
@@ -410,7 +411,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
             DisableAllCanvases();
             yield return endOfFrame;
             textureStreaming?.Update();
-            RenderOriginalScene(scene);
+            RenderOriginalScene();
             textureStreaming?.CaptureVisibility();
         }
         DriveOriginalTimeline(assembly, targetSeconds);
@@ -418,7 +419,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
         DisableAllCanvases();
         yield return endOfFrame;
         textureStreaming?.Update();
-        RenderOriginalScene(scene);
+        RenderOriginalScene();
         textureStreaming?.CaptureVisibility();
     }
 
@@ -735,24 +736,37 @@ internal sealed class GameSceneProbe : MonoBehaviour
 
     private static RenderTexture GetOriginalSceneTarget(Scene scene)
     {
-        return GetOriginalSceneCameras(scene)
-                   .Where(camera => camera != null && camera.enabled && camera.gameObject.activeInHierarchy && camera.targetTexture != null)
+        return (_manualOriginalCameras ?? GetOriginalSceneCameras(scene))
+                   .Where(camera => camera != null && camera.gameObject.activeInHierarchy && camera.targetTexture != null)
                    .Select(camera => camera.targetTexture)
                    .LastOrDefault()
                ?? throw new InvalidOperationException("Original scene camera RenderTexture is unavailable.");
     }
 
-    private static RenderTexture RenderOriginalScene(Scene scene)
+    private static void BeginManualOriginalCameraRendering(Scene scene)
     {
+        _manualOriginalCameras = GetOriginalSceneCameras(scene)
+            .Where(static camera => camera != null && camera.enabled &&
+                                    camera.gameObject.activeInHierarchy && camera.targetTexture != null)
+            .ToArray();
+        if (_manualOriginalCameras.Length == 0)
+            throw new InvalidOperationException("Original scene has no enabled internal cameras for manual capture.");
+        foreach (var camera in _manualOriginalCameras) camera.enabled = false;
+        Debug.Log($"GAME_SCENE_MANUAL_CAMERAS count={_manualOriginalCameras.Length} " +
+                  $"names={string.Join(",", _manualOriginalCameras.Select(static camera => camera.name))}");
+    }
+
+    private static RenderTexture RenderOriginalScene()
+    {
+        if (_manualOriginalCameras is not { Length: > 0 })
+            throw new InvalidOperationException("Manual original cameras were not initialized.");
         RenderTexture? finalTarget = null;
-        foreach (var camera in GetOriginalSceneCameras(scene))
+        foreach (var camera in _manualOriginalCameras)
         {
-            if (camera == null || !camera.enabled || !camera.gameObject.activeInHierarchy || camera.targetTexture == null)
-                continue;
             camera.Render();
             finalTarget = camera.targetTexture;
         }
-        return finalTarget ?? throw new InvalidOperationException("Original scene has no enabled internal cameras.");
+        return finalTarget ?? throw new InvalidOperationException("Original scene manual cameras have no target texture.");
     }
 
     private static Camera[] GetOriginalSceneCameras(Scene scene) => _originalCameraCache ??=
@@ -776,6 +790,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
         };
         WriteInstalledStatus(job.statusPath, status);
         yield return StartOriginalPlayback(assembly, job.framesPerSecond);
+        BeginManualOriginalCameraRendering(scene);
         using var textureStreaming = DynamicTextureStreaming.Create(
             assembly,
             job.chartPath,
@@ -828,7 +843,7 @@ internal sealed class GameSceneProbe : MonoBehaviour
             DisableAllCanvases();
             yield return endOfFrame;
             textureStreaming?.Update();
-            originalTarget = RenderOriginalScene(scene);
+            originalTarget = RenderOriginalScene();
             textureStreaming?.CaptureVisibility();
             var previousActive = RenderTexture.active;
             RenderTexture.active = originalTarget;

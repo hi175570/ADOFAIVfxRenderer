@@ -32,8 +32,9 @@ Video Pro 使用所选游戏安装中的原版 `scnGame` 场景、事件组件�
 - 每个谱面旁只维护一个 `Video VFX` 输出目录；同一种版本只有一个规范视频和一个规范派生谱面，成功重渲染后原子替换旧文件，不堆积时间戳备份。
 - 支持装饰贴图黑名单与白名单、引用顺序和深度排序、透明网格大图预览。
 - 支持生成十组同帧有图／无图对照，共二十张诊断图，并直接在程序中比较。
-- 支持按基本／高级滤镜、平面、目标类型和标签分组，分别选择保留实时、烤入视频或忽略。
-- 支持“烤入视频并保留实时”：同一滤镜可以预处理视频层，同时继续处理实时轨道；这类组合必须经过闭环对照，不能仅凭规则自动放行。
+- “装饰与视觉效果”页面把装饰与视觉效果分开编辑；视觉效果包含基础／高级滤镜、Hall of Mirrors、绽放、卷屏等，可按平面、目标类型和标签分组，逐项选择保留实时、烤入视频、视频与实时同时保留或忽略。Video VFX 默认全部保留实时。
+- 视觉效果列表可直接选择任意一组并点击“对照所选视觉效果”；程序会跳到其首次调用时间，按需生成“烤入视频”与“保留到最终合成”的左右画面，并可一键把任一侧写回正式配置。
+- 支持“烤入视频并保留实时”：同一视觉效果可以预处理视频层，同时继续处理实时轨道；这类组合必须经过闭环对照，不能仅凭规则自动放行。
 - 能识别当前选择性渲染器尚不能可靠烤入的滤镜组，并在开始前阻止没有实现的配置；候选处理方式不会被直接写成“已解决”。
 - 支持源谱已有 `bgVideo`：选择性 Worker 使用 FFmpeg 顺序逐帧解码，保留 `vidOffset`、独立倒计时、循环和 `FitHorizontally` 画幅语义；不会把视频当作静态贴图或按墙钟速度播放。
 - 可将刚生成的 Video VFX 派生谱直接作为输入，执行一次独立的 Video Pro 最终合成验证；验证视频使用单独文件名，不覆盖原始源谱的 Video Pro 输出。
@@ -41,9 +42,11 @@ Video Pro 使用所选游戏安装中的原版 `scnGame` 场景、事件组件�
 
 ## 拆层风险与候选实测
 
-Video、Video VFX 和 Video VFX Pro 会把原版相机栈拆成视频层与游戏实时层，因此遮罩、前后景滤镜、历史帧反馈、标签目标、运行中换图、粒子、背景视频和运镜可能在分层后改变语义。程序会列出所有分析到的可能位置，但不会假装能自动确定哪些位置一定出错，也不会要求用户逐项确认后才能渲染。
+Video、Video VFX 和 Video VFX Pro 会把原版相机栈拆成视频层与游戏实时层，因此遮罩、前后景滤镜、历史帧反馈、标签目标、运行中换图、粒子、背景视频和运镜可能在分层后改变语义。程序会列出分析到的组合风险，但不会因为出现某个单独滤镜就乱报警，也不会假装能自动确定哪些位置一定出错。Hall 每次重新开启都会作为独立分支检查；“负深度前景＋换图或闪光＋多组视觉效果”会标成前景跨轨道层级风险。用户不需要逐项确认后才能渲染。
 
 点开列表中的任意位置后，程序才会按需生成该处的左右最终合成。默认左侧把相关效果烤入视频；默认右侧先生成不含该效果的视频层，再由原版运行时合成保留的第二层。任一侧先完成就先显示，不必等待另一侧，也不会预先渲染整张列表。左右下拉框可以各自选择局部或全谱遮罩依赖闭包、背景／前景滤镜分别归属、滤镜同时预烤和实时、目标滤镜与目标对象共层、完整换图序列、粒子实时或预烤、历史缓冲预热、Video／Video VFX Pro 切换，以及 Video Pro 完整压平等方案。
+
+风险详情可直接跳到“当前风险相关装饰”或“当前风险相关视觉效果”的筛选列表，不需要在全谱数千项中手工找索引。用户可以在筛选结果中继续逐项微调，或用左右方案的“应用”按钮一次设置整组保留名单和视觉效果归属；处理后可一键恢复全谱列表。
 
 风险列表只是定位和人工对比工具，不是审批清单；未打开、未比较或生成失败的项目都不会阻止正式任务加入队列。用户确认某个画面确有问题后，可以直接应用左右任一方案，再继续用同一位置比较结果。
 
@@ -70,7 +73,7 @@ Video、Video VFX 和 Video VFX Pro 会把原版相机栈拆成视频层与游�
 pwsh -File .\scripts\Build-UnityWorker.ps1
 pwsh -File .\scripts\Build-ResourcePatcher.ps1
 pwsh -File .\scripts\Publish-TestPackage.ps1 -SelfContained
-pwsh -File .\scripts\Build-ReleasePackages.ps1 -Version 0.1.5
+pwsh -File .\scripts\Build-ReleasePackages.ps1 -Version 0.1.6
 dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core.Tests.csproj
 ```
 
@@ -83,7 +86,7 @@ dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core
 - [INVERSION](https://tuforums.com/levels/17017)：大量 `AddObject`、对象动画、轨道、滤镜与玩家星球。
 - [Friday](https://tuforums.com/levels/17111)：高密度逐帧贴图与图形动画。
 - [Camellia - Seagull](https://tuforums.com/levels/12421)：横向宽屏滤镜、遮罩、开场聚合线条与运镜。
-- [THE STAR SYSTEM'S CALLING](https://tuforums.com/levels/15708)：轨道、粒子、复杂高级滤镜、遮罩和历史帧反馈回归用例。风险系统会分别定位开场遮罩链与 327 Combo 历史反馈段，并从正式视频起点预热后生成闭环对照；没有通过的 Video VFX 候选会继续阻止正式拆层输出。Video Pro 仍是完整压平参考。
+- [THE STAR SYSTEM'S CALLING](https://tuforums.com/levels/15708)：轨道、粒子、复杂高级滤镜、遮罩和历史帧反馈回归用例。风险系统会分别定位开场遮罩链与 327 Combo 历史反馈段；手动把 `24-bg2 / 24-bg3` 场景装饰留在实时层后，该段闭环 SSIM 从 0.7442 提升到 0.9254，证明这类 Background 高级滤镜必须与被处理的场景精灵同层。仍有一条光束亮度差异，因此不写成逐像素通过。Video Pro 是完整压平参考。
 - [Our Life](https://tuforums.com/levels/12613)：高密度遮罩与多组 Hall of Mirrors。
 - [PLUM MEGAMIX](https://tuforums.com/levels/6337)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 599.683 秒和 598.183 秒；另以 1 GB 贴图预算做原版场景压力测试，并用本机案例视频按场景时序对照，不只与渲染器旧输出互比。
 - [PLUM MEGAMIX 2](https://tuforums.com/levels/840)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 694.000 秒和 692.500 秒。
@@ -91,11 +94,12 @@ dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core
 - [Megamix 2.7（Ciforance remake）](https://tuforums.com/levels/12465)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 611.567 秒和 609.967 秒。
 - [A School of Fish](https://tuforums.com/levels/4148)：Video Pro 与 Video VFX 的 1080p60 短片段实测。
 - [Black Knife（nerdexample remix）](https://tuforums.com/levels/16914)：Video Pro 与 Video VFX 的 1080p60 短片段实测；人工将游玩警告图设为“完全隐藏”后，视频与派生谱面均不再包含该装饰。
-- [Circles In Ruin](https://tuforums.com/levels/8978)：Video Pro 与 Video VFX 的 1080p60、1 GB 贴图预算、30 秒压力片段及派生谱闭环实测。当前 TUF CDN 包与页面所列旧 Google Drive 包字节完全相同，但都缺少谱面实际引用的 70 个素材文件；程序会在开始前列出缺失数量与首个风险格，现有包中不存在的画面不冒充已经还原。
+- [Circles In Ruin](https://tuforums.com/levels/8978)：Video Pro 与 Video VFX 的 1080p60、1 GB 贴图预算、30 秒压力片段及派生谱闭环实测。使用 7-Zip 保留韩文文件名重新解包后，当前包仍缺少谱面实际引用的 23 个素材文件；程序会在开始前列出缺失数量与首个风险格。第 3197 格完整状态对照中，手动保留 8 个前景遮罩/字幕装饰后 SSIM 从 0.7615 提升到 0.8114，转场黑场恢复一致；字幕缺失与构图差异仍保留为未完成项，不冒充已经还原。
 
 以下 TUF 页面已收录为后续回归参考，但本版本不把它们写成已经逐一复验：
 
 - [Parallel Universe Shifter](https://tuforums.com/levels/6066)
+- [Icyxis ~True Ending~](https://tuforums.com/levels/2856)：已作为高难度回归案例载入并对照；120 秒 Video Pro 与 TUF 原视频稳定对时，整段 SSIM 为 0.819630。第 2869 格重新开启 Hall 时，标准 Video VFX 会丢失跨背景、前景和轨道的历史合成；手动保留新旧两套同标签 Hall 依赖装饰后，风险段 SSIM 从 0.8174 提升到 0.8712，但后续彩色残影仍略少。本条是未完全通过案例，不写成已经还原。
 
 逐帧热点优化采用同一 MM1 10 秒、1 GB、1080p60、QSV 条件做 A/B：Video Pro 从 34.72 提升到 43.90 帧/秒（约 +26.4%），Video VFX 从 31.91 提升到 33.07 帧/秒（约 +3.6%）。最新的全分辨率动态载入复验中，Video Pro 的流式贴图峰值为 537,459,052 字节，另有 59,484,816 字节初始化遮罩常驻，Worker 峰值工作集为 2.364 GiB；Video VFX 的贴图峰值为 446,586,260 字节，Worker 峰值工作集为 1.287 GiB。两条路径都没有触发 1 GiB 贴图预算警报。Video VFX 修改前后短片的解码 SSIM 为 0.999800；Video Pro 含原版运行时非确定性粒子与反馈，抽帧构图一致，但不同运行之间不承诺逐像素相同。贴图预算不是进程硬上限，具体速度与峰值仍取决于谱面和硬件。
 

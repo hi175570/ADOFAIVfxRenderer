@@ -289,7 +289,7 @@
         </Grid>
     </Grid>
         </TabItem>
-        <TabItem Header="滤镜与装饰">
+        <TabItem Header="装饰与视觉效果">
             <TabControl x:Name="VisualEditorTabs"
                         Background="{StaticResource WindowBackground}"
                         BorderThickness="0"
@@ -307,6 +307,7 @@
                         <ColumnDefinition Width="220" />
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Margin="0,0,10,0" Text="名单模式" />
@@ -331,6 +332,11 @@
                                Margin="18,0,0,0"
                                Foreground="{StaticResource TextSecondary}"
                                Text="尚未载入谱面" />
+                    <Button Grid.Column="5"
+                            Margin="14,0,0,0"
+                            Padding="10,4"
+                            Click="ShowAllDecorations_Click"
+                            Content="显示全部装饰" />
                 </Grid>
 
                 <Grid Grid.Row="2">
@@ -497,7 +503,7 @@
                                               Content="星球（待适配）" />
                                     <CheckBox x:Name="DiagnosticFiltersCheckBox"
                                               ToolTip="使用独立 Worker 的离线近似滤镜；适合诊断，不能保证与游戏逐像素一致。"
-                                              Content="滤镜（离线预览）" />
+                                              Content="视觉效果（离线预览）" />
                                 </StackPanel>
                                 <TextBlock x:Name="DecorationDiagnosticStatusText"
                                            Grid.Column="2"
@@ -554,7 +560,7 @@
                 </Grid>
             </Grid>
                 </TabItem>
-                <TabItem x:Name="FilterEditorTab" Header="滤镜">
+                <TabItem x:Name="FilterEditorTab" Header="视觉效果">
                     <Grid Margin="20" Background="{StaticResource WindowBackground}">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -564,16 +570,25 @@
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
                         <StackPanel>
-                            <TextBlock FontSize="23" FontWeight="SemiBold" Text="滤镜归属" />
+                            <TextBlock FontSize="23" FontWeight="SemiBold" Text="视觉效果归属" />
                             <TextBlock Margin="0,5,0,0"
                                        Foreground="{StaticResource TextSecondary}"
                                        TextWrapping="Wrap"
-                                       Text="默认保留实时：滤镜仍由游戏处理。烤入视频：独立 Worker 预渲染，并在派生谱面中自动关闭。忽略：不渲染，并在派生谱面中关闭。原谱永不修改。" />
+                                       Text="这里包含基础/高级滤镜、Hall of Mirrors、绽放、卷屏等视觉效果。Video VFX 默认全部保留实时；也可逐项选择烤入视频、视频与实时同时保留或忽略。原谱永不修改。" />
                              <TextBlock x:Name="VisualRiskSummaryText"
                                         Margin="0,10,0,0"
                                         Foreground="{StaticResource WarningText}"
                                         TextWrapping="Wrap"
                                         Text="尚未载入谱面。" />
+                            <StackPanel Margin="0,10,0,0" Orientation="Horizontal">
+                                <Button Padding="10,5"
+                                        Click="ShowAllVisualEffects_Click"
+                                        Content="显示全部视觉效果" />
+                                <Button Margin="10,0,0,0"
+                                        Padding="10,5"
+                                        Click="CompareSelectedVisualEffect_Click"
+                                        Content="对照所选视觉效果" />
+                            </StackPanel>
                         </StackPanel>
                         <Border Grid.Row="2"
                                 Background="{StaticResource PanelBackground}"
@@ -591,7 +606,7 @@
                                       SelectionMode="Single"
                                       IsReadOnly="False">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Width="190" Header="滤镜" Binding="{Binding DisplayName}" IsReadOnly="True" />
+                                    <DataGridTextColumn Width="190" Header="视觉效果" Binding="{Binding DisplayName}" IsReadOnly="True" />
                                     <DataGridTextColumn Width="100" Header="类别" Binding="{Binding EventKind}" IsReadOnly="True" />
                                     <DataGridTextColumn Width="100" Header="平面" Binding="{Binding Plane}" IsReadOnly="True" />
                                     <DataGridTextColumn Width="150" Header="作用对象" Binding="{Binding TargetDescription}" IsReadOnly="True" />
@@ -851,11 +866,30 @@
                                 </Grid>
                             </Border>
                         </Grid>
-                        <TextBlock x:Name="RiskRenderGateText"
-                                   Grid.Row="4"
-                                   Foreground="{StaticResource TextSecondary}"
-                                   TextWrapping="Wrap"
-                                   Text="尚未分析谱面。" />
+                        <Grid Grid.Row="4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="RiskRenderGateText"
+                                       VerticalAlignment="Center"
+                                       Foreground="{StaticResource TextSecondary}"
+                                       TextWrapping="Wrap"
+                                       Text="尚未分析谱面。" />
+                            <StackPanel Grid.Column="1" Margin="16,0,0,0" Orientation="Horizontal">
+                                <Button x:Name="OpenRiskDecorationsButton"
+                                        Margin="0,0,8,0"
+                                        Padding="12,6"
+                                        IsEnabled="False"
+                                        Click="OpenRiskDecorations_Click"
+                                        Content="查看相关装饰（0）" />
+                                <Button x:Name="OpenRiskVisualEffectsButton"
+                                        Padding="12,6"
+                                        IsEnabled="False"
+                                        Click="OpenRiskVisualEffects_Click"
+                                        Content="查看相关视觉效果（0）" />
+                            </StackPanel>
+                        </Grid>
                     </Grid>
                 </TabItem>
             </TabControl>

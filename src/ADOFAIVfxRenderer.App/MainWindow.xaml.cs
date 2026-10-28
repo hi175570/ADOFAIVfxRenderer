@@ -26,6 +26,9 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<FilterOwnershipItem> _filterChoices = [];
     private readonly ObservableCollection<VisualRiskReviewItem> _riskReviews = [];
     private ICollectionView? _decorationChoicesView;
+    private ICollectionView? _filterChoicesView;
+    private HashSet<int>? _focusedRiskDecorationIndices;
+    private HashSet<string>? _focusedRiskFilterKeys;
     private GameInstallation? _installation;
     private ChartMetadata? _chart;
     private bool _updatingTail;
@@ -142,8 +145,30 @@ public partial class MainWindow : Window
                 .Select(static value => int.TryParse(value, out var index) ? index : -1)
                 .Where(static index => index >= 0)
                 .ToHashSet();
+            var retainedIndices = (GetArgumentValue(arguments, "--retain-decoration-indices") ?? "")
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(static value => int.TryParse(value, out var index) ? index : -1)
+                .Where(static index => index >= 0)
+                .ToHashSet();
+            if (retainedIndices.Count > 0)
+                RetentionModeBox.SelectedIndex = 0;
             foreach (var choice in _decorationChoices)
+            {
                 choice.IsExcluded = excludedIndices.Contains(choice.Item.Index);
+                choice.IsListed = retainedIndices.Contains(choice.Item.Index);
+            }
+            var bakedFilterKeys = ParseAutomationValues(GetArgumentValue(arguments, "--bake-filter-keys"));
+            var duplicatedFilterKeys = ParseAutomationValues(GetArgumentValue(arguments, "--bake-and-realtime-filter-keys"));
+            var ignoredFilterKeys = ParseAutomationValues(GetArgumentValue(arguments, "--ignore-filter-keys"));
+            foreach (var choice in _filterChoices)
+            {
+                if (bakedFilterKeys.Contains(choice.Item.Key))
+                    choice.Ownership = FilterOwnership.BakeIntoVideo;
+                else if (duplicatedFilterKeys.Contains(choice.Item.Key))
+                    choice.Ownership = FilterOwnership.BakeAndRealtime;
+                else if (ignoredFilterKeys.Contains(choice.Item.Key))
+                    choice.Ownership = FilterOwnership.Ignore;
+            }
             var requestedRiskKey = GetArgumentValue(arguments, "--diagnose-risk-key");
             var hasRiskIndex = int.TryParse(GetArgumentValue(arguments, "--diagnose-risk-index"), out var riskIndex);
             if (hasRiskIndex || requestedRiskKey is not null)
@@ -338,6 +363,11 @@ public partial class MainWindow : Window
 
         return null;
     }
+
+    private static HashSet<string> ParseAutomationValues(string? value) =>
+        (value ?? "")
+        .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .ToHashSet(StringComparer.Ordinal);
 
     private void ApplyDarkTitleBar(object? sender, EventArgs e)
     {
@@ -637,6 +667,7 @@ public partial class MainWindow : Window
 
     private void LoadDecorationCatalog(string chartPath)
     {
+        _focusedRiskDecorationIndices = null;
         _decorationChoices.Clear();
         foreach (var item in DecorationCatalogReader.Read(chartPath))
         {
@@ -645,7 +676,7 @@ public partial class MainWindow : Window
 
         _decorationChoicesView = CollectionViewSource.GetDefaultView(_decorationChoices);
         _decorationChoicesView.Filter = item => item is DecorationRetentionItem choice &&
-            (HideBackgroundDecorationsCheckBox.IsChecked != true || choice.Item.Depth <= 0);
+            IsDecorationVisible(choice);
         DecorationRetentionList.ItemsSource = _decorationChoicesView;
         DecorationComparisonList.ItemsSource = null;
         DiagnosticComparisonPanel.Visibility = Visibility.Collapsed;
@@ -657,6 +688,7 @@ public partial class MainWindow : Window
 
     private void LoadFilterCatalog(string chartPath)
     {
+        _focusedRiskFilterKeys = null;
         _filterChoices.Clear();
         foreach (var item in FilterCatalogReader.Read(chartPath))
         {
@@ -673,9 +705,17 @@ public partial class MainWindow : Window
             };
             _filterChoices.Add(choice);
         }
-        FilterOwnershipGrid.ItemsSource = _filterChoices;
+        _filterChoicesView = CollectionViewSource.GetDefaultView(_filterChoices);
+        _filterChoicesView.Filter = item => item is FilterOwnershipItem choice &&
+            (_focusedRiskFilterKeys is null || _focusedRiskFilterKeys.Contains(choice.Item.Key));
+        FilterOwnershipGrid.ItemsSource = _filterChoicesView;
         RefreshFilterOwnershipSummary();
     }
+
+    private bool IsDecorationVisible(DecorationRetentionItem choice) =>
+        _focusedRiskDecorationIndices is not null
+            ? _focusedRiskDecorationIndices.Contains(choice.Item.Index)
+            : HideBackgroundDecorationsCheckBox.IsChecked != true || choice.Item.Depth <= 0;
 
     private void LoadVisualRisks(string chartPath)
     {
@@ -800,6 +840,21 @@ public partial class MainWindow : Window
         _decorationChoicesView?.Refresh();
     }
 
+    private void ShowAllDecorations_Click(object sender, RoutedEventArgs e)
+    {
+        _focusedRiskDecorationIndices = null;
+        _decorationChoicesView?.Refresh();
+        RetentionCountText.Text = "已恢复显示全谱装饰。";
+    }
+
+    private void ShowAllVisualEffects_Click(object sender, RoutedEventArgs e)
+    {
+        _focusedRiskFilterKeys = null;
+        _filterChoicesView?.Refresh();
+        FilterOwnershipSummaryText.Text = "已恢复显示全谱视觉效果。";
+        RefreshFilterOwnershipSummary();
+    }
+
     private void RetentionItem_Checked(object sender, RoutedEventArgs e)
     {
         if (!_viewReady) return;
@@ -906,6 +961,8 @@ public partial class MainWindow : Window
             RiskReviewTitleText.Text = "从左侧选择风险项";
             RiskReviewDetailText.Text = "";
             RiskReviewActionText.Text = "";
+            OpenRiskDecorationsButton.IsEnabled = false;
+            OpenRiskVisualEffectsButton.IsEnabled = false;
             RiskReferenceImage.Source = null;
             RiskCandidateImage.Source = null;
             return;
@@ -913,6 +970,14 @@ public partial class MainWindow : Window
         RiskReviewTitleText.Text = selected.Title;
         RiskReviewDetailText.Text = selected.Issue.Detail;
         RiskReviewActionText.Text = "分析线索（未经实测不能当结论）：" + selected.Issue.SuggestedAction;
+        var relatedDecorationCount = selected.Issue.RelatedDecorationIndices?.Count ??
+                                     (selected.Issue.DecorationIndex.HasValue ? 1 : 0);
+        var relatedFilterCount = selected.Issue.RelatedFilterKeys?.Count ??
+                                 (string.IsNullOrWhiteSpace(selected.Issue.FilterKey) ? 0 : 1);
+        OpenRiskDecorationsButton.IsEnabled = relatedDecorationCount > 0;
+        OpenRiskDecorationsButton.Content = $"查看相关装饰（{relatedDecorationCount:N0}）";
+        OpenRiskVisualEffectsButton.IsEnabled = relatedFilterCount > 0;
+        OpenRiskVisualEffectsButton.Content = $"查看相关视觉效果（{relatedFilterCount:N0}）";
         var strategies = BuildRiskStrategies(selected);
         var left = strategies.FirstOrDefault(static item => item.Kind.ToString().StartsWith("Bake", StringComparison.Ordinal))
                    ?? strategies.FirstOrDefault(static item => item.Kind == VisualRiskStrategyKind.VideoProFallback)
@@ -938,6 +1003,84 @@ public partial class MainWindow : Window
         }
         UpdateRiskPairLabels();
         RequestRiskPairRender();
+    }
+
+    private void OpenRiskDecorations_Click(object sender, RoutedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review) return;
+        var indices = (review.Issue.RelatedDecorationIndices ??
+                       (review.Issue.DecorationIndex is { } index ? [index] : []))
+            .ToHashSet();
+        if (indices.Count == 0) return;
+        _focusedRiskDecorationIndices = indices;
+        _decorationChoicesView?.Refresh();
+        VisualEditorTabs.SelectedItem = DecorationEditorTab;
+        var firstDecoration = _decorationChoices.FirstOrDefault(item => indices.Contains(item.Item.Index));
+        DecorationRetentionList.SelectedItem = firstDecoration;
+        if (firstDecoration is not null) DecorationRetentionList.ScrollIntoView(firstDecoration);
+        RetentionCountText.Text = $"当前风险相关装饰 {indices.Count:N0} 个；可逐项保留、烤入或隐藏。";
+    }
+
+    private void OpenRiskVisualEffects_Click(object sender, RoutedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review) return;
+        var keys = (review.Issue.RelatedFilterKeys ??
+                    (string.IsNullOrWhiteSpace(review.Issue.FilterKey) ? [] : [review.Issue.FilterKey]))
+            .ToHashSet(StringComparer.Ordinal);
+        if (keys.Count == 0) return;
+        _focusedRiskFilterKeys = keys;
+        _filterChoicesView?.Refresh();
+        VisualEditorTabs.SelectedItem = FilterEditorTab;
+        var firstEffect = _filterChoices.FirstOrDefault(item => keys.Contains(item.Item.Key));
+        FilterOwnershipGrid.SelectedItem = firstEffect;
+        if (firstEffect is not null) FilterOwnershipGrid.ScrollIntoView(firstEffect);
+        FilterOwnershipSummaryText.Text = $"当前风险相关视觉效果 {keys.Count:N0} 组；可逐项选择实时、烤入、两边保留或忽略。";
+    }
+
+    private void CompareSelectedVisualEffect_Click(object sender, RoutedEventArgs e)
+    {
+        if (_chart is null || FilterOwnershipGrid.SelectedItem is not FilterOwnershipItem selected)
+        {
+            DarkDialog.Show(this, "请先在列表中选择一个视觉效果。", "尚未选择视觉效果");
+            return;
+        }
+
+        var key = $"manual-filter:{selected.Item.Key}";
+        var review = _riskReviews.FirstOrDefault(item => item.Issue.Key.Equals(key, StringComparison.Ordinal));
+        if (review is null)
+        {
+            var targeted = !string.IsNullOrWhiteSpace(selected.Item.TargetTag) ||
+                           !selected.Item.TargetType.Equals("Camera", StringComparison.OrdinalIgnoreCase);
+            var history = selected.Item.Key.Equals("builtin:HallOfMirrors", StringComparison.Ordinal);
+            var kind = history
+                ? VisualRiskKind.HistoryFeedback
+                : targeted
+                    ? VisualRiskKind.TargetedFilter
+                    : VisualRiskKind.SplitFilter;
+            var issue = new VisualRiskIssue(
+                $"视觉效果对照：{selected.DisplayName}",
+                $"格 {selected.FirstFloor} 首次调用；{selected.EventKind} · {selected.Plane} · {selected.TargetDescription}，" +
+                $"全谱共 {selected.InvocationCount:N0} 次。这里直接比较烤入视频、保留实时和完整 Video Pro，" +
+                "不要求用户先猜哪一种会正确。",
+                selected.FirstFloor,
+                key,
+                kind,
+                VisualRiskSeverity.Warning,
+                VisualRiskAnalyzer.TimeAtFloor(_chart.Path, selected.FirstFloor),
+                RequiresComparison: true,
+                RequiresContinuousFrames: history || selected.InvocationCount > 1,
+                FilterKey: selected.Item.Key,
+                SuggestedAction: "先看左右最终合成，再应用更接近原版的一侧；若两侧都不对，继续比较共层、前后景拆分或 Video Pro。",
+                RelatedFilterKeys: [selected.Item.Key]);
+            review = new VisualRiskReviewItem(issue);
+            review.PropertyChanged += (_, _) => RefreshRiskReviewSummary();
+            _riskReviews.Add(review);
+            RefreshRiskReviewSummary();
+        }
+
+        RiskReviewGrid.SelectedItem = review;
+        RiskReviewGrid.ScrollIntoView(review);
+        VisualEditorTabs.SelectedItem = RiskReviewTab;
     }
 
     private void VisualEditorTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1322,6 +1465,8 @@ public partial class MainWindow : Window
                 VisualRiskStrategyKind.RetainMaskDependencyClosure or
                 VisualRiskStrategyKind.RetainAllMaskDependencyClosures or
                 VisualRiskStrategyKind.RetainDynamicImageSequence or
+                VisualRiskStrategyKind.RetainTrackForegroundDependencies or
+                VisualRiskStrategyKind.RetainHistoryDependencies or
                 VisualRiskStrategyKind.RetainParticleSystems;
             var bakeDependencies = strategy.Kind is
                 VisualRiskStrategyKind.BakeTargetedFilterWithTargets or
@@ -1462,9 +1607,17 @@ public partial class MainWindow : Window
                     "候选：反馈滤镜作用于最终合成",
                     "先播放视频并合成轨道、粒子和实时前景，再由游戏执行历史帧反馈；必须用实际风险片段验证。"));
                 strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainHistoryDependencies,
+                    "候选：Hall 依赖装饰全部留在实时层",
+                    $"把这次 Hall 重启分支关联的 {decorationCount:N0} 个装饰留给游戏，与轨道、Bloom 和历史缓冲同层计算；其他装饰仍可进入视频。"));
+                strategies.Add(new VisualRiskStrategyOption(
                     VisualRiskStrategyKind.PrewarmHistory,
                     "候选：从更早时间预热反馈缓冲",
                     "诊断时提前 10 秒开始计算历史帧，排除因为直接跳到风险格导致反馈缓冲为空。正式完整渲染会从关卡开头自然预热。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：Video VFX Pro 保留负深度前景参与反馈",
+                    "正深度背景装饰进入视频；负深度装饰继续位于轨道上方，并与轨道一起进入实时 Hall。适合历史缓冲依赖前景层级的段落。"));
                 strategies.Add(new VisualRiskStrategyOption(
                     VisualRiskStrategyKind.DisableFilterCompromise,
                     "诊断候选：关闭反馈滤镜（妥协）",
@@ -1501,6 +1654,10 @@ public partial class MainWindow : Window
                         onlyBackgroundFilters
                             ? "滤镜只声明作用背景平面；连同背景装饰预渲染，派生谱关闭重复滤镜。"
                             : "滤镜跨越多个平面；只作为真实对照候选，若影响轨道或实时前景就不能采用。"));
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundAndGlobalKeepRealtimeFilters,
+                        "候选：滤镜预处理视频，同时保留实时轨道效果",
+                        "同一组滤镜先处理烤入的视频层，并继续由游戏处理最终轨道；用于滤镜影响轨道、但对 bgVideo 与原装饰层处理不等价的段落。必须实测，不能凭名称采用。"));
                 }
                 strategies.Add(new VisualRiskStrategyOption(
                     VisualRiskStrategyKind.FinalCompositeRealtime,
@@ -1512,10 +1669,6 @@ public partial class MainWindow : Window
                         VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime,
                         "候选：只烤背景平面滤镜",
                         "背景滤镜随背景视频预渲染，前景滤镜留到最终合成继续处理轨道与实时前景。"));
-                    strategies.Add(new VisualRiskStrategyOption(
-                        VisualRiskStrategyKind.BakeBackgroundAndGlobalKeepRealtimeFilters,
-                        "候选：背景与全画面滤镜烤入，全画面滤镜同时实时",
-                        "全画面滤镜既预处理视频背景，也保留给实时轨道；背景专用滤镜只烤入，前景滤镜只实时。"));
                     strategies.Add(new VisualRiskStrategyOption(
                         VisualRiskStrategyKind.BakeForegroundPlaneKeepBackgroundRealtime,
                         "反向对照：只烤前景平面滤镜",
@@ -1548,6 +1701,16 @@ public partial class MainWindow : Window
                     VisualRiskStrategyKind.SwitchToVideoVfxPro,
                     "候选：Video VFX Pro 保留前景换图",
                     "只烤背景装饰，前景换图序列留在派生谱，适合换图对象会遮挡轨道的情况。"));
+                break;
+            case VisualRiskKind.TrackLayerCrossing:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainTrackForegroundDependencies,
+                    "候选：只保留跨轨道的负深度前景",
+                    $"把分析出的 {decorationCount:N0} 个负深度装饰留在游戏层；其他装饰继续烤入视频，尽量缩小实时贴图集合。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：Video VFX Pro 保留全部负深度前景",
+                    "背景装饰进入视频，所有深度小于 0 的前景保持原版轨道上方层级；适合前景滤镜、闪光和遮挡相互依赖的段落。"));
                 break;
             case VisualRiskKind.ParticleComposition:
                 strategies.Add(new VisualRiskStrategyOption(
@@ -1630,6 +1793,8 @@ public partial class MainWindow : Window
                 case VisualRiskStrategyKind.RetainTargetedFilterWithTargets:
                 case VisualRiskStrategyKind.RetainMaskDependencyClosure:
                 case VisualRiskStrategyKind.RetainDynamicImageSequence:
+                case VisualRiskStrategyKind.RetainTrackForegroundDependencies:
+                case VisualRiskStrategyKind.RetainHistoryDependencies:
                 case VisualRiskStrategyKind.RetainParticleSystems:
                     baked.ExceptWith(filterKeys);
                     disabled.ExceptWith(filterKeys);
@@ -2480,7 +2645,10 @@ public partial class MainWindow : Window
         }
     }
 
-    private sealed record FilterOwnershipOption(string Label, FilterOwnership Value);
+    private sealed record FilterOwnershipOption(string Label, FilterOwnership Value)
+    {
+        public override string ToString() => Label;
+    }
 
     private sealed class FilterOwnershipItem : INotifyPropertyChanged
     {
@@ -2550,6 +2718,8 @@ public partial class MainWindow : Window
         RetainAllMaskDependencyClosures,
         BakeDynamicImageSequence,
         RetainDynamicImageSequence,
+        RetainTrackForegroundDependencies,
+        RetainHistoryDependencies,
         BakeParticleSystems,
         RetainParticleSystems,
         DisableFilterCompromise,
@@ -2565,7 +2735,14 @@ public partial class MainWindow : Window
     private sealed record VisualRiskStrategyOption(
         VisualRiskStrategyKind Kind,
         string Label,
-        string Description);
+        string Description)
+    {
+        // WPF's ComboBox can fall back to the item's string representation when
+        // a nested private record is used as the ItemsSource, even with
+        // DisplayMemberPath set. Keep that fallback user-facing rather than
+        // exposing the generated record dump in the risk editor.
+        public override string ToString() => Label;
+    }
 
     private sealed class VisualRiskReviewItem : INotifyPropertyChanged
     {

@@ -33,6 +33,9 @@ var tests = new (string Name, Action Run)[]
     ("Decoration catalog uses first invocation", DecorationCatalogUsesFirstInvocation),
     ("Filter catalog groups by target", FilterCatalogGroupsByTarget),
     ("Visual risk analyzer finds missing assets and split effects", VisualRiskAnalyzerFindsMissingAssetsAndSplitEffects),
+    ("Visual risk analyzer keeps each Hall activation", VisualRiskAnalyzerKeepsEachHallActivation),
+    ("Visual risk analyzer keeps complete filter transitions", VisualRiskAnalyzerKeepsCompleteFilterTransitions),
+    ("History pre-roll follows an uncleared Hall segment", HistoryPreRollFollowsUnclearedHallSegment),
     ("Texture catalog finds unique referenced files", TextureCatalogFindsUniqueReferencedFiles),
     ("Derived chart disables selected filters", DerivedChartDisablesSelectedFilters),
     ("Canonical render output layout", CanonicalRenderOutputLayout),
@@ -706,10 +709,127 @@ static void VisualRiskAnalyzerFindsMissingAssetsAndSplitEffects()
         True(mask.Title.Contains("遮罩", StringComparison.Ordinal));
         True(mask.RelatedFilterKeys?.Contains("basic:Aberration", StringComparer.Ordinal) == true);
         True(issues.Any(issue => issue.Title.Contains("局部", StringComparison.Ordinal)));
-        True(issues.Any(issue => issue.Kind == VisualRiskKind.HistoryFeedback && issue.RequiresContinuousFrames));
+        True(issues.Any(issue => issue.Kind == VisualRiskKind.HistoryFeedback &&
+                                 issue.RequiresContinuousFrames &&
+                                 issue.Severity == VisualRiskSeverity.Error));
         True(issues.Any(issue => issue.Kind == VisualRiskKind.NegativeFilterParameter));
         True(issues.Any(issue => issue.Kind == VisualRiskKind.SourceBackgroundVideo && issue.RequiresComparison));
         True(issues.All(issue => !string.IsNullOrWhiteSpace(issue.Key)));
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void VisualRiskAnalyzerKeepsEachHallActivation()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-history-risk-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180, 0, 180, 0],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 1, "eventType": "HallOfMirrors", "enabled": true},
+            {"floor": 2, "eventType": "HallOfMirrors", "enabled": false},
+            {"floor": 3, "eventType": "SetFilter", "filter": "Posterize", "enabled": true},
+            {"floor": 3, "eventType": "HallOfMirrors", "enabled": true},
+            {"floor": 3, "eventType": "MoveDecorations", "tag": "branch-a", "opacity": 100}
+          ],
+          "decorations": [
+            {"floor": 0, "eventType": "AddDecoration", "tag": "branch-a", "decorationImage": "prefab:old", "depth": 1},
+            {"floor": 3, "eventType": "AddDecoration", "tag": "branch-a", "decorationImage": "prefab:test", "depth": 1}
+          ]
+        }
+        """);
+
+        var history = VisualRiskAnalyzer.Analyze(chartPath)
+            .Where(issue => issue.Kind == VisualRiskKind.HistoryFeedback)
+            .OrderBy(issue => issue.FirstFloor)
+            .ToArray();
+        Equal(2, history.Length);
+        Equal(1, history[0].FirstFloor);
+        Equal(3, history[1].FirstFloor);
+        Equal("history-feedback:3", history[1].Key);
+        True(history[1].RelatedFilterKeys?.Contains("basic:Posterize", StringComparer.Ordinal) == true);
+        True(history[1].RelatedDecorationIndices?.Contains(0) == true);
+        True(history[1].RelatedDecorationIndices?.Contains(1) == true);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void VisualRiskAnalyzerKeepsCompleteFilterTransitions()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-transition-risk-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180, 0],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 1, "eventType": "SetFilter", "filter": "MotionBlur", "enabled": true},
+            {"floor": 1, "eventType": "SetFilter", "filter": "Posterize", "enabled": true},
+            {"floor": 1, "eventType": "Bloom", "enabled": true},
+            {"floor": 1, "eventType": "MoveDecorations", "tag": "film", "decorationImage": "frame2.png"},
+            {"floor": 1, "eventType": "Flash", "plane": "Foreground"}
+          ],
+          "decorations": [
+            {"floor": 1, "eventType": "AddDecoration", "tag": "film", "decorationImage": "prefab:test", "depth": -1}
+          ]
+        }
+        """);
+
+        var issue = VisualRiskAnalyzer.Analyze(chartPath)
+            .Single(item => item.Key == "filter-transition:1");
+        Equal(VisualRiskKind.SplitFilter, issue.Kind);
+        Equal(3, issue.RelatedFilterKeys?.Count);
+        True(issue.RelatedDecorationIndices?.Contains(0) == true);
+        var crossing = VisualRiskAnalyzer.Analyze(chartPath)
+            .Single(item => item.Key == "track-layer-crossing:1");
+        Equal(VisualRiskKind.TrackLayerCrossing, crossing.Kind);
+        True(crossing.RelatedDecorationIndices?.Contains(0) == true);
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void HistoryPreRollFollowsUnclearedHallSegment()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-history-preroll-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 0, 0, 0, 0, 0],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [
+            {"floor": 1, "eventType": "HallOfMirrors", "enabled": true},
+            {"floor": 3, "eventType": "HallOfMirrors", "enabled": false, "angleOffset": 179.9999},
+            {"floor": 4, "eventType": "HallOfMirrors", "enabled": true}
+          ],
+          "decorations": []
+        }
+        """);
+        var activation = VisualRiskAnalyzer.TimeAtFloor(chartPath, 4);
+        var firstEnable = VisualRiskAnalyzer.TimeAtFloor(chartPath, 1);
+        Near(
+            activation - Math.Max(0d, firstEnable - 1d / 30d),
+            VisualRiskAnalyzer.CalculateHistoryPreRollSeconds(chartPath, activation, 30),
+            0.000001d);
     }
     finally
     {

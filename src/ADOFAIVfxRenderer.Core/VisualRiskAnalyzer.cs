@@ -15,6 +15,7 @@ public enum VisualRiskKind
     ParticleComposition,
     CreatedObject,
     SourceBackgroundVideo,
+    TrackLayerCrossing,
     MemoryPressure,
 }
 
@@ -48,6 +49,43 @@ public static class VisualRiskAnalyzer
     {
         var root = AdoJson.ParseObject(File.ReadAllText(Path.GetFullPath(chartPath)));
         return DecorationCatalogReader.BuildTimeline(root).TimeAtFloorAngleOffset(floor, angleOffset);
+    }
+
+    public static double CalculateHistoryPreRollSeconds(
+        string chartPath,
+        double activationTimeSeconds,
+        int framesPerSecond = 30,
+        double maximumSeconds = 50d)
+    {
+        var root = AdoJson.ParseObject(File.ReadAllText(Path.GetFullPath(chartPath)));
+        var timeline = DecorationCatalogReader.BuildTimeline(root);
+        var events = (root["actions"] as JsonArray ?? [])
+            .OfType<JsonObject>()
+            .Select((action, order) => new
+            {
+                Action = action,
+                Order = order,
+                Time = timeline.TimeAtFloorAngleOffset(
+                    action["floor"]?.GetValue<int>() ?? 0,
+                    action["angleOffset"]?.GetValue<double>() ?? 0d),
+            })
+            .Where(static entry => entry.Action["eventType"]?.GetValue<string>() == "HallOfMirrors")
+            .OrderBy(static entry => entry.Time)
+            .ThenBy(static entry => entry.Order)
+            .ToArray();
+        var prior = events
+            .Where(entry => entry.Time < activationTimeSeconds - 0.0000001d)
+            .ToArray();
+        var lastDisable = prior.LastOrDefault(entry => !AdoJson.ReadBoolean(entry.Action["enabled"], true));
+        var frameSeconds = 1d / Math.Max(1, framesPerSecond);
+        if (lastDisable is not null && activationTimeSeconds - lastDisable.Time >= frameSeconds)
+            return Math.Min(maximumSeconds, Math.Min(3d, activationTimeSeconds));
+        var previousEnable = prior.LastOrDefault(entry => AdoJson.ReadBoolean(entry.Action["enabled"], true));
+        // Seed the feedback target with one ordinary cleared frame before Hall is
+        // enabled. Starting exactly on the enable event would preserve an empty
+        // black target instead of the scene that the game had on the prior frame.
+        var start = previousEnable is null ? 0d : Math.Max(0d, previousEnable.Time - frameSeconds);
+        return Math.Clamp(activationTimeSeconds - start, 0d, maximumSeconds);
     }
 
     public static IReadOnlyList<VisualRiskIssue> Analyze(string chartPath)
@@ -241,7 +279,9 @@ public static class VisualRiskAnalyzer
                 segment.Key,
                 $"filter-segment:{segment.Key}",
                 kind,
-                unsupported ? VisualRiskSeverity.Error : VisualRiskSeverity.Warning,
+                kind == VisualRiskKind.HistoryFeedback || unsupported
+                    ? VisualRiskSeverity.Error
+                    : VisualRiskSeverity.Warning,
                 time,
                 RequiresContinuousFrames: hall || filters.Length > 1,
                 FilterKey: filters[0].Key,
@@ -250,6 +290,138 @@ public static class VisualRiskAnalyzer
                     : "当前选择性 Worker 没有这组滤镜的独立实现；仍须实测最终合成实时、完整历史预热和可安全共层的候选，不能直接猜结论。",
                 RelatedFilterKeys: filters.Select(static filter => filter.Key).ToArray(),
                 RelatedDecorationIndices: targetedDecorationIndices));
+        }
+
+        // FilterCatalogReader intentionally groups identical filter keys for ownership
+        // controls. A risk navigator cannot do that for history feedback: every later
+        // HallOfMirrors enable begins a new history buffer segment with a different
+        // scene/filter/decorations context. Keep the first grouped item above and add
+        // every later activation as its own directly renderable branch.
+        var existingHistoryFloors = result
+            .Where(static issue => issue.Kind == VisualRiskKind.HistoryFeedback)
+            .Select(static issue => issue.FirstFloor ?? -1)
+            .ToHashSet();
+        foreach (var hall in actions.Where(static action =>
+                     action["eventType"]?.GetValue<string>() == "HallOfMirrors" &&
+                     AdoJson.ReadBoolean(action["enabled"], true)))
+        {
+            var floor = hall["floor"]?.GetValue<int>() ?? 0;
+            if (!existingHistoryFloors.Add(floor)) continue;
+            var hallTime = TimeAt(hall);
+            var sameFloorFilters = actions
+                .Where(action => (action["floor"]?.GetValue<int>() ?? 0) == floor)
+                .Select(FilterCatalogReader.CreateKey)
+                .Where(static key => !string.IsNullOrWhiteSpace(key))
+                .Cast<string>()
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var branchTags = actions
+                .Where(action => (action["floor"]?.GetValue<int>() ?? 0) == floor ||
+                                 (TimeAt(action) <= hallTime && hallTime - TimeAt(action) <= 1d / 30d))
+                .SelectMany(action => SplitTags(action["tag"]?.GetValue<string>()))
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var tag in decorations
+                         .Where(decoration => (decoration["floor"]?.GetValue<int>() ?? 0) == floor)
+                         .SelectMany(decoration => SplitTags(decoration["tag"]?.GetValue<string>())))
+                branchTags.Add(tag);
+            var relatedDecorations = decorations
+                .Select((decoration, index) => new { decoration, index })
+                .Where(entry => (entry.decoration["floor"]?.GetValue<int>() ?? 0) == floor ||
+                                SplitTags(entry.decoration["tag"]?.GetValue<string>()).Any(branchTags.Contains))
+                .Select(static entry => entry.index)
+                .Distinct()
+                .Order()
+                .ToArray();
+            var filterNames = sameFloorFilters.Length == 0
+                ? "HallOfMirrors"
+                : string.Join("、", sameFloorFilters);
+            result.Add(new VisualRiskIssue(
+                "历史帧反馈重新开启",
+                $"格 {floor} 重新开启 HallOfMirrors；同格分支包含 {sameFloorFilters.Length:N0} 组滤镜（{filterNames}）" +
+                $"与 {relatedDecorations.Length:N0} 个新建或同标签装饰。这个段落不能沿用第一次 Hall 的结论。",
+                floor,
+                $"history-feedback:{floor}",
+                VisualRiskKind.HistoryFeedback,
+                VisualRiskSeverity.Error,
+                hallTime,
+                RequiresComparison: true,
+                RequiresContinuousFrames: true,
+                FilterKey: "builtin:HallOfMirrors",
+                SuggestedAction: "单独渲染这次重新开启后的连续片段，比较实时反馈、整组预烤与完整 Video Pro。",
+                RelatedFilterKeys: sameFloorFilters,
+                RelatedDecorationIndices: relatedDecorations));
+        }
+
+        var historyActivationFloors = result
+            .Where(static issue => issue.Kind == VisualRiskKind.HistoryFeedback)
+            .Select(static issue => issue.FirstFloor ?? -1)
+            .ToHashSet();
+        var complexFilterTransitions = actions
+            .Where(static action => FilterCatalogReader.CreateKey(action) is not null)
+            .GroupBy(static action => action["floor"]?.GetValue<int>() ?? 0)
+            .Where(group => group.Count() >= 3 && !historyActivationFloors.Contains(group.Key))
+            .Where(group => actions.Any(action =>
+                (action["floor"]?.GetValue<int>() ?? 0) == group.Key &&
+                action["eventType"]?.GetValue<string>() is "MoveDecorations" or "Flash"))
+            .ToArray();
+        foreach (var transition in complexFilterTransitions)
+        {
+            var floor = transition.Key;
+            var filterKeys = transition
+                .Select(FilterCatalogReader.CreateKey)
+                .Where(static key => !string.IsNullOrWhiteSpace(key))
+                .Cast<string>()
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var branchTags = actions
+                .Where(action => (action["floor"]?.GetValue<int>() ?? 0) == floor)
+                .SelectMany(action => SplitTags(action["tag"]?.GetValue<string>()))
+                .ToHashSet(StringComparer.Ordinal);
+            var relatedDecorations = decorations
+                .Select((decoration, index) => new { decoration, index })
+                .Where(entry => (entry.decoration["floor"]?.GetValue<int>() ?? 0) == floor ||
+                                SplitTags(entry.decoration["tag"]?.GetValue<string>()).Any(branchTags.Contains))
+                .Select(static entry => entry.index)
+                .Distinct()
+                .Order()
+                .ToArray();
+            var first = transition.OrderBy(TimeAt).First();
+            result.Add(new VisualRiskIssue(
+                "同格滤镜链与动态层切换",
+                $"格 {floor} 同时切换 {filterKeys.Length:N0} 组滤镜，并触发换图或前后景闪光；" +
+                $"相关装饰分支有 {relatedDecorations.Length:N0} 个。只测试其中一个滤镜不能代表这段合成。",
+                floor,
+                $"filter-transition:{floor}",
+                VisualRiskKind.SplitFilter,
+                VisualRiskSeverity.Error,
+                TimeAt(first),
+                RequiresComparison: true,
+                RequiresContinuousFrames: true,
+                FilterKey: filterKeys.FirstOrDefault() ?? "",
+                SuggestedAction: "整组比较实时处理、视频预处理且实时保留、全部预烤；逐帧换图仅在前两者仍失败时才保留实时。",
+                RelatedFilterKeys: filterKeys,
+                RelatedDecorationIndices: relatedDecorations));
+
+            var negativeDepthDecorations = relatedDecorations
+                .Where(index => decorations[index]["depth"]?.GetValue<int>() < 0)
+                .ToArray();
+            if (negativeDepthDecorations.Length > 0)
+            {
+                result.Add(new VisualRiskIssue(
+                    "前景装饰会跨过轨道层级",
+                    $"格 {floor} 的 {negativeDepthDecorations.Length:N0} 个相关装饰深度小于 0，原谱位于轨道上方。" +
+                    "标准 Video VFX 把它们压进单层 bgVideo 后会落到轨道下方；同段滤镜、闪光或逐帧换图可能因此爆闪或改变遮挡。",
+                    floor,
+                    $"track-layer-crossing:{floor}",
+                    VisualRiskKind.TrackLayerCrossing,
+                    VisualRiskSeverity.Error,
+                    TimeAt(first),
+                    RequiresComparison: true,
+                    RequiresContinuousFrames: true,
+                    SuggestedAction: "优先比较 Video VFX Pro 或只保留这些负深度前景；若要继续烤入，必须证明它们不参与轨道遮挡和滤镜输入。",
+                    RelatedFilterKeys: filterKeys,
+                    RelatedDecorationIndices: negativeDepthDecorations));
+            }
         }
 
         var negativeFilters = actions.Select((action, index) => new { Action = action, Index = index })

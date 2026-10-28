@@ -63,24 +63,16 @@ internal static partial class VisualRiskDiagnosticClient
             placeholderMaximumSide: 0);
 
         var chartDirectory = Path.GetDirectoryName(chart.Path)!;
-        var safeKey = InvalidFileName().Replace(issue.Key + "-" + options.DiagnosticLabel, "-").Trim('-');
-        if (safeKey.Length == 0) safeKey = "visual-risk";
-        if (safeKey.Length > 80) safeKey = safeKey[..80];
-        var diagnosticRoot = Path.Combine(
-            chartDirectory,
-            "ADOFAIVfxRenderer Diagnostics",
-            $"{DateTime.Now:yyyyMMdd-HHmmss-fff}-risk-frame-{safeKey}");
-        Directory.CreateDirectory(diagnosticRoot);
-        PreRenderCacheRegistry.Register(diagnosticRoot);
+        var diagnosticRoot = CreateDiagnosticRoot(chartDirectory, singleFrame: true);
 
         var firstPlayableFloorSeconds = (double)DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
         var sampleTime = issue.TimeSeconds.Value + (issue.RequiresContinuousFrames ? 3d : 0.001d);
-        var startTime = issue.Kind == VisualRiskKind.HistoryFeedback
-            ? Math.Max(0d, firstPlayableFloorSeconds)
-            : Math.Max(0d, issue.TimeSeconds.Value - (issue.RequiresContinuousFrames ? 3d : 0.25d));
+        var startTime = Math.Max(0d, issue.TimeSeconds.Value - (issue.RequiresContinuousFrames ? 3d : 0.25d));
         if (options.PreRollSeconds.HasValue)
             startTime = Math.Max(0d, issue.TimeSeconds.Value - options.PreRollSeconds.Value);
         var durationSeconds = Math.Max(1d, sampleTime - startTime + 0.25d);
+        var backgroundStartTime = Math.Max(0d, Math.Min(startTime, firstPlayableFloorSeconds));
+        var backgroundDurationSeconds = Math.Max(1d, sampleTime - backgroundStartTime + 0.25d);
         var backgroundDirectory = Path.Combine(diagnosticRoot, "candidate-background");
         var candidateDirectory = Path.Combine(diagnosticRoot, "candidate-final");
         var framePath = Path.Combine(candidateDirectory, "candidate-frame.jpg");
@@ -91,7 +83,7 @@ internal static partial class VisualRiskDiagnosticClient
         try
         {
             WorkerRunResult candidate;
-            if (options.DiagnosticLabel.Equals("VideoProFallback", StringComparison.Ordinal))
+            if (options.DiagnosticLabel.StartsWith("VideoProFallback", StringComparison.Ordinal))
             {
                 progress?.Report("正在用原版完整合成生成这一帧……");
                 candidate = await RunWorkerAsync(
@@ -117,22 +109,19 @@ internal static partial class VisualRiskDiagnosticClient
                     installation,
                     chart.Path,
                     backgroundDirectory,
-                    startTime,
-                    durationSeconds,
+                    backgroundStartTime,
+                    backgroundDurationSeconds,
                     installedRuntime: false,
                     profile: options.Profile,
                     content: content,
                     retainedDecorationIndices: options.RetainedDecorationIndices,
                     excludedDecorationIndices: options.ExcludedDecorationIndices,
-                    bakedFilterKeys: options.BakedFilterKeys,
-                    diagnoseRenderFrame: Math.Max(
-                        0,
-                        (int)Math.Round((sampleTime - startTime) * FramesPerSecond, MidpointRounding.AwayFromZero)));
+                    bakedFilterKeys: options.BakedFilterKeys);
 
                 var retained = new HashSet<int>(options.RetainedDecorationIndices);
                 retained.UnionWith(background.UnbakedDecorationIndices);
                 var renderStartAfterFirstPlayableFloor =
-                    (decimal)startTime - (decimal)firstPlayableFloorSeconds;
+                    (decimal)backgroundStartTime - (decimal)firstPlayableFloorSeconds;
                 DerivedChartExporter.Export(
                     chart.Path,
                     background.VideoPath,
@@ -193,20 +182,10 @@ internal static partial class VisualRiskDiagnosticClient
             placeholderMaximumSide: 0);
 
         var chartDirectory = Path.GetDirectoryName(chart.Path)!;
-        var safeKey = InvalidFileName().Replace(issue.Key + "-" + options.DiagnosticLabel, "-").Trim('-');
-        if (safeKey.Length == 0) safeKey = "visual-risk";
-        if (safeKey.Length > 80) safeKey = safeKey[..80];
-        var diagnosticRoot = Path.Combine(
-            chartDirectory,
-            "ADOFAIVfxRenderer Diagnostics",
-            $"{DateTime.Now:yyyyMMdd-HHmmss}-risk-{safeKey}");
-        Directory.CreateDirectory(diagnosticRoot);
-        PreRenderCacheRegistry.Register(diagnosticRoot);
+        var diagnosticRoot = CreateDiagnosticRoot(chartDirectory, singleFrame: false);
 
         var firstPlayableFloorSeconds = (double)DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
-        var warmup = options.PreRollSeconds ?? (issue.Kind == VisualRiskKind.HistoryFeedback
-            ? Math.Max(0d, issue.TimeSeconds.Value - firstPlayableFloorSeconds)
-            : issue.RequiresContinuousFrames ? 3d : 0.5d);
+        var warmup = options.PreRollSeconds ?? (issue.RequiresContinuousFrames ? 3d : 0.5d);
         var startTime = Math.Max(0d, issue.TimeSeconds.Value - warmup);
         var effectiveWarmup = issue.TimeSeconds.Value - startTime;
         var requiredPostRiskSeconds = issue.Kind == VisualRiskKind.HistoryFeedback ? 10d : 1d;
@@ -214,6 +193,10 @@ internal static partial class VisualRiskDiagnosticClient
             Math.Max(options.DurationSeconds, effectiveWarmup + requiredPostRiskSeconds),
             1d,
             60d);
+        var backgroundStartTime = Math.Max(0d, Math.Min(startTime, firstPlayableFloorSeconds));
+        var backgroundDurationSeconds = Math.Max(
+            1d,
+            startTime + durationSeconds - backgroundStartTime);
         var referenceDirectory = Path.Combine(diagnosticRoot, "reference-original");
         var backgroundDirectory = Path.Combine(diagnosticRoot, "candidate-background");
         var candidateDirectory = Path.Combine(diagnosticRoot, "candidate-final");
@@ -244,19 +227,14 @@ internal static partial class VisualRiskDiagnosticClient
                 installation,
                 chart.Path,
                 backgroundDirectory,
-                startTime,
-                durationSeconds,
+                backgroundStartTime,
+                backgroundDurationSeconds,
                 installedRuntime: false,
                 profile: options.Profile,
                 content: content,
                 retainedDecorationIndices: options.RetainedDecorationIndices,
                 excludedDecorationIndices: options.ExcludedDecorationIndices,
-                bakedFilterKeys: options.BakedFilterKeys,
-                diagnoseRenderFrame: Math.Max(
-                    0,
-                    (int)Math.Round(
-                        (issue.TimeSeconds.Value + 3d - startTime) * FramesPerSecond,
-                        MidpointRounding.AwayFromZero)));
+                bakedFilterKeys: options.BakedFilterKeys);
 
             var retained = new HashSet<int>(options.RetainedDecorationIndices);
             retained.UnionWith(background.UnbakedDecorationIndices);
@@ -265,7 +243,7 @@ internal static partial class VisualRiskDiagnosticClient
             // clocks shifts the temporary video by the entire countdown/first-tile
             // interval and makes a correct candidate look visually wrong.
             var renderStartAfterFirstPlayableFloor =
-                (decimal)startTime - (decimal)firstPlayableFloorSeconds;
+                (decimal)backgroundStartTime - (decimal)firstPlayableFloorSeconds;
             DerivedChartExporter.Export(
                 chart.Path,
                 background.VideoPath,
@@ -455,6 +433,17 @@ internal static partial class VisualRiskDiagnosticClient
         await process.WaitForExitAsync();
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"FFmpeg 提取风险对照图失败，退出代码 {process.ExitCode}。");
+    }
+
+    private static string CreateDiagnosticRoot(string chartDirectory, bool singleFrame)
+    {
+        var cacheRoot = Path.Combine(chartDirectory, ".vfxd");
+        var diagnosticRoot = Path.Combine(
+            cacheRoot,
+            $"{DateTime.Now:yyyyMMddHHmmss}-{(singleFrame ? "f" : "c")}-{Guid.NewGuid():N}"[..26]);
+        Directory.CreateDirectory(diagnosticRoot);
+        PreRenderCacheRegistry.Register(diagnosticRoot);
+        return diagnosticRoot;
     }
 
     private static async Task ExtractSingleFrameAsync(
