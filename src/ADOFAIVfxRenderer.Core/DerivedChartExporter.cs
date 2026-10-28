@@ -26,7 +26,8 @@ public static class DerivedChartExporter
         decimal renderStartSeconds = 0m,
         IReadOnlySet<int>? retainedDecorationIndices = null,
         IReadOnlySet<int>? excludedDecorationIndices = null,
-        IReadOnlySet<string>? disabledFilterKeys = null)
+        IReadOnlySet<string>? disabledFilterKeys = null,
+        string? outputChartPath = null)
     {
         sourceChartPath = Path.GetFullPath(sourceChartPath);
         renderedVideoPath = Path.GetFullPath(renderedVideoPath);
@@ -56,7 +57,9 @@ public static class DerivedChartExporter
         var disabledFilterEvents = DisableBakedFilters(root, profile, disabledFilterKeys);
         if (profile == OutputProfile.VideoPro) HideLiveTrackAndPlanets(root);
 
-        var outputPath = RenderOutputLayout.Create(sourceChartPath, profile).DerivedChartPath;
+        var outputPath = string.IsNullOrWhiteSpace(outputChartPath)
+            ? RenderOutputLayout.Create(sourceChartPath, profile).DerivedChartPath
+            : Path.GetFullPath(outputChartPath);
         WriteTextAtomically(
             outputPath,
             root.ToJsonString(JsonOptions),

@@ -92,7 +92,7 @@ public static class DecorationCatalogReader
         return (declarationFloor, int.MaxValue - decorationIndex, 0d);
     }
 
-    private static AdoTimelineResult BuildTimeline(JsonObject root)
+    internal static AdoTimelineResult BuildTimeline(JsonObject root)
     {
         var settings = root["settings"] as JsonObject ?? new JsonObject();
         var initialBpm = settings["bpm"]?.GetValue<double>() ?? 100d;

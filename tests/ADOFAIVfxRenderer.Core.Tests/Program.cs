@@ -37,6 +37,7 @@ var tests = new (string Name, Action Run)[]
     ("Derived chart disables selected filters", DerivedChartDisablesSelectedFilters),
     ("Canonical render output layout", CanonicalRenderOutputLayout),
     ("Derived chart replaces canonical profile output", DerivedChartReplacesCanonicalOutput),
+    ("Derived chart supports isolated diagnostic output", DerivedChartSupportsDiagnosticOutput),
 };
 
 var failures = new List<string>();
@@ -292,6 +293,41 @@ static void DerivedChartReplacesCanonicalOutput()
     }
 }
 
+static void DerivedChartSupportsDiagnosticOutput()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-diagnostic-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var chartPath = Path.Combine(root, "main.adofai");
+        var videoPath = Path.Combine(root, "diagnostic.mp4");
+        var diagnosticChartPath = Path.Combine(root, ".risk-check.adofai");
+        File.WriteAllBytes(videoPath, [1]);
+        File.WriteAllText(chartPath, """
+        {
+          "angleData": [0, 180],
+          "settings": {"version": 19, "bpm": 120},
+          "actions": [],
+          "decorations": []
+        }
+        """);
+
+        var result = DerivedChartExporter.Export(
+            chartPath,
+            videoPath,
+            OutputProfile.VideoVfx,
+            outputChartPath: diagnosticChartPath);
+
+        Equal(diagnosticChartPath, result.ChartPath);
+        True(File.Exists(diagnosticChartPath));
+        False(File.Exists(RenderOutputLayout.Create(chartPath, OutputProfile.VideoVfx).DerivedChartPath));
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
 static void VideoSyncFollowsFirstPlayableFloor()
 {
     static System.Text.Json.Nodes.JsonObject Chart(double firstAngle) => new()
@@ -310,6 +346,7 @@ static void VideoSyncFollowsFirstPlayableFloor()
     Equal(-250, VideoSynchronizationCalculator.Calculate(Chart(270d)).VideoOffsetMilliseconds);
     Equal(250, VideoSynchronizationCalculator.Calculate(Chart(90d)).VideoOffsetMilliseconds);
     Equal(-500, VideoSynchronizationCalculator.Calculate(Chart(0d), 0.5m).VideoOffsetMilliseconds);
+    Equal(2000, VideoSynchronizationCalculator.Calculate(Chart(0d), -2m).VideoOffsetMilliseconds);
 
     var recommendedRoot = Chart(0d);
     var recommendedPath = Path.Combine(Path.GetTempPath(), $"adofai-vfx-render-start-{Guid.NewGuid():N}.adofai");
@@ -642,11 +679,13 @@ static void VisualRiskAnalyzerFindsMissingAssetsAndSplitEffects()
     try
     {
         var chartPath = Path.Combine(root, "main.adofai");
+        File.WriteAllBytes(Path.Combine(root, "background.mp4"), [0]);
         File.WriteAllText(chartPath, """
         {
           "angleData": [0, 180],
-          "settings": {"version": 19, "bpm": 120},
+          "settings": {"version": 19, "bpm": 120, "bgVideo": "background.mp4"},
           "actions": [
+            {"floor": 1, "eventType": "SetFilter", "filter": "Aberration", "intensity": -2},
             {"floor": 2, "eventType": "SetFilterAdvanced", "filter": "A", "plane": "Background"},
             {"floor": 3, "eventType": "SetFilterAdvanced", "filter": "B", "plane": "Foreground", "targetType": "Decoration", "targetTag": "x"},
             {"floor": 4, "eventType": "HallOfMirrors", "enabled": true}
@@ -658,10 +697,19 @@ static void VisualRiskAnalyzerFindsMissingAssetsAndSplitEffects()
         """);
 
         var issues = VisualRiskAnalyzer.Analyze(chartPath);
-        True(issues.Any(issue => issue.Title.Contains("缺少", StringComparison.Ordinal)));
-        True(issues.Any(issue => issue.Title.Contains("遮罩", StringComparison.Ordinal)));
+        var missing = issues.Single(issue => issue.Kind == VisualRiskKind.MissingAsset);
+        True(missing.Title.Contains("缺少", StringComparison.Ordinal));
+        True(missing.AffectsVideoPro);
+        False(missing.RequiresComparison);
+        True(missing.TimeSeconds.HasValue);
+        var mask = issues.Single(issue => issue.Kind == VisualRiskKind.MaskComposition);
+        True(mask.Title.Contains("遮罩", StringComparison.Ordinal));
+        True(mask.RelatedFilterKeys?.Contains("basic:Aberration", StringComparer.Ordinal) == true);
         True(issues.Any(issue => issue.Title.Contains("局部", StringComparison.Ordinal)));
-        True(issues.Any(issue => issue.Title.Contains("Hall", StringComparison.Ordinal)));
+        True(issues.Any(issue => issue.Kind == VisualRiskKind.HistoryFeedback && issue.RequiresContinuousFrames));
+        True(issues.Any(issue => issue.Kind == VisualRiskKind.NegativeFilterParameter));
+        True(issues.Any(issue => issue.Kind == VisualRiskKind.SourceBackgroundVideo && issue.RequiresComparison));
+        True(issues.All(issue => !string.IsNullOrWhiteSpace(issue.Key)));
     }
     finally
     {
@@ -701,7 +749,7 @@ static void FilterCatalogGroupsByTarget()
         True(items.Any(item => item.Key.EndsWith(":Decoration:mask-b", StringComparison.Ordinal)));
         False(items.Any(item => item.DisplayName == "Unused"));
         False(items.Single(item => item.Key.EndsWith(":Decoration:mask-a", StringComparison.Ordinal)).OfflineSupported);
-        False(items.Single(item => item.Key == "builtin:HallOfMirrors").OfflineSupported);
+        True(items.Single(item => item.Key == "builtin:HallOfMirrors").OfflineSupported);
     }
     finally
     {

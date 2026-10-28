@@ -33,8 +33,23 @@ Video Pro 使用所选游戏安装中的原版 `scnGame` 场景、事件组件�
 - 支持装饰贴图黑名单与白名单、引用顺序和深度排序、透明网格大图预览。
 - 支持生成十组同帧有图／无图对照，共二十张诊断图，并直接在程序中比较。
 - 支持按基本／高级滤镜、平面、目标类型和标签分组，分别选择保留实时、烤入视频或忽略。
-- 能识别当前选择性渲染器尚不能可靠烤入的滤镜组，并在开始前阻止错误配置；不会用猜测参数冒充原版效果。
+- 支持“烤入视频并保留实时”：同一滤镜可以预处理视频层，同时继续处理实时轨道；这类组合必须经过闭环对照，不能仅凭规则自动放行。
+- 能识别当前选择性渲染器尚不能可靠烤入的滤镜组，并在开始前阻止没有实现的配置；候选处理方式不会被直接写成“已解决”。
+- 支持源谱已有 `bgVideo`：选择性 Worker 使用 FFmpeg 顺序逐帧解码，保留 `vidOffset`、独立倒计时、循环和 `FitHorizontally` 画幅语义；不会把视频当作静态贴图或按墙钟速度播放。
+- 可将刚生成的 Video VFX 派生谱直接作为输入，执行一次独立的 Video Pro 最终合成验证；验证视频使用单独文件名，不覆盖原始源谱的 Video Pro 输出。
 - 支持游戏自身的谱面版本转换路径。当前验证基线为 3.x、Unity 6000.3.10f1；未知二进制版本会明确拒绝，不会套用未经验证的假设。
+
+## 拆层风险与候选实测
+
+Video、Video VFX 和 Video VFX Pro 会把原版相机栈拆成视频层与游戏实时层，因此遮罩、前后景滤镜、历史帧反馈、标签目标、运行中换图、粒子、背景视频和运镜可能在分层后改变语义。程序会按实际谱面自动定位风险格与绝对时间，并为每项风险建立确认门槛：
+
+1. 用所选游戏安装的原版场景渲染参考片段。
+2. 生成候选视频层和临时派生谱。
+3. 再用原版场景加载临时派生谱，渲染最终拆层合成。
+4. 在风险点前后提取同时间画面，计算 SSIM 仅用于排序，同时保留逐帧人工确认。
+5. 未完成对照、对照失败或标记“需要调整”的风险会阻止正式拆层任务加入队列。
+
+候选库会根据实际风险筛选不同处理方式，包括局部或全谱遮罩依赖闭包、背景／前景滤镜分别归属、滤镜同时预烤和实时、目标滤镜与目标对象共层、完整换图序列、粒子实时或预烤、历史缓冲从正式起点预热、Video／Video VFX Pro 切换，以及 Video Pro 完整压平。点击“实测全部候选”会真的逐个渲染同一风险片段；数值最接近只会被排到前面，不会自动变成“已解决”。“关闭效果”与“接受已知风险”始终标为妥协，不是默认方案。
 
 ## 输出与同步
 
@@ -59,7 +74,7 @@ Video Pro 使用所选游戏安装中的原版 `scnGame` 场景、事件组件�
 pwsh -File .\scripts\Build-UnityWorker.ps1
 pwsh -File .\scripts\Build-ResourcePatcher.ps1
 pwsh -File .\scripts\Publish-TestPackage.ps1 -SelfContained
-pwsh -File .\scripts\Build-ReleasePackages.ps1 -Version 0.1.3
+pwsh -File .\scripts\Build-ReleasePackages.ps1 -Version 0.1.4
 dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core.Tests.csproj
 ```
 
@@ -72,7 +87,7 @@ dotnet run --project .\tests\ADOFAIVfxRenderer.Core.Tests\ADOFAIVfxRenderer.Core
 - [INVERSION](https://tuforums.com/levels/17017)：大量 `AddObject`、对象动画、轨道、滤镜与玩家星球。
 - [Friday](https://tuforums.com/levels/17111)：高密度逐帧贴图与图形动画。
 - [Camellia - Seagull](https://tuforums.com/levels/12421)：横向宽屏滤镜、遮罩、开场聚合线条与运镜。
-- [THE STAR SYSTEM'S CALLING](https://tuforums.com/levels/15708)：轨道、粒子、复杂高级滤镜和相机效果。已对 327 Combo 附近做 35 秒闭环：先生成 Video VFX 与派生谱面，再由原版运行时逐帧播放背景视频并合成实时轨道、粒子和滤镜；蓝色隧道、环状残影与碎片均保留，没有再出现黑底或整屏炸白。原版 `VideoPlayer` 在离线渲染时会按谱面时间逐帧定位，而不是按墙钟速度播放。
+- [THE STAR SYSTEM'S CALLING](https://tuforums.com/levels/15708)：轨道、粒子、复杂高级滤镜、遮罩和历史帧反馈回归用例。风险系统会分别定位开场遮罩链与 327 Combo 历史反馈段，并从正式视频起点预热后生成闭环对照；没有通过的 Video VFX 候选会继续阻止正式拆层输出。Video Pro 仍是完整压平参考。
 - [Our Life](https://tuforums.com/levels/12613)：高密度遮罩与多组 Hall of Mirrors。
 - [PLUM MEGAMIX](https://tuforums.com/levels/6337)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 599.683 秒和 598.183 秒；另以 1 GB 贴图预算做原版场景压力测试，并用本机案例视频按场景时序对照，不只与渲染器旧输出互比。
 - [PLUM MEGAMIX 2](https://tuforums.com/levels/840)：Video Pro 与 Video VFX 均已完整输出 1920×1080、60 FPS，时长分别为 694.000 秒和 692.500 秒。

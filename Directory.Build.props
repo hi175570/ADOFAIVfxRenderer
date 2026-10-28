@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <Version>0.1.3</Version>
+    <Version>0.1.4</Version>
     <Authors>hi175570</Authors>
     <Product>ADOFAI VFX Renderer</Product>
     <Description>无需启动游戏的 ADOFAI 视频背景与 VFX 离线渲染器</Description>

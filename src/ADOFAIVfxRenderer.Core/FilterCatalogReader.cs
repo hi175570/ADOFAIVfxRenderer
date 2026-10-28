@@ -6,6 +6,7 @@ public enum FilterOwnership
 {
     Realtime,
     BakeIntoVideo,
+    BakeAndRealtime,
     Ignore,
 }
 
@@ -25,7 +26,7 @@ public static class FilterCatalogReader
 {
     private static readonly HashSet<string> OfflineSupportedEvents = new(StringComparer.Ordinal)
     {
-        "SetFilter", "SetFilterAdvanced", "Bloom", "ScreenTile", "ScreenScroll",
+        "SetFilter", "SetFilterAdvanced", "Bloom", "ScreenTile", "ScreenScroll", "HallOfMirrors",
     };
 
     public static IReadOnlyList<FilterCatalogItem> Read(string chartPath)
@@ -133,7 +134,7 @@ public static class FilterCatalogReader
         }
         if (filter.EventType is "ScreenTile" or "ScreenScroll")
             hints.Add("画面坐标变换");
-        if (!filter.OfflineSupported) hints.Add("无法单独离线近似");
+        if (!filter.OfflineSupported) hints.Add("当前选择性 Worker 尚无独立实现");
         return string.Join("；", hints.Distinct(StringComparer.Ordinal));
     }
 

@@ -92,7 +92,11 @@ public sealed class OfflineEffectController : MonoBehaviour
         _events.Sort(static (left, right) => left.Start != right.Start
             ? left.Start.CompareTo(right.Start)
             : left.Order.CompareTo(right.Order));
-        if (_gameFilters?.IsAvailable == true) return;
+        if (_gameFilters?.IsAvailable == true)
+        {
+            _gameFilters.ThrowIfBindingsFailed();
+            return;
+        }
         var shader = Resources.Load<Shader>("ADOFAIOfflineEffects");
         if (shader == null) throw new InvalidOperationException("Missing ADOFAIOfflineEffects shader resource.");
         _material = new Material(shader) { name = "ADOFAI Offline Effect Stack" };

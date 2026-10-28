@@ -82,12 +82,19 @@ def patch_resource_index(
         if pointer["m_FileID"] != game_resources_id:
             continue
         translated = (name, worker_resources_id, pointer["m_PathID"])
-        if translated in existing:
-            continue
-        worker_tree["m_Container"].append(
-            (name, {"m_FileID": worker_resources_id, "m_PathID": pointer["m_PathID"]})
-        )
-        existing.add(translated)
+        if translated not in existing:
+            worker_tree["m_Container"].append(
+                (name, {"m_FileID": worker_resources_id, "m_PathID": pointer["m_PathID"]})
+            )
+            existing.add(translated)
+        if name.startswith("camerafilterpack_"):
+            alias = "adofai_filter_" + name[len("camerafilterpack_") :]
+            aliased = (alias, worker_resources_id, pointer["m_PathID"])
+            if aliased not in existing:
+                worker_tree["m_Container"].append(
+                    (alias, {"m_FileID": worker_resources_id, "m_PathID": pointer["m_PathID"]})
+                )
+                existing.add(aliased)
 
     # VideoBloom is referenced by the game scene rather than Resources.Load.
     # Give the exact installed shader a private lookup key for the standalone worker.

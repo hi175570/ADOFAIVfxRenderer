@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -435,7 +436,8 @@ internal sealed class GameSceneProbe : MonoBehaviour
         if (!video.isPrepared)
         {
             video.Prepare();
-            for (var frame = 0; frame < 600 && !video.isPrepared; frame++) yield return null;
+            var prepareWatch = Stopwatch.StartNew();
+            while (!video.isPrepared && prepareWatch.Elapsed.TotalSeconds < 30d) yield return null;
             if (!video.isPrepared)
                 throw new InvalidOperationException($"Background video did not prepare: {video.url}");
         }
@@ -455,34 +457,94 @@ internal sealed class GameSceneProbe : MonoBehaviour
         var targetFrame = video.frameRate > 0f
             ? (long)Math.Floor(videoTime * video.frameRate + 0.000001d)
             : -1L;
-        if (video.texture != null && targetFrame >= 0L && video.frame >= 0L &&
-            Math.Abs(video.frame - targetFrame) <= 1L)
+        if (video.texture != null && targetFrame >= 0L && video.frame == targetFrame)
         {
             LogVideoSync(video, songTimeSeconds, videoTime, targetFrame);
             yield break;
         }
 
-        var decodedFrameReady = false;
-        void OnFrameReady(VideoPlayer _, long __) => decodedFrameReady = true;
+        if (targetFrame >= 0L && video.frame >= 0L &&
+            targetFrame > video.frame && targetFrame - video.frame <= 4L)
+        {
+            yield return StepVideoForward(video, targetFrame);
+            if (video.frame == targetFrame)
+            {
+                LogVideoSync(video, songTimeSeconds, videoTime, targetFrame);
+                yield break;
+            }
+        }
+
+        yield return SeekVideoFrame(video, videoTime, targetFrame);
+        LogVideoSync(video, songTimeSeconds, videoTime, targetFrame);
+    }
+
+    private static IEnumerator StepVideoForward(VideoPlayer video, long targetFrame)
+    {
+        var decodedFrame = -1L;
+        void OnFrameReady(VideoPlayer _, long frame) => decodedFrame = frame;
         video.sendFrameReadyEvents = true;
         video.frameReady += OnFrameReady;
         try
         {
-            video.time = videoTime;
-            video.Play();
-            for (var frame = 0; frame < 180; frame++)
+            for (var step = 0; step < 4 && video.frame < targetFrame; step++)
             {
-                if (decodedFrameReady || (video.texture != null && targetFrame >= 0L && video.frame >= 0L &&
-                                          Math.Abs(video.frame - targetFrame) <= 1L))
+                var before = video.frame;
+                decodedFrame = -1L;
+                video.StepForward();
+                for (var wait = 0; wait < 90; wait++)
                 {
-                    video.Pause();
-                    LogVideoSync(video, songTimeSeconds, videoTime, targetFrame);
-                    yield break;
+                    if (decodedFrame >= 0L || video.frame != before) break;
+                    yield return null;
                 }
-                yield return null;
+                if (video.frame == before) yield break;
+            }
+        }
+        finally
+        {
+            video.frameReady -= OnFrameReady;
+            if (video.isPlaying) video.Pause();
+        }
+    }
+
+    private static IEnumerator SeekVideoFrame(VideoPlayer video, double videoTime, long targetFrame)
+    {
+        var decodedFrame = -1L;
+        void OnFrameReady(VideoPlayer _, long frame) => decodedFrame = frame;
+        video.sendFrameReadyEvents = true;
+        video.frameReady += OnFrameReady;
+        try
+        {
+            var requestedFrame = targetFrame;
+            for (var attempt = 0; attempt < 8; attempt++)
+            {
+                var before = video.frame;
+                decodedFrame = -1L;
+                if (targetFrame >= 0L)
+                    video.frame = Math.Max(0L, requestedFrame);
+                else
+                    video.time = videoTime;
+                video.Play();
+                for (var wait = 0; wait < 90; wait++)
+                {
+                    if (decodedFrame >= 0L || (video.frame >= 0L && video.frame != before)) break;
+                    yield return null;
+                }
+                video.Pause();
+                if (targetFrame < 0L) yield break;
+                if (video.texture != null && video.frame == targetFrame)
+                    yield break;
+                if (video.frame >= 0L)
+                {
+                    var correction = targetFrame - video.frame;
+                    requestedFrame = Math.Max(0L, requestedFrame + correction);
+                    Debug.Log(
+                        $"GAME_VIDEO_SEEK_CORRECT attempt={attempt + 1} nextRequested={requestedFrame} " +
+                        $"actual={video.frame} target={targetFrame} correction={correction}");
+                }
+                else requestedFrame = Math.Max(0L, targetFrame + attempt + 1L);
             }
             throw new InvalidOperationException(
-                $"Background video seek timed out at song={songTimeSeconds:0.###}, video={videoTime:0.###}, frame={video.frame}, targetFrame={targetFrame}.");
+                $"Background video frame seek failed at video={videoTime:0.###}, frame={video.frame}, targetFrame={targetFrame}.");
         }
         finally
         {
@@ -1048,13 +1110,20 @@ internal sealed class GameSceneProbe : MonoBehaviour
 
     private IEnumerator RunInstalledRenderSafely(IEnumerator routine)
     {
-        while (true)
+        var stack = new Stack<IEnumerator>();
+        stack.Push(routine);
+        while (stack.Count > 0)
         {
             object current;
             try
             {
-                if (!routine.MoveNext()) yield break;
-                current = routine.Current;
+                var active = stack.Peek();
+                if (!active.MoveNext())
+                {
+                    stack.Pop();
+                    continue;
+                }
+                current = active.Current;
             }
             catch (Exception exception)
             {
@@ -1063,6 +1132,11 @@ internal sealed class GameSceneProbe : MonoBehaviour
                 Application.Quit(1);
                 Process.GetCurrentProcess().Kill();
                 yield break;
+            }
+            if (current is IEnumerator nested)
+            {
+                stack.Push(nested);
+                continue;
             }
             yield return current;
         }

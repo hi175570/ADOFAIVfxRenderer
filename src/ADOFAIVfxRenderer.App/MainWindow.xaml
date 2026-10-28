@@ -65,6 +65,11 @@
                                    Foreground="{StaticResource TextSecondary}"
                                    TextWrapping="Wrap"
                                    Text="尚未选择 .adofai。" />
+                        <Button Margin="0,9,0,0"
+                                HorizontalAlignment="Left"
+                                Padding="12,6"
+                                Click="UseVideoVfxDerived_Click"
+                                Content="使用刚生成的 Video VFX 派生谱做最终合成验证" />
                     </StackPanel>
                 </GroupBox>
 
@@ -285,8 +290,8 @@
     </Grid>
         </TabItem>
         <TabItem Header="滤镜与装饰">
-            <TabControl Background="{StaticResource WindowBackground}" BorderThickness="0">
-                <TabItem Header="装饰">
+            <TabControl x:Name="VisualEditorTabs" Background="{StaticResource WindowBackground}" BorderThickness="0">
+                <TabItem x:Name="DecorationEditorTab" Header="装饰">
             <Grid Margin="20" Background="{StaticResource WindowBackground}">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
@@ -546,7 +551,7 @@
                 </Grid>
             </Grid>
                 </TabItem>
-                <TabItem Header="滤镜">
+                <TabItem x:Name="FilterEditorTab" Header="滤镜">
                     <Grid Margin="20" Background="{StaticResource WindowBackground}">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -610,6 +615,240 @@
                                    Foreground="{StaticResource TextSecondary}"
                                    TextWrapping="Wrap"
                                    Text="尚未载入谱面。" />
+                    </Grid>
+                </TabItem>
+                <TabItem x:Name="RiskReviewTab" Header="风险确认">
+                    <Grid Margin="20" Background="{StaticResource WindowBackground}">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="12" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock FontSize="23" FontWeight="SemiBold" Text="拆层风险确认" />
+                                <TextBlock Margin="0,5,20,0"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           TextWrapping="Wrap"
+                                           Text="程序先定位可能出错的格数；一键生成原谱原版场景与当前 Video VFX 派生谱最终合成的十组同时间点对照。所有相关风险确认后才能加入正式渲染队列。" />
+                            </StackPanel>
+                            <TextBlock x:Name="RiskReviewSummaryText"
+                                       Grid.Column="1"
+                                       VerticalAlignment="Center"
+                                       Foreground="{StaticResource WarningText}"
+                                       Text="尚未载入谱面" />
+                        </Grid>
+
+                        <Grid Grid.Row="2">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="430" MinWidth="360" />
+                                <ColumnDefinition Width="14" />
+                                <ColumnDefinition Width="*" MinWidth="420" />
+                            </Grid.ColumnDefinitions>
+                            <Border Background="{StaticResource PanelBackground}"
+                                    BorderBrush="{StaticResource PanelBorder}"
+                                    BorderThickness="1"
+                                    CornerRadius="8">
+                                <DataGrid x:Name="RiskReviewGrid"
+                                          AutoGenerateColumns="False"
+                                          CanUserAddRows="False"
+                                          CanUserDeleteRows="False"
+                                          HeadersVisibility="Column"
+                                          GridLinesVisibility="Horizontal"
+                                          BorderThickness="0"
+                                          IsReadOnly="True"
+                                          SelectionMode="Single"
+                                          SelectionChanged="RiskReviewGrid_SelectionChanged">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Width="95" Header="状态" Binding="{Binding StatusText}" />
+                                        <DataGridTextColumn Width="55" Header="格" Binding="{Binding FloorText}" />
+                                        <DataGridTextColumn Width="75" Header="时间" Binding="{Binding TimeText}" />
+                                        <DataGridTextColumn Width="*" Header="可能的问题" Binding="{Binding Title}" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Border>
+
+                            <Border Grid.Column="2"
+                                    Background="{StaticResource PanelBackground}"
+                                    BorderBrush="{StaticResource PanelBorder}"
+                                    BorderThickness="1"
+                                    CornerRadius="8">
+                                <Grid Margin="14">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="10" />
+                                        <RowDefinition Height="*" />
+                                        <RowDefinition Height="10" />
+                                        <RowDefinition Height="180" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <StackPanel>
+                                        <TextBlock x:Name="RiskReviewTitleText"
+                                                   FontSize="19"
+                                                   FontWeight="SemiBold"
+                                                   Text="从左侧选择风险项" />
+                                        <TextBlock x:Name="RiskReviewDetailText"
+                                                   Margin="0,5,0,0"
+                                                   Foreground="{StaticResource TextSecondary}"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock x:Name="RiskReviewActionText"
+                                                   Margin="0,5,0,0"
+                                                   Foreground="{StaticResource WarningText}"
+                                                   TextWrapping="Wrap" />
+                                    </StackPanel>
+
+                                    <Grid Grid.Row="2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="10" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid Grid.Column="0">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="*" />
+                                            </Grid.RowDefinitions>
+                                            <TextBlock Margin="0,0,0,6"
+                                                       HorizontalAlignment="Center"
+                                                       FontWeight="SemiBold"
+                                                       Text="原谱 · 原版场景" />
+                                            <Border Grid.Row="1" Background="#090B10">
+                                                <Image x:Name="RiskReferenceImage" Stretch="Uniform" />
+                                            </Border>
+                                        </Grid>
+                                        <Grid Grid.Column="2">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="*" />
+                                            </Grid.RowDefinitions>
+                                            <TextBlock Margin="0,0,0,6"
+                                                       HorizontalAlignment="Center"
+                                                       FontWeight="SemiBold"
+                                                       Text="当前拆层方案 · 最终合成" />
+                                            <Border Grid.Row="1" Background="#090B10">
+                                                <Image x:Name="RiskCandidateImage" Stretch="Uniform" />
+                                            </Border>
+                                        </Grid>
+                                    </Grid>
+
+                                    <ListBox x:Name="RiskComparisonList"
+                                             Grid.Row="4"
+                                             BorderThickness="0"
+                                             Background="{StaticResource InputBackground}"
+                                             SelectionChanged="RiskComparisonList_SelectionChanged"
+                                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                             ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                                        <ListBox.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <VirtualizingStackPanel Orientation="Horizontal" />
+                                            </ItemsPanelTemplate>
+                                        </ListBox.ItemsPanel>
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <StackPanel Width="190" Margin="5">
+                                                    <TextBlock HorizontalAlignment="Center"
+                                                               FontWeight="SemiBold"
+                                                               Text="{Binding TimestampLabel}" />
+                                                    <Grid Height="105" Margin="0,5,0,0">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="4" />
+                                                            <ColumnDefinition Width="*" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <Border Background="#090B10">
+                                                            <Image Source="{Binding ReferenceImage}" Stretch="Uniform" />
+                                                        </Border>
+                                                        <Border Grid.Column="2" Background="#090B10">
+                                                            <Image Source="{Binding CandidateImage}" Stretch="Uniform" />
+                                                        </Border>
+                                                    </Grid>
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+
+                                    <Grid Grid.Row="5" Margin="0,12,0,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="10" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="10" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="10" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.ColumnSpan="8"
+                                                    Margin="0,0,0,10"
+                                                    Orientation="Horizontal">
+                                            <TextBlock VerticalAlignment="Center" Text="候选解决方案" />
+                                            <ComboBox x:Name="RiskStrategyBox"
+                                                      Width="310"
+                                                      Margin="10,0,0,0"
+                                                      DisplayMemberPath="Label"
+                                                      SelectionChanged="RiskStrategyBox_SelectionChanged" />
+                                            <Button Margin="10,0,0,0"
+                                                    Padding="12,6"
+                                                    Click="ApplyRiskStrategy_Click"
+                                                    Content="应用此候选" />
+                                            <Button x:Name="TestAllRiskCandidatesButton"
+                                                    Margin="10,0,0,0"
+                                                    Padding="12,6"
+                                                    Click="TestAllRiskCandidates_Click"
+                                                    Content="实测全部候选" />
+                                            <TextBlock x:Name="RiskStrategyDescriptionText"
+                                                       Margin="12,0,0,0"
+                                                       VerticalAlignment="Center"
+                                                       Foreground="{StaticResource TextSecondary}"
+                                                       TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <Button x:Name="GenerateRiskComparisonButton"
+                                                Grid.Row="1"
+                                                Style="{StaticResource RenderActionButtonStyle}"
+                                                Padding="14,8"
+                                                Click="GenerateRiskComparison_Click"
+                                                Content="生成原版／拆层闭环对照" />
+                                        <Button Grid.Column="2"
+                                                Grid.Row="1"
+                                                Padding="14,8"
+                                                Click="ConfirmRiskNormal_Click"
+                                                Content="确认正常" />
+                                        <Button Grid.Column="4"
+                                                Grid.Row="1"
+                                                Padding="14,8"
+                                                Click="MarkRiskNeedsAdjustment_Click"
+                                                Content="需要调整" />
+                                        <Button Grid.Column="6"
+                                                Grid.Row="1"
+                                                Padding="14,8"
+                                                Click="AcceptRisk_Click"
+                                                Content="接受已知风险" />
+                                        <TextBlock x:Name="RiskDiagnosticStatusText"
+                                                   Grid.Column="7"
+                                                   Grid.Row="1"
+                                                   Margin="14,0,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Foreground="{StaticResource TextSecondary}"
+                                                   TextWrapping="Wrap" />
+                                    </Grid>
+                                </Grid>
+                            </Border>
+                        </Grid>
+                        <TextBlock x:Name="RiskRenderGateText"
+                                   Grid.Row="4"
+                                   Foreground="{StaticResource WarningText}"
+                                   TextWrapping="Wrap"
+                                   Text="尚未分析谱面。" />
                     </Grid>
                 </TabItem>
             </TabControl>

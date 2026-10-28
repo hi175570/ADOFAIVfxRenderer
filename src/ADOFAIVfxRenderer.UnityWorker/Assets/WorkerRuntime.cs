@@ -76,6 +76,14 @@ public sealed class WorkerRuntime : MonoBehaviour
     private OfflineEffectController? _effects;
     private OfflineEffectController? _backgroundEffects;
     private GameTrackRenderer? _trackRenderer;
+    private string? _backgroundVideoPath;
+    private bool _backgroundVideoLoop;
+    private double _backgroundVideoOffsetSeconds;
+    private double _backgroundVideoCountdownSeconds;
+    private BackgroundVideoDecoder? _backgroundVideoDecoder;
+    private SpriteRenderer? _backgroundVideoRenderer;
+    private Texture2D? _backgroundVideoTexture;
+    private Sprite? _backgroundVideoSprite;
     private bool _cameraFollowsPlayer;
     private Vector2 _lastPlayerFollowPosition;
 
@@ -218,6 +226,7 @@ public sealed class WorkerRuntime : MonoBehaviour
         _staticBackgroundCamera.cullingMask = 1 << StaticBackgroundLayer;
         _staticBackgroundCamera.depth = -1.63f;
         _staticBackgroundCamera.enabled = false;
+        ConfigureBackgroundVideo(settings);
         if (_job.includeFilters || _job.includeEffects)
         {
             _effects = cameraObject.AddComponent<OfflineEffectController>();
@@ -1008,6 +1017,96 @@ public sealed class WorkerRuntime : MonoBehaviour
         _backgroundEvents.Add(new BackgroundEvent(start, data, _eventSequence++));
     }
 
+    private void ConfigureBackgroundVideo(JObject settings)
+    {
+        if (!_job.includeBackgroundDecorations) return;
+        var videoName = settings.Value<string>("bgVideo") ?? "";
+        if (string.IsNullOrWhiteSpace(videoName)) return;
+        var videoPath = Path.IsPathRooted(videoName)
+            ? videoName
+            : Path.GetFullPath(Path.Combine(
+                _chartDirectory,
+                videoName.Replace('/', Path.DirectorySeparatorChar)));
+        if (!File.Exists(videoPath))
+            throw new FileNotFoundException("谱面引用的背景视频不存在。", videoPath);
+
+        _backgroundVideoPath = videoPath;
+        _backgroundVideoLoop = settings.Value<bool?>("loopVideo") ?? false;
+        _backgroundVideoOffsetSeconds = (settings.Value<double?>("vidOffset") ?? 0d) * 0.001d;
+        var separateCountdown = settings.Value<bool?>("separateCountdownTime") ?? false;
+        var countdownTicks = Math.Max(0, settings.Value<int?>("countdownTicks") ?? 4);
+        var initialBpm = Math.Max(0.000001d, settings.Value<double?>("bpm") ?? 100d);
+        _backgroundVideoCountdownSeconds = separateCountdown
+            ? 60d / (initialBpm * Math.Max(0.01d, _pitch)) * countdownTicks
+            : 0d;
+        var videoObject = new GameObject("ADOFAI Background Video");
+        videoObject.layer = StaticBackgroundLayer;
+        videoObject.transform.SetParent(_staticBackgroundCamera.transform, false);
+        videoObject.transform.localPosition = new Vector3(0f, 0f, 10f);
+        _backgroundVideoRenderer = videoObject.AddComponent<SpriteRenderer>();
+        _backgroundVideoRenderer.sortingOrder = short.MinValue;
+        _backgroundVideoRenderer.enabled = false;
+        _backgroundVideoTexture = new Texture2D(RenderWidth, RenderHeight, TextureFormat.RGBA32, false, false)
+        {
+            filterMode = FilterMode.Bilinear,
+            wrapMode = TextureWrapMode.Clamp,
+            name = "ADOFAI Background Video Frame",
+        };
+        _backgroundVideoSprite = Sprite.Create(
+            _backgroundVideoTexture,
+            new Rect(0f, 0f, RenderWidth, RenderHeight),
+            new Vector2(0.5f, 0.5f),
+            100f);
+        _backgroundVideoRenderer.sprite = _backgroundVideoSprite;
+        var screenHeight = _staticBackgroundCamera.orthographicSize * 2f;
+        var screenWidth = screenHeight * _staticBackgroundCamera.aspect;
+        videoObject.transform.localScale = new Vector3(
+            screenWidth / _backgroundVideoSprite.bounds.size.x,
+            screenHeight / _backgroundVideoSprite.bounds.size.y,
+            1f);
+        Debug.Log(
+            $"BACKGROUND_VIDEO_CONFIG path={videoPath} offset={_backgroundVideoOffsetSeconds:0.###} " +
+            $"countdown={_backgroundVideoCountdownSeconds:0.###} loop={_backgroundVideoLoop} " +
+            "decoder=ffmpeg-sequential aspect=FitHorizontally");
+    }
+
+    private void StartBackgroundVideoDecoder(double firstSongTimeSeconds)
+    {
+        if (string.IsNullOrWhiteSpace(_backgroundVideoPath)) return;
+        var firstVideoTime = firstSongTimeSeconds - _backgroundVideoCountdownSeconds + _backgroundVideoOffsetSeconds;
+        _backgroundVideoDecoder = new BackgroundVideoDecoder(
+            _job.ffmpegPath,
+            _backgroundVideoPath,
+            RenderWidth,
+            RenderHeight,
+            _job.framesPerSecond,
+            Math.Max(0d, firstVideoTime),
+            _backgroundVideoLoop);
+    }
+
+    private void UpdateBackgroundVideo(double songTimeSeconds)
+    {
+        if (_backgroundVideoDecoder == null || _backgroundVideoRenderer == null || _backgroundVideoTexture == null)
+            return;
+        var videoTime = songTimeSeconds - _backgroundVideoCountdownSeconds + _backgroundVideoOffsetSeconds;
+        if (videoTime < -0.0000001d)
+        {
+            _backgroundVideoRenderer.enabled = false;
+            return;
+        }
+        if (!_backgroundVideoDecoder.TryReadNextFrame(out var frameBytes))
+        {
+            if (!_backgroundVideoDecoder.HasDecodedFrame)
+                throw new InvalidOperationException("背景视频没有可解码的画面：" + _backgroundVideoPath);
+            // The original player holds the last frame when a non-looping video ends.
+            _backgroundVideoRenderer.enabled = true;
+            return;
+        }
+        _backgroundVideoTexture.LoadRawTextureData(frameBytes);
+        _backgroundVideoTexture.Apply(false, false);
+        _backgroundVideoRenderer.enabled = true;
+    }
+
     private IEnumerator RenderFrames()
     {
         RenderTexture? target = null;
@@ -1032,6 +1131,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             // captureFramerate makes that delta exactly match the requested video
             // frame interval instead of the worker's wall-clock rendering speed.
             Time.captureFramerate = _job.framesPerSecond;
+            StartBackgroundVideoDecoder(_job.renderStartSeconds);
             StartEncoder();
             target = new RenderTexture(RenderWidth, RenderHeight, 24, RenderTextureFormat.ARGB32);
             target.Create();
@@ -1051,6 +1151,7 @@ public sealed class WorkerRuntime : MonoBehaviour
             {
                 var time = _job.renderStartSeconds + frame / (float)_job.framesPerSecond;
                 ApplyTimeline(time);
+                UpdateBackgroundVideo(time);
                 if (Environment.GetCommandLineArgs().Contains("--diagnose-decorations") && frame % 15 == 0)
                 {
                     if (frame == 0) LogDecorationPipeline(time);
@@ -1130,6 +1231,10 @@ public sealed class WorkerRuntime : MonoBehaviour
             if (staticStage != null) staticStage.Release();
             if (backgroundStage != null) backgroundStage.Release();
             if (frameTexture != null) Destroy(frameTexture);
+            _backgroundVideoDecoder?.Dispose();
+            _backgroundVideoDecoder = null;
+            if (_backgroundVideoSprite != null) Destroy(_backgroundVideoSprite);
+            if (_backgroundVideoTexture != null) Destroy(_backgroundVideoTexture);
         }
     }
 
@@ -1719,6 +1824,125 @@ public sealed class WorkerRuntime : MonoBehaviour
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr window, int command);
+
+    private sealed class BackgroundVideoDecoder : IDisposable
+    {
+        private readonly Process _process;
+        private readonly byte[] _frameBytes;
+        private readonly Queue<string> _errorTail = new();
+        private bool _disposed;
+
+        public BackgroundVideoDecoder(
+            string ffmpegPath,
+            string videoPath,
+            int width,
+            int height,
+            int framesPerSecond,
+            double startSeconds,
+            bool loop)
+        {
+            _frameBytes = new byte[checked(width * height * 4)];
+            var loopArguments = loop ? "-stream_loop -1 " : "";
+            var seekArguments = startSeconds > 0.0000001d
+                ? " -ss " + startSeconds.ToString("0.#########", CultureInfo.InvariantCulture)
+                : "";
+            // ADOFAI's FitHorizontally fixes the source width to the camera width,
+            // then crops or letterboxes vertically. vflip converts FFmpeg's
+            // top-left raw rows into Unity Texture2D's bottom-left row order.
+            var fitHorizontally = string.Format(
+                CultureInfo.InvariantCulture,
+                "scale={0}:-2:flags=lanczos,crop={0}:min(ih\\,{1}):0:(ih-min(ih\\,{1}))/2," +
+                "pad={0}:{1}:0:({1}-ih)/2:black,fps={2},vflip",
+                width,
+                height,
+                framesPerSecond);
+            if (!loop) fitHorizontally += ",tpad=stop_mode=clone:stop_duration=86400";
+            var arguments = string.Format(
+                CultureInfo.InvariantCulture,
+                "-hide_banner -loglevel warning {0}-i \"{1}\" -vf \"{2}\"{3} -an -pix_fmt rgba -f rawvideo pipe:1",
+                loopArguments,
+                videoPath.Replace("\"", "\\\""),
+                fitHorizontally,
+                seekArguments);
+            _process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = ffmpegPath,
+                    Arguments = arguments,
+                    WorkingDirectory = Path.GetDirectoryName(videoPath),
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                },
+            };
+            _process.ErrorDataReceived += (_, eventArgs) =>
+            {
+                if (string.IsNullOrWhiteSpace(eventArgs.Data)) return;
+                lock (_errorTail)
+                {
+                    _errorTail.Enqueue(eventArgs.Data);
+                    while (_errorTail.Count > 20) _errorTail.Dequeue();
+                }
+            };
+            if (!_process.Start()) throw new InvalidOperationException("无法启动背景视频 FFmpeg 解码器。");
+            _process.BeginErrorReadLine();
+        }
+
+        public bool HasDecodedFrame { get; private set; }
+
+        public bool TryReadNextFrame(out byte[] frameBytes)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(BackgroundVideoDecoder));
+            var offset = 0;
+            while (offset < _frameBytes.Length)
+            {
+                var count = _process.StandardOutput.BaseStream.Read(
+                    _frameBytes,
+                    offset,
+                    _frameBytes.Length - offset);
+                if (count == 0) break;
+                offset += count;
+            }
+            if (offset == 0)
+            {
+                frameBytes = _frameBytes;
+                return false;
+            }
+            if (offset != _frameBytes.Length)
+            {
+                string details;
+                lock (_errorTail) details = string.Join(Environment.NewLine, _errorTail);
+                throw new EndOfStreamException(
+                    $"背景视频只解码出 {offset:N0} / {_frameBytes.Length:N0} 字节。" +
+                    (details.Length == 0 ? "" : Environment.NewLine + details));
+            }
+            HasDecodedFrame = true;
+            frameBytes = _frameBytes;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try
+            {
+                _process.StandardOutput.Close();
+                if (!_process.HasExited)
+                {
+                    _process.Kill();
+                    _process.WaitForExit(2000);
+                }
+            }
+            catch
+            {
+                // Decoder cleanup must not hide the render result or original failure.
+            }
+            _process.Dispose();
+        }
+    }
 
     [Serializable]
     private sealed class WorkerJob

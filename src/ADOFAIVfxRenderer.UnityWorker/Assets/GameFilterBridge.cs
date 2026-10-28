@@ -75,6 +75,7 @@ internal sealed class GameFilterBridge
     };
 
     private readonly Dictionary<string, Binding> _bindings = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _failedBindings = new(StringComparer.Ordinal);
     private readonly List<Binding> _order = new();
     private readonly GameObject _host;
     private readonly GameObject _serviceHost;
@@ -143,7 +144,8 @@ internal sealed class GameFilterBridge
         var type = _firstPass!.GetType(className) ?? _gameAssembly?.GetType(className);
         if (type == null || !typeof(MonoBehaviour).IsAssignableFrom(type))
         {
-            Debug.LogWarning($"Installed game filter type is unavailable: {className}");
+            _failedBindings[key] = $"原版滤镜类型不存在：{className}";
+            Debug.LogError(_failedBindings[key]);
             return;
         }
         var filterName = data.Value<string>("filter") ?? "";
@@ -163,17 +165,22 @@ internal sealed class GameFilterBridge
             CopyInstanceFields(templateComponent, component);
         }
         var binding = new Binding(key, eventType, filterName, component, renderOrder);
-        binding.Shader = FindAssignedShader(templateComponent) ?? LoadInstalledShader(className);
+        var assignedShader = FindAssignedShader(templateComponent);
+        binding.Shader = assignedShader != null && assignedShader.isSupported
+            ? assignedShader
+            : LoadInstalledShader(className);
         if (!AttachInstalledShader(binding))
         {
-            Debug.LogWarning($"Installed game shader is unavailable: {className}");
+            _failedBindings[key] = $"原版滤镜 shader 不可用：{className}";
+            Debug.LogError(_failedBindings[key]);
             return;
         }
         AttachInstalledTextures(binding);
         if (_useNativeCameraPipeline) PrimeNativeMaterials(binding);
         if (eventType == "SetFilter" && !RegisterBasicFilter(binding))
         {
-            Debug.LogError($"Installed ffxSetFilterPlus could not bind {filterName}; the filter will not be approximated.");
+            _failedBindings[key] = $"原版基础滤镜事件无法绑定：{filterName}";
+            Debug.LogError(_failedBindings[key]);
             UnityEngine.Object.Destroy(component);
             return;
         }
@@ -194,6 +201,15 @@ internal sealed class GameFilterBridge
         _bindings[key] = binding;
         _order.Add(binding);
         Debug.Log($"Bound installed game filter {key} -> {binding.Shader?.name}");
+    }
+
+    public void ThrowIfBindingsFailed()
+    {
+        if (_failedBindings.Count == 0) return;
+        throw new InvalidOperationException(
+            "这些请求烤入的视频滤镜没有成功绑定原版资源：" +
+            string.Join("；", _failedBindings.OrderBy(static pair => pair.Key, StringComparer.Ordinal)
+                .Select(static pair => pair.Key + "（" + pair.Value + "）")));
     }
 
     public object? ConvertAdvancedValue(string key, string propertyName, JToken chartValue)
@@ -329,6 +345,24 @@ internal sealed class GameFilterBridge
     {
         if (className == "VideoBloom")
             return Resources.Load<Shader>("adofai_videobloom");
+        if (className.StartsWith("CameraFilterPack_", StringComparison.Ordinal) ||
+            className.StartsWith("CameraFilterPackLegacy_", StringComparison.Ordinal))
+        {
+            var alias = "adofai_filter_" + className
+                .Replace("CameraFilterPackLegacy_", "", StringComparison.Ordinal)
+                .Replace("CameraFilterPack_", "", StringComparison.Ordinal)
+                .ToLowerInvariant();
+            var aliasShaders = Resources.LoadAll<Shader>(alias);
+            var wantsLegacyAlias = className.StartsWith("CameraFilterPackLegacy_", StringComparison.Ordinal);
+            var exact = aliasShaders.FirstOrDefault(shader =>
+                            shader.isSupported &&
+                            shader.name.Contains("Legacy/", StringComparison.Ordinal) == wantsLegacyAlias)
+                        ?? aliasShaders.FirstOrDefault(static shader => shader.isSupported);
+            if (exact != null) return exact;
+            Debug.LogError(
+                $"Installed filter alias failed: class={className} alias={alias} " +
+                $"count={aliasShaders.Length} candidates=[{string.Join(",", aliasShaders.Select(static shader => shader.name + ":" + shader.isSupported))}]");
+        }
         var coreResource = className switch
         {
             "PolarScreen" => "adofai_polarscreen",
@@ -342,8 +376,14 @@ internal sealed class GameFilterBridge
             .ToLowerInvariant();
         var shaders = Resources.LoadAll<Shader>(resourceName);
         var wantsLegacy = className.StartsWith("CameraFilterPackLegacy_", StringComparison.Ordinal);
-        return shaders.FirstOrDefault(item => item.name.Contains("Legacy/", StringComparison.Ordinal) == wantsLegacy)
-               ?? shaders.FirstOrDefault();
+        var selected = shaders.FirstOrDefault(item =>
+                           item.name.Contains("Legacy/", StringComparison.Ordinal) == wantsLegacy && item.isSupported)
+                       ?? shaders.FirstOrDefault(static item => item.isSupported);
+        if (selected == null)
+            Debug.LogError(
+                $"Installed shader lookup failed: class={className} resource={resourceName} " +
+                $"count={shaders.Length} candidates=[{string.Join(",", shaders.Select(static shader => shader.name + ":" + shader.isSupported))}]");
+        return selected;
     }
 
     private static void AttachInstalledTextures(Binding binding)

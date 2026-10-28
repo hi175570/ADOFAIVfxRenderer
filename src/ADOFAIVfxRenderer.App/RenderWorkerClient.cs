@@ -23,6 +23,7 @@ internal sealed class RenderWorkerClient : IDisposable
     private IReadOnlySet<int> _activeExcludedDecorationIndices = new HashSet<int>();
     private IReadOnlySet<string> _activeDisabledFilterKeys = new HashSet<string>();
     private bool _derivedExportAttempted;
+    private bool _skipDerivedExport;
     private long _activeMemoryLimitBytes;
     private long _activeEstimatedTextureBytes;
     private int _activeTextureCount;
@@ -59,7 +60,8 @@ internal sealed class RenderWorkerClient : IDisposable
         IReadOnlySet<string>? bakedFilterKeys = null,
         IReadOnlySet<string>? disabledFilterKeys = null,
         RenderBackend renderBackend = RenderBackend.Automatic,
-        int memoryLimitMb = 0)
+        int memoryLimitMb = 0,
+        bool finalCompositeVerification = false)
     {
         if (!installation.CanRender || installation.RootDirectory is null)
         {
@@ -107,6 +109,18 @@ internal sealed class RenderWorkerClient : IDisposable
         if (!Path.GetFullPath(renderChartPath).Equals(Path.GetFullPath(chart.Path), StringComparison.OrdinalIgnoreCase))
             _temporaryRenderChartPath = renderChartPath;
         var layout = RenderOutputLayout.Create(chart.Path, variant.Profile);
+        if (finalCompositeVerification)
+        {
+            const string name = "Video VFX 最终合成验证";
+            layout = layout with
+            {
+                VideoPath = Path.Combine(layout.OutputDirectory, name + ".mp4"),
+                PreviewDirectory = Path.Combine(layout.OutputDirectory, ".preview", name),
+                JobPath = Path.Combine(layout.OutputDirectory, $"render-job-{name}.json"),
+                StatusPath = Path.Combine(layout.OutputDirectory, $"render-status-{name}.json"),
+                WorkerLogPath = Path.Combine(layout.OutputDirectory, $"worker-{name}.log"),
+            };
+        }
         var outputDirectory = layout.OutputDirectory;
         var previewDirectory = layout.PreviewDirectory;
         Directory.CreateDirectory(previewDirectory);
@@ -168,6 +182,7 @@ internal sealed class RenderWorkerClient : IDisposable
             ? new HashSet<string>()
             : new HashSet<string>(disabledFilterKeys, StringComparer.Ordinal);
         _derivedExportAttempted = false;
+        _skipDerivedExport = finalCompositeVerification;
         _activeMemoryLimitBytes = memoryLimitMb > 0 ? memoryLimitMb * 1024L * 1024L : 0L;
         _activeEstimatedTextureBytes = textureBudgetPlan?.FullResolutionBytes ?? 0L;
         _activeTextureCount = textureBudgetPlan?.TextureCount ?? 0;
@@ -268,6 +283,11 @@ internal sealed class RenderWorkerClient : IDisposable
                         if (status.State == "complete" && !_derivedExportAttempted)
                         {
                             _derivedExportAttempted = true;
+                            if (_skipDerivedExport)
+                            {
+                                status.Message = "Video VFX 派生谱最终合成验证已完成；未再次生成派生谱。";
+                            }
+                            else
                             try
                             {
                                 var retainedDecorationIndices = new HashSet<int>(_activeRetainedDecorationIndices);

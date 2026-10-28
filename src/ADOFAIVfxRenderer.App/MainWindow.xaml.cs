@@ -24,6 +24,7 @@ public partial class MainWindow : Window
     private readonly AppSettings _settings = AppSettingsStore.Load();
     private readonly ObservableCollection<DecorationRetentionItem> _decorationChoices = [];
     private readonly ObservableCollection<FilterOwnershipItem> _filterChoices = [];
+    private readonly ObservableCollection<VisualRiskReviewItem> _riskReviews = [];
     private ICollectionView? _decorationChoicesView;
     private GameInstallation? _installation;
     private ChartMetadata? _chart;
@@ -38,6 +39,8 @@ public partial class MainWindow : Window
     private int _batchTotal;
     private int _batchCompleted;
     private bool _exitWhenQueueFinishes;
+    private bool _finalCompositeVerificationMode;
+    private bool _suppressRiskInvalidation;
     private Exception? _lastQueueError;
 
     public MainWindow()
@@ -55,7 +58,7 @@ public partial class MainWindow : Window
         Loaded += ApplyCommandLineSmokeTest;
     }
 
-    private void ApplyCommandLineSmokeTest(object sender, RoutedEventArgs e)
+    private async void ApplyCommandLineSmokeTest(object sender, RoutedEventArgs e)
     {
         Loaded -= ApplyCommandLineSmokeTest;
         var arguments = Environment.GetCommandLineArgs();
@@ -138,6 +141,75 @@ public partial class MainWindow : Window
                 .ToHashSet();
             foreach (var choice in _decorationChoices)
                 choice.IsExcluded = excludedIndices.Contains(choice.Item.Index);
+            var requestedRiskKey = GetArgumentValue(arguments, "--diagnose-risk-key");
+            var hasRiskIndex = int.TryParse(GetArgumentValue(arguments, "--diagnose-risk-index"), out var riskIndex);
+            if (hasRiskIndex || requestedRiskKey is not null)
+            {
+                VisualRiskReviewItem risk;
+                if (requestedRiskKey is not null)
+                {
+                    risk = _riskReviews.FirstOrDefault(item =>
+                               item.Issue.Key.Equals(requestedRiskKey, StringComparison.Ordinal))
+                           ?? throw new InvalidDataException($"找不到风险键：{requestedRiskKey}");
+                }
+                else
+                {
+                    if (riskIndex < 0 || riskIndex >= _riskReviews.Count)
+                        throw new InvalidDataException($"风险索引 {riskIndex} 超出范围；当前共 {_riskReviews.Count} 项。");
+                    risk = _riskReviews[riskIndex];
+                }
+                RiskReviewGrid.SelectedItem = risk;
+                var availableStrategies = BuildRiskStrategies(risk);
+                var requestedStrategy = GetArgumentValue(arguments, "--risk-strategy");
+                var strategy = requestedStrategy is null
+                    ? availableStrategies[0]
+                    : availableStrategies.FirstOrDefault(candidate =>
+                        candidate.Kind.ToString().Equals(requestedStrategy, StringComparison.OrdinalIgnoreCase))
+                      ?? throw new InvalidDataException(
+                          $"风险候选 {requestedStrategy} 不适用于当前风险。可用：" +
+                          string.Join("、", availableStrategies.Select(static candidate => candidate.Kind)));
+                var progress = new Progress<string>(message => RiskDiagnosticStatusText.Text = message);
+                var riskDuration = double.TryParse(
+                    GetArgumentValue(arguments, "--risk-duration"),
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out var parsedRiskDuration)
+                    ? parsedRiskDuration
+                    : 10d;
+                var diagnosticOptions = BuildRiskDiagnosticOptions(strategy) with
+                {
+                    DurationSeconds = riskDuration,
+                };
+                var result = await VisualRiskDiagnosticClient.GenerateAsync(
+                    _installation ?? throw new InvalidOperationException("游戏安装未载入。"),
+                    _chart ?? throw new InvalidOperationException("谱面未载入。"),
+                    risk.Issue,
+                    diagnosticOptions with
+                    {
+                        Profile = smokeProfile == OutputProfile.VideoPro
+                            ? OutputProfile.VideoVfx
+                            : diagnosticOptions.Profile,
+                        DiagnosticLabel = strategy.Kind + "-automation",
+                    },
+                    progress);
+                var resultPath = GetArgumentValue(arguments, "--risk-result");
+                if (!string.IsNullOrWhiteSpace(resultPath))
+                {
+                    File.WriteAllText(
+                        Path.GetFullPath(resultPath),
+                        JsonSerializer.Serialize(new
+                        {
+                            risk = risk.Issue,
+                            strategy = strategy.Kind.ToString(),
+                            result.ReferenceVideoPath,
+                            result.CandidateVideoPath,
+                            result.StructuralSimilarity,
+                            frames = result.Frames,
+                        }, new JsonSerializerOptions { WriteIndented = true }));
+                }
+                if (_exitWhenQueueFinishes) Close();
+                return;
+            }
             AddToQueue_Click(this, new RoutedEventArgs());
             if (_lastQueueError is not null) throw _lastQueueError;
             StartQueue_Click(this, new RoutedEventArgs());
@@ -444,6 +516,37 @@ public partial class MainWindow : Window
         }
     }
 
+    private void UseVideoVfxDerived_Click(object sender, RoutedEventArgs e)
+    {
+        if (_chart is null)
+        {
+            DarkDialog.Show(this, "请先选择生成 Video VFX 时使用的源谱面。", "找不到派生谱");
+            return;
+        }
+        var currentPath = Path.GetFullPath(_chart.Path);
+        var derivedPath = Path.GetFileNameWithoutExtension(currentPath)
+            .EndsWith(" - Video VFX", StringComparison.OrdinalIgnoreCase)
+            ? currentPath
+            : RenderOutputLayout.Create(currentPath, OutputProfile.VideoVfx).DerivedChartPath;
+        if (!File.Exists(derivedPath))
+        {
+            DarkDialog.Show(
+                this,
+                "尚未找到对应的 Video VFX 派生谱：\n" + derivedPath +
+                "\n请先完成 Video VFX 渲染。",
+                "找不到派生谱");
+            return;
+        }
+        LoadChart(derivedPath);
+        foreach (var check in _profileChecks)
+            check.IsChecked = (OutputProfile)check.Tag == OutputProfile.VideoPro;
+        UseProfileContentCheckBox.IsChecked = true;
+        RefreshContentChoices();
+        SummaryText.Text =
+            "已切换到刚生成的 Video VFX 派生谱，并选择 Video Pro。" +
+            "这条输出会用原版场景播放背景视频，再合成谱面中保留的实时轨道、滤镜、遮罩与装饰。";
+    }
+
     private string? GetRememberedChartDirectory()
     {
         if (Directory.Exists(_settings.LastChartDirectory)) return _settings.LastChartDirectory;
@@ -454,6 +557,8 @@ public partial class MainWindow : Window
     private void LoadChart(string path)
     {
         path = Path.GetFullPath(path);
+        _finalCompositeVerificationMode = Path.GetFileNameWithoutExtension(path)
+            .EndsWith(" - Video VFX", StringComparison.OrdinalIgnoreCase);
         ChartPathBox.Text = path;
         _chart = ChartMetadataReader.Read(path);
         LoadDecorationCatalog(path);
@@ -532,7 +637,13 @@ public partial class MainWindow : Window
             var choice = new FilterOwnershipItem(item);
             choice.PropertyChanged += (_, args) =>
             {
-                if (args.PropertyName == nameof(FilterOwnershipItem.Ownership)) RefreshFilterOwnershipSummary();
+                if (args.PropertyName != nameof(FilterOwnershipItem.Ownership)) return;
+                RefreshFilterOwnershipSummary();
+                if (!_suppressRiskInvalidation)
+                {
+                    RefreshBakedFilterRisks();
+                    InvalidateRiskComparisons();
+                }
             };
             _filterChoices.Add(choice);
         }
@@ -543,14 +654,91 @@ public partial class MainWindow : Window
     private void LoadVisualRisks(string chartPath)
     {
         var issues = VisualRiskAnalyzer.Analyze(chartPath);
-        VisualRiskSummaryText.Text = issues.Count == 0
-            ? "未发现明显的拆层风险；仍建议用参考视频抽查。"
-            : "可能需要人工对照：\n" + string.Join("\n", issues.Select(static issue =>
-                $"• {(issue.FirstFloor.HasValue ? $"格 {issue.FirstFloor.Value} · " : "")}{issue.Title}：{issue.Detail}"));
+        _riskReviews.Clear();
+        foreach (var issue in issues)
+        {
+            var review = new VisualRiskReviewItem(issue);
+            review.PropertyChanged += (_, _) => RefreshRiskReviewSummary();
+            _riskReviews.Add(review);
+        }
+        RiskReviewGrid.ItemsSource = _riskReviews;
+        RiskComparisonList.ItemsSource = null;
+        RiskReferenceImage.Source = null;
+        RiskCandidateImage.Source = null;
+        RiskReviewGrid.SelectedIndex = _riskReviews.Count > 0 ? 0 : -1;
+        RefreshBakedFilterRisks();
+    }
+
+    private void RefreshRiskReviewSummary()
+    {
+        if (RiskReviewSummaryText is null || RiskRenderGateText is null || VisualRiskSummaryText is null) return;
+        var pending = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.Pending);
+        var adjustment = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.NeedsAdjustment);
+        var normal = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.ConfirmedNormal);
+        var accepted = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.AcceptedRisk);
+        RiskReviewSummaryText.Text = _riskReviews.Count == 0
+            ? "未发现明显风险"
+            : $"待确认 {pending:N0} · 需调整 {adjustment:N0} · 正常 {normal:N0} · 已接受 {accepted:N0}";
+        RiskRenderGateText.Text = _riskReviews.Count == 0
+            ? "自动分析没有发现明显拆层风险；这不替代最终成片抽查。"
+            : pending + adjustment > 0
+                ? $"正式拆层渲染暂不可加入队列：还有 {pending:N0} 项待确认、{adjustment:N0} 项需要调整。"
+                : "所有自动发现的风险均已确认或明确接受；可以加入正式拆层渲染队列。";
+        VisualRiskSummaryText.Text = _riskReviews.Count == 0
+            ? "未发现明显拆层风险；仍建议抽查最终成片。"
+            : $"已自动定位 {_riskReviews.Count:N0} 个可能出问题的位置；请到“风险确认”逐项生成闭环对照。";
+    }
+
+    private void RefreshBakedFilterRisks()
+    {
+        foreach (var stale in _riskReviews
+                     .Where(static item => item.Issue.Key.StartsWith("baked-filter-segment:", StringComparison.Ordinal))
+                     .ToArray())
+            _riskReviews.Remove(stale);
+        if (_chart is null) return;
+
+        var existingFilterKeys = _riskReviews
+            .Select(static item => item.Issue.FilterKey)
+            .Where(static key => !string.IsNullOrWhiteSpace(key))
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var segment in _filterChoices
+                     .Where(static item => item.Ownership == FilterOwnership.BakeIntoVideo)
+                     .Where(item => !existingFilterKeys.Contains(item.Item.Key))
+                     .GroupBy(static item => item.Item.FirstFloor))
+        {
+            var filters = segment.ToArray();
+            var names = string.Join("、", filters.Select(static item => item.DisplayName));
+            var issue = new VisualRiskIssue(
+                "选择烤入的滤镜需要闭环确认",
+                $"格 {segment.Key} 的 {names} 将从派生谱实时层关闭，并改由视频层承担；必须确认没有改变遮挡与作用对象。",
+                segment.Key,
+                $"baked-filter-segment:{segment.Key}",
+                VisualRiskKind.SplitFilter,
+                VisualRiskSeverity.Warning,
+                VisualRiskAnalyzer.TimeAtFloor(_chart.Path, segment.Key),
+                RequiresContinuousFrames: true,
+                FilterKey: filters[0].Item.Key,
+                SuggestedAction: "生成原版／拆层闭环对照；若不一致，把滤镜改回保留实时或调整相关装饰归属。");
+            var review = new VisualRiskReviewItem(issue);
+            review.PropertyChanged += (_, _) => RefreshRiskReviewSummary();
+            _riskReviews.Add(review);
+        }
+        RefreshRiskReviewSummary();
+    }
+
+    private void InvalidateRiskComparisons()
+    {
+        if (!_viewReady || _suppressRiskInvalidation) return;
+        foreach (var review in _riskReviews.Where(static item => item.Issue.RequiresComparison))
+            review.InvalidateComparison();
+        RiskComparisonList.ItemsSource = null;
+        RiskReferenceImage.Source = null;
+        RiskCandidateImage.Source = null;
+        RefreshRiskReviewSummary();
     }
 
     private IReadOnlySet<string> GetBakedFilterKeys() => _filterChoices
-        .Where(static item => item.Ownership == FilterOwnership.BakeIntoVideo)
+        .Where(static item => item.Ownership is FilterOwnership.BakeIntoVideo or FilterOwnership.BakeAndRealtime)
         .Select(static item => item.Item.Key)
         .ToHashSet(StringComparer.Ordinal);
 
@@ -564,13 +752,15 @@ public partial class MainWindow : Window
         if (FilterOwnershipSummaryText is null) return;
         var realtime = _filterChoices.Count(static item => item.Ownership == FilterOwnership.Realtime);
         var baked = _filterChoices.Count(static item => item.Ownership == FilterOwnership.BakeIntoVideo);
+        var bakedAndRealtime = _filterChoices.Count(static item => item.Ownership == FilterOwnership.BakeAndRealtime);
         var ignored = _filterChoices.Count(static item => item.Ownership == FilterOwnership.Ignore);
         var risky = _filterChoices.Count(static item => !string.IsNullOrWhiteSpace(item.RiskHint));
         var unsupportedBake = _filterChoices.Count(static item =>
-            item.Ownership == FilterOwnership.BakeIntoVideo && !item.Item.OfflineSupported);
+            (item.Ownership is FilterOwnership.BakeIntoVideo or FilterOwnership.BakeAndRealtime) &&
+            !item.Item.OfflineSupported);
         FilterOwnershipSummaryText.Text = _chart is null
             ? "尚未载入谱面。"
-            : $"共 {_filterChoices.Count:N0} 组 · 可能需人工对照 {risky:N0} 组 · 保留实时 {realtime:N0} · 烤入视频 {baked:N0} · 忽略 {ignored:N0}" +
+            : $"共 {_filterChoices.Count:N0} 组 · 可能需人工对照 {risky:N0} 组 · 保留实时 {realtime:N0} · 烤入并关闭 {baked:N0} · 烤入且实时 {bakedAndRealtime:N0} · 忽略 {ignored:N0}" +
               (unsupportedBake > 0 ? $" · 有 {unsupportedBake:N0} 组尚无离线实现，开始渲染时会阻止并指出。" : "");
     }
 
@@ -578,6 +768,7 @@ public partial class MainWindow : Window
     {
         if (!_viewReady) return;
         RefreshRetentionSummary();
+        InvalidateRiskComparisons();
     }
 
     private void RetentionFilter_Changed(object sender, RoutedEventArgs e)
@@ -590,6 +781,7 @@ public partial class MainWindow : Window
     {
         if (!_viewReady) return;
         RefreshRetentionSummary();
+        InvalidateRiskComparisons();
     }
 
     private DecorationRetentionMode CurrentRetentionMode =>
@@ -684,6 +876,724 @@ public partial class MainWindow : Window
         DecorationPreviewDetails.Text = "左：包含此贴图；右：不包含此贴图。两张来自完全相同的谱面时间点。";
     }
 
+    private void RiskReviewGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem selected)
+        {
+            RiskReviewTitleText.Text = "从左侧选择风险项";
+            RiskReviewDetailText.Text = "";
+            RiskReviewActionText.Text = "";
+            return;
+        }
+        RiskReviewTitleText.Text = selected.Title;
+        RiskReviewDetailText.Text = selected.Issue.Detail;
+        RiskReviewActionText.Text = "分析线索（未经实测不能当结论）：" + selected.Issue.SuggestedAction;
+        var strategies = BuildRiskStrategies(selected);
+        RiskStrategyBox.ItemsSource = strategies;
+        RiskStrategyBox.SelectedItem = strategies.FirstOrDefault(item => item.Kind == selected.ActiveStrategy) ?? strategies[0];
+        ShowActiveRiskDiagnostic(selected);
+    }
+
+    private async void GenerateRiskComparison_Click(object sender, RoutedEventArgs e)
+    {
+        if (_installation?.CanRender != true || _chart is null ||
+            RiskReviewGrid.SelectedItem is not VisualRiskReviewItem selected)
+        {
+            DarkDialog.Show(this, "请先选择有效游戏、谱面和一个风险项。", "无法生成风险对照");
+            return;
+        }
+
+        if (RiskStrategyBox.SelectedItem is not VisualRiskStrategyOption strategy)
+            return;
+        if (strategy.Kind == VisualRiskStrategyKind.VideoProFallback)
+        {
+            DarkDialog.Show(this, "Video Pro 本身就是左侧原版参考，不需要重复生成拆层候选；点击“应用此方案”即可切换。", "无需对照");
+            return;
+        }
+        var diagnosticOptions = BuildRiskDiagnosticOptions(strategy);
+        var unsupportedBake = _filterChoices
+            .Where(item => diagnosticOptions.BakedFilterKeys.Contains(item.Item.Key) && !item.Item.OfflineSupported)
+            .Select(static item => item.DisplayName)
+            .ToArray();
+        if (unsupportedBake.Length > 0)
+        {
+            DarkDialog.Show(
+                this,
+                "这些滤镜不能离线烤入，请先改为保留实时或忽略：" + string.Join("、", unsupportedBake),
+                "风险对照配置无效");
+            return;
+        }
+
+        GenerateRiskComparisonButton.IsEnabled = false;
+        RiskDiagnosticStatusText.Text = "正在准备风险闭环对照……";
+        try
+        {
+            var progress = new Progress<string>(message => RiskDiagnosticStatusText.Text = message);
+            var result = await VisualRiskDiagnosticClient.GenerateAsync(
+                _installation,
+                _chart,
+                selected.Issue,
+                diagnosticOptions,
+                progress);
+            selected.SetDiagnostic(strategy.Kind, result);
+            ShowActiveRiskDiagnostic(selected);
+            RefreshPreRenderCacheStatus();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            RiskDiagnosticStatusText.Text = "生成失败：" + exception.Message;
+            DarkDialog.Show(this, exception.Message, "风险闭环对照生成失败");
+        }
+        finally
+        {
+            GenerateRiskComparisonButton.IsEnabled = selected.Issue.RequiresComparison &&
+                                                     selected.Issue.TimeSeconds.HasValue &&
+                                                     strategy.Kind != VisualRiskStrategyKind.VideoProFallback;
+        }
+    }
+
+    private async void TestAllRiskCandidates_Click(object sender, RoutedEventArgs e)
+    {
+        if (_installation?.CanRender != true || _chart is null ||
+            RiskReviewGrid.SelectedItem is not VisualRiskReviewItem selected)
+        {
+            DarkDialog.Show(this, "请先选择有效游戏、谱面和一个风险项。", "无法实测候选");
+            return;
+        }
+
+        var candidates = BuildRiskStrategies(selected)
+            .Where(static strategy => strategy.Kind != VisualRiskStrategyKind.VideoProFallback)
+            .ToArray();
+        if (candidates.Length == 0) return;
+        GenerateRiskComparisonButton.IsEnabled = false;
+        TestAllRiskCandidatesButton.IsEnabled = false;
+        var succeeded = new List<(VisualRiskStrategyOption Strategy, double? Similarity)>();
+        var failed = new List<string>();
+        try
+        {
+            for (var index = 0; index < candidates.Length; index++)
+            {
+                var strategy = candidates[index];
+                var diagnosticOptions = BuildRiskDiagnosticOptions(strategy);
+                var unsupportedBake = _filterChoices
+                    .Where(item => diagnosticOptions.BakedFilterKeys.Contains(item.Item.Key) && !item.Item.OfflineSupported)
+                    .Select(static item => item.DisplayName)
+                    .ToArray();
+                if (unsupportedBake.Length > 0)
+                {
+                    var reason = "离线实现不存在：" + string.Join("、", unsupportedBake);
+                    selected.SetDiagnosticFailure(strategy.Kind, reason);
+                    failed.Add(strategy.Label + "（" + reason + "）");
+                    continue;
+                }
+
+                RiskDiagnosticStatusText.Text =
+                    $"正在实测候选 {index + 1:N0}/{candidates.Length:N0}：{strategy.Label}。每个候选都使用同一风险时间点与原版最终画面对照。";
+                try
+                {
+                    var progress = new Progress<string>(message =>
+                        RiskDiagnosticStatusText.Text = $"候选 {index + 1:N0}/{candidates.Length:N0} · {strategy.Label}：{message}");
+                    var result = await VisualRiskDiagnosticClient.GenerateAsync(
+                        _installation,
+                        _chart,
+                        selected.Issue,
+                        diagnosticOptions,
+                        progress);
+                    selected.SetDiagnostic(strategy.Kind, result);
+                    succeeded.Add((strategy, result.StructuralSimilarity));
+                    RefreshPreRenderCacheStatus();
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    selected.SetDiagnosticFailure(strategy.Kind, exception.Message);
+                    failed.Add(strategy.Label + "（" + exception.Message + "）");
+                }
+            }
+
+            var best = succeeded
+                .Where(static result => result.Similarity.HasValue)
+                .OrderByDescending(static result => result.Similarity)
+                .FirstOrDefault();
+            var strategies = BuildRiskStrategies(selected);
+            RiskStrategyBox.ItemsSource = strategies;
+            if (best.Strategy is not null)
+            {
+                selected.SelectStrategy(best.Strategy.Kind);
+                RiskStrategyBox.SelectedItem = strategies.First(item => item.Kind == best.Strategy.Kind);
+                ShowActiveRiskDiagnostic(selected);
+            }
+            RiskDiagnosticStatusText.Text =
+                $"已实际渲染 {succeeded.Count:N0} 个候选，失败 {failed.Count:N0} 个。" +
+                (best.Strategy is null
+                    ? "没有候选得到可比较结果。"
+                    : $"已切到数值差异最小的“{best.Strategy.Label}”（SSIM {best.Similarity:0.000000}）；这只是排序，仍必须逐帧人工确认，程序不会自动宣布解决。") +
+                (failed.Count == 0 ? "" : " 失败项可在下拉框逐个查看原因。");
+        }
+        finally
+        {
+            TestAllRiskCandidatesButton.IsEnabled = true;
+            GenerateRiskComparisonButton.IsEnabled = selected.Issue.RequiresComparison &&
+                                                     selected.Issue.TimeSeconds.HasValue &&
+                                                     selected.ActiveStrategy != VisualRiskStrategyKind.VideoProFallback;
+        }
+    }
+
+    private void RiskStrategyBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review ||
+            RiskStrategyBox.SelectedItem is not VisualRiskStrategyOption strategy)
+            return;
+        review.SelectStrategy(strategy.Kind);
+        RiskStrategyDescriptionText.Text = strategy.Description;
+        ShowActiveRiskDiagnostic(review);
+    }
+
+    private void ApplyRiskStrategy_Click(object sender, RoutedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review ||
+            RiskStrategyBox.SelectedItem is not VisualRiskStrategyOption strategy)
+            return;
+        if (review.Issue.RequiresComparison &&
+            strategy.Kind != VisualRiskStrategyKind.VideoProFallback &&
+            !review.HasComparison)
+        {
+            DarkDialog.Show(
+                this,
+                "这个候选还没有在当前风险的实际时间点完成原版／拆层闭环对照，不能把猜测当作解决方案。请先生成对照，或点击“实测全部候选”。",
+                "候选尚未实测");
+            return;
+        }
+        _suppressRiskInvalidation = true;
+        try
+        {
+            var filterKeys = review.Issue.RelatedFilterKeys ??
+                             (string.IsNullOrWhiteSpace(review.Issue.FilterKey) ? [] : [review.Issue.FilterKey]);
+            if (strategy.Kind is VisualRiskStrategyKind.FinalCompositeRealtime or
+                VisualRiskStrategyKind.BakeBackgroundFilterChain or
+                VisualRiskStrategyKind.BakeTargetedFilterWithTargets or
+                VisualRiskStrategyKind.DisableFilterCompromise or
+                VisualRiskStrategyKind.RetainTargetedFilterWithTargets)
+            {
+                var ownership = strategy.Kind switch
+                {
+                    VisualRiskStrategyKind.BakeBackgroundFilterChain or
+                    VisualRiskStrategyKind.BakeTargetedFilterWithTargets => FilterOwnership.BakeIntoVideo,
+                    VisualRiskStrategyKind.DisableFilterCompromise => FilterOwnership.Ignore,
+                    _ => FilterOwnership.Realtime,
+                };
+                foreach (var item in _filterChoices.Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal)))
+                    item.Ownership = ownership;
+            }
+            if (strategy.Kind == VisualRiskStrategyKind.BakeBackgroundHistoryComposite)
+            {
+                foreach (var item in _filterChoices.Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal)))
+                    item.Ownership = item.Item.EventType == "HallOfMirrors" ||
+                                     item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase)
+                        ? FilterOwnership.BakeIntoVideo
+                        : FilterOwnership.Realtime;
+            }
+            else if (strategy.Kind == VisualRiskStrategyKind.BakeBackgroundAndGlobalKeepRealtimeFilters)
+            {
+                foreach (var item in _filterChoices.Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal)))
+                {
+                    item.Ownership = item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase)
+                        ? FilterOwnership.BakeIntoVideo
+                        : item.Item.Plane.Equals("Foreground", StringComparison.OrdinalIgnoreCase)
+                            ? FilterOwnership.Realtime
+                            : FilterOwnership.BakeAndRealtime;
+                }
+            }
+            else if (strategy.Kind is VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime or
+                     VisualRiskStrategyKind.BakeForegroundPlaneKeepBackgroundRealtime)
+            {
+                var bakePlane = strategy.Kind == VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime
+                    ? "Background"
+                    : "Foreground";
+                foreach (var item in _filterChoices.Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal)))
+                    item.Ownership = item.Item.Plane.Equals(bakePlane, StringComparison.OrdinalIgnoreCase)
+                        ? FilterOwnership.BakeIntoVideo
+                        : FilterOwnership.Realtime;
+            }
+            var retainDependencies = strategy.Kind is
+                VisualRiskStrategyKind.RetainTargetedFilterWithTargets or
+                VisualRiskStrategyKind.RetainMaskDependencyClosure or
+                VisualRiskStrategyKind.RetainAllMaskDependencyClosures or
+                VisualRiskStrategyKind.RetainDynamicImageSequence or
+                VisualRiskStrategyKind.RetainParticleSystems;
+            var bakeDependencies = strategy.Kind is
+                VisualRiskStrategyKind.BakeTargetedFilterWithTargets or
+                VisualRiskStrategyKind.BakeMaskDependencyClosure or
+                VisualRiskStrategyKind.BakeDynamicImageSequence or
+                VisualRiskStrategyKind.BakeParticleSystems;
+            if (retainDependencies || bakeDependencies)
+            {
+                var indices = strategy.Kind == VisualRiskStrategyKind.RetainAllMaskDependencyClosures
+                    ? _riskReviews
+                        .Where(static item => item.Issue.Kind == VisualRiskKind.MaskComposition)
+                        .SelectMany(static item => item.Issue.RelatedDecorationIndices ?? [])
+                        .ToHashSet()
+                    : (review.Issue.RelatedDecorationIndices ?? []).ToHashSet();
+                var whitelist = CurrentRetentionMode == DecorationRetentionMode.Whitelist;
+                foreach (var item in _decorationChoices.Where(item => indices.Contains(item.Item.Index)))
+                {
+                    item.IsExcluded = false;
+                    item.IsListed = retainDependencies ? whitelist : !whitelist;
+                }
+            }
+            if (retainDependencies)
+            {
+                foreach (var item in _filterChoices.Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal)))
+                    item.Ownership = FilterOwnership.Realtime;
+            }
+            if (strategy.Kind == VisualRiskStrategyKind.ExtendParticleTail &&
+                (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var currentTail) || currentTail < 10m))
+                TailSecondsBox.Text = "10";
+            if (strategy.Kind is VisualRiskStrategyKind.VideoProFallback or
+                VisualRiskStrategyKind.SwitchToVideo or VisualRiskStrategyKind.SwitchToVideoVfxPro)
+            {
+                var selectedProfile = strategy.Kind switch
+                {
+                    VisualRiskStrategyKind.SwitchToVideo => OutputProfile.Video,
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro => OutputProfile.VideoVfxPro,
+                    _ => OutputProfile.VideoPro,
+                };
+                foreach (var check in _profileChecks)
+                    check.IsChecked = (OutputProfile)check.Tag == selectedProfile;
+                UseProfileContentCheckBox.IsChecked = true;
+                RefreshContentChoices();
+            }
+        }
+        finally
+        {
+            _suppressRiskInvalidation = false;
+        }
+        review.Status = VisualRiskReviewStatus.Pending;
+        RefreshFilterOwnershipSummary();
+        RefreshBakedFilterRisks();
+        RefreshRetentionSummary();
+        review.MarkStrategyApplied(strategy.Kind);
+        RiskDiagnosticStatusText.Text = "已应用经选择的候选：“" + strategy.Label + "”。请检查它在此风险位置生成的对应对照，再确认正常。";
+    }
+
+    private IReadOnlyList<VisualRiskStrategyOption> BuildRiskStrategies(VisualRiskReviewItem review)
+    {
+        var strategies = new List<VisualRiskStrategyOption>
+        {
+            new(VisualRiskStrategyKind.Current, "当前配置（基线候选）", "先实际渲染当前拆层结果，确认问题是否在这个时间点真实出现。"),
+        };
+        var filterKeys = review.Issue.RelatedFilterKeys ??
+                         (string.IsNullOrWhiteSpace(review.Issue.FilterKey) ? [] : [review.Issue.FilterKey]);
+        var decorationCount = review.Issue.RelatedDecorationIndices?.Count ?? 0;
+        var matchingFilters = _filterChoices.Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal)).ToArray();
+        var canBakeFilters = filterKeys.Count > 0 && filterKeys.All(key => matchingFilters.Any(item =>
+            item.Item.Key.Equals(key, StringComparison.Ordinal) && item.Item.OfflineSupported));
+        var onlyBackgroundFilters = matchingFilters.Length > 0 && matchingFilters.All(static item =>
+            item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase));
+        var hasBackgroundFilters = matchingFilters.Any(static item =>
+            item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase));
+        var hasForegroundFilters = matchingFilters.Any(static item =>
+            item.Item.Plane.Equals("Foreground", StringComparison.OrdinalIgnoreCase));
+        var canBakeBackgroundPlane = hasBackgroundFilters && matchingFilters
+            .Where(static item => item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase))
+            .All(static item => item.Item.OfflineSupported);
+
+        switch (review.Issue.Kind)
+        {
+            case VisualRiskKind.MaskComposition:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.BakeMaskDependencyClosure,
+                    "候选：遮罩依赖闭包一起烤入",
+                    $"把分析出的 {decorationCount:N0} 个遮罩依赖放在同一视频层，避免只删掉其中一边。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainMaskDependencyClosure,
+                    "候选：遮罩依赖闭包一起实时",
+                    $"把分析出的 {decorationCount:N0} 个遮罩依赖全部留在派生谱，让游戏维持原本深度与遮罩缓存。"));
+                var allMaskDependencyCount = _riskReviews
+                    .Where(static item => item.Issue.Kind == VisualRiskKind.MaskComposition)
+                    .SelectMany(static item => item.Issue.RelatedDecorationIndices ?? [])
+                    .Distinct()
+                    .Count();
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainAllMaskDependencyClosures,
+                    "候选：全谱遮罩依赖闭包全部实时",
+                    $"把所有遮罩风险段合并后的 {allMaskDependencyCount:N0} 个依赖元素留给游戏，保留全局排序和共享遮罩缓存；普通非遮罩装饰仍可烤入。"));
+                if (canBakeFilters && hasBackgroundFilters && hasForegroundFilters)
+                {
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundFilterChain,
+                        "候选：整组滤镜链与背景一起烤入并实时关闭",
+                        "把同一风险段的背景、前景和全画面滤镜按原顺序全部处理视频层，并在派生谱关闭重复事件；轨道不再获得这组滤镜，必须用实际画面对照。"));
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime,
+                        "候选：背景滤镜烤入，前景滤镜实时",
+                        "把同一风险段的背景平面滤镜随背景装饰烤入；前景平面滤镜仍在最终合成处理轨道和实时前景。"));
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundAndGlobalKeepRealtimeFilters,
+                        "候选：背景与全画面滤镜烤入，全画面滤镜同时实时",
+                        "背景平面滤镜与全画面滤镜先处理视频；全画面滤镜仍在派生谱处理轨道。用于原版滤镜能处理场景层、却处理不到静态 bgVideo 的情况。"));
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeForegroundPlaneKeepBackgroundRealtime,
+                        "反向对照：前景滤镜烤入，背景滤镜实时",
+                        "用于验证前后景归属方向；只有实际闭环更接近原版时才可采用。"));
+                }
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：改用 Video VFX Pro 分开前景",
+                    "只烤深度大于等于零的背景装饰，把前景遮罩与遮挡留给游戏；适合跨轨道前景关系。"));
+                break;
+            case VisualRiskKind.HistoryFeedback:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.BakeBackgroundFilterChain,
+                    "候选：全部装饰层、前后景滤镜与 Hall 一起烤入",
+                    "Video VFX 的全部装饰、粒子、Background/Foreground 滤镜和历史反馈在压平前共同计算；派生谱关闭这组滤镜，只保留实时轨道与星球。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.BakeBackgroundHistoryComposite,
+                    "候选：背景层与 Hall 历史反馈一起离线烤入",
+                    "从正式视频起点保留历史颜色缓冲，让背景装饰、Background 滤镜和 Hall 在压平前共同计算；Foreground 滤镜与实时轨道不烤入。"));
+                if (canBakeBackgroundPlane)
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime,
+                        "候选：背景滤镜烤入，Hall 与前景滤镜实时",
+                        "先让视频层经过同段 Background 滤镜链；Hall of Mirrors 和 Foreground 滤镜仍在最终合成处理视频、轨道、粒子与实时前景。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.FinalCompositeRealtime,
+                    "候选：反馈滤镜作用于最终合成",
+                    "先播放视频并合成轨道、粒子和实时前景，再由游戏执行历史帧反馈；必须用实际风险片段验证。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.PrewarmHistory,
+                    "候选：从更早时间预热反馈缓冲",
+                    "诊断时提前 10 秒开始计算历史帧，排除因为直接跳到风险格导致反馈缓冲为空。正式完整渲染会从关卡开头自然预热。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.DisableFilterCompromise,
+                    "诊断候选：关闭反馈滤镜（妥协）",
+                    "只用来证明爆炸是否由反馈链造成；会失去主效果，不能默认采用。"));
+                break;
+            case VisualRiskKind.TargetedFilter:
+                if (canBakeFilters)
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeTargetedFilterWithTargets,
+                        "候选：目标滤镜与目标装饰一起烤入",
+                        $"把滤镜和匹配目标标签的 {decorationCount:N0} 个装饰放在同一视频层，保留局部作用域。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainTargetedFilterWithTargets,
+                    "候选：目标滤镜与目标装饰一起实时",
+                    $"把滤镜和匹配目标标签的 {decorationCount:N0} 个装饰都留给游戏，避免滤镜失去目标。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：改用 Video VFX Pro 保留前景目标",
+                    "背景装饰进入视频，深度小于零的目标装饰与局部滤镜留给游戏，减少跨层断裂。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.DisableFilterCompromise,
+                    "诊断候选：关闭目标滤镜（妥协）",
+                    "只用于确认爆炸是否由该滤镜造成；会缺效果，不能默认采用。"));
+                break;
+            case VisualRiskKind.SplitFilter:
+            case VisualRiskKind.NegativeFilterParameter:
+                if (canBakeFilters)
+                {
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundFilterChain,
+                        onlyBackgroundFilters
+                            ? "候选：背景滤镜链与背景一起烤入"
+                            : "候选：滤镜链与视频层一起烤入（高风险）",
+                        onlyBackgroundFilters
+                            ? "滤镜只声明作用背景平面；连同背景装饰预渲染，派生谱关闭重复滤镜。"
+                            : "滤镜跨越多个平面；只作为真实对照候选，若影响轨道或实时前景就不能采用。"));
+                }
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.FinalCompositeRealtime,
+                    "候选：滤镜保留到最终合成",
+                    "让滤镜在背景视频、轨道和前景合成后执行；适合会影响轨道或多层的效果。"));
+                if (canBakeFilters && hasBackgroundFilters && hasForegroundFilters)
+                {
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime,
+                        "候选：只烤背景平面滤镜",
+                        "背景滤镜随背景视频预渲染，前景滤镜留到最终合成继续处理轨道与实时前景。"));
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeBackgroundAndGlobalKeepRealtimeFilters,
+                        "候选：背景与全画面滤镜烤入，全画面滤镜同时实时",
+                        "全画面滤镜既预处理视频背景，也保留给实时轨道；背景专用滤镜只烤入，前景滤镜只实时。"));
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.BakeForegroundPlaneKeepBackgroundRealtime,
+                        "反向对照：只烤前景平面滤镜",
+                        "前景滤镜进入视频、背景滤镜留实时；主要用于实际对照判断平面归属是否与预期相反。"));
+                }
+                if (onlyBackgroundFilters)
+                    strategies.Add(new VisualRiskStrategyOption(
+                        VisualRiskStrategyKind.SwitchToVideo,
+                        "候选：Video 整体预渲染装饰与特效",
+                        "把装饰和特效放入同一视频，轨道与星球仍实时；仍需确认滤镜确实不依赖轨道。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：Video VFX Pro 保留前景层",
+                    "背景滤镜与背景装饰预渲染，深度小于零的前景仍实时，用对照确认跨层关系。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.DisableFilterCompromise,
+                    "诊断候选：关闭相关滤镜（妥协）",
+                    "只用于定位爆炸来源；会缺效果，不能默认采用。"));
+                break;
+            case VisualRiskKind.DynamicImageSwap:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.BakeDynamicImageSequence,
+                    "候选：完整换图序列烤入视频",
+                    $"让 {decorationCount:N0} 个换图依赖在视频层连续执行，不按初始空贴图误删。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainDynamicImageSequence,
+                    "候选：换图装饰保留实时",
+                    $"把 {decorationCount:N0} 个相关装饰留给游戏执行 MoveDecorations。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：Video VFX Pro 保留前景换图",
+                    "只烤背景装饰，前景换图序列留在派生谱，适合换图对象会遮挡轨道的情况。"));
+                break;
+            case VisualRiskKind.ParticleComposition:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.BakeParticleSystems,
+                    "候选：完整粒子系统烤入视频",
+                    "粒子创建、控制、预热和尾帧全部由离线时间线执行；用实际片段检查滤镜与遮罩依赖。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.ExtendParticleTail,
+                    "候选：粒子烤入并延长尾帧",
+                    "保持粒子烤入视频，但正式输出至少多渲染 10 秒，避免关卡结束后粒子突然冻结。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.RetainParticleSystems,
+                    "候选：相关粒子保留实时",
+                    $"把 {decorationCount:N0} 个粒子系统留给游戏；适合依赖实时滤镜或遮罩的粒子。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：Video VFX Pro 保留前景粒子",
+                    "背景粒子进视频，前景粒子继续实时，避免前景粒子被压到轨道下面。"));
+                break;
+            case VisualRiskKind.SourceBackgroundVideo:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.PreserveBackgroundVideo,
+                    "候选：保留源背景视频并逐帧定位",
+                    "沿用原谱 bgVideo、vidOffset、倒计时、循环和原版画幅模式，不把视频当静态贴图。"));
+                break;
+            case VisualRiskKind.CreatedObject:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.KeepCreatedObjectsRealtime,
+                    "候选：创建对象保留实时",
+                    "AddObject 默认留在派生谱由原版运行时处理，不强行塞进选择性装饰渲染器。"));
+                break;
+            case VisualRiskKind.CameraComposition:
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.FinalCompositeRealtime,
+                    "候选：运镜只在最终合成执行",
+                    "背景视频不重复执行运镜，派生谱在轨道、前景和视频合成后按原版事件执行一次。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideo,
+                    "候选：装饰与特效共用预渲染运镜",
+                    "把装饰与特效放入同一预渲染相机，轨道实时；用对照检查运动视差是否仍一致。"));
+                strategies.Add(new VisualRiskStrategyOption(
+                    VisualRiskStrategyKind.SwitchToVideoVfxPro,
+                    "候选：前后景分层运镜",
+                    "背景层预渲染，前景层与轨道实时；用对照确认相机方向、整圈旋转和缩放。"));
+                break;
+        }
+        if (review.Issue.Kind is not (VisualRiskKind.MemoryPressure or VisualRiskKind.MissingAsset))
+            strategies.Add(new VisualRiskStrategyOption(
+                VisualRiskStrategyKind.VideoProFallback,
+                "确定性回退：Video Pro 完整压平",
+                "直接用原版场景完整渲染所有视觉层；这是无法安全拆层时的完整还原方案，不是接受错误。"));
+        return strategies.ToArray();
+    }
+
+    private VisualRiskDiagnosticOptions BuildRiskDiagnosticOptions(VisualRiskStrategyOption strategy)
+    {
+        var selectedReview = RiskReviewGrid.SelectedItem as VisualRiskReviewItem;
+        var profile = _profileChecks
+            .Where(static check => check.IsChecked == true)
+            .Select(static check => (OutputProfile)check.Tag)
+            .FirstOrDefault(static profile => profile != OutputProfile.VideoPro);
+        if (profile == OutputProfile.VideoPro) profile = OutputProfile.VideoVfx;
+        profile = strategy.Kind switch
+        {
+            VisualRiskStrategyKind.SwitchToVideo => OutputProfile.Video,
+            VisualRiskStrategyKind.SwitchToVideoVfxPro => OutputProfile.VideoVfxPro,
+            _ => profile,
+        };
+        var retained = new HashSet<int>(GetRetainedDecorationIndices());
+        var excluded = new HashSet<int>(GetExcludedDecorationIndices());
+        var baked = new HashSet<string>(GetBakedFilterKeys(), StringComparer.Ordinal);
+        var disabled = new HashSet<string>(GetDisabledFilterKeys(), StringComparer.Ordinal);
+        if (selectedReview is { } review)
+        {
+            var filterKeys = review.Issue.RelatedFilterKeys ??
+                             (string.IsNullOrWhiteSpace(review.Issue.FilterKey) ? [] : [review.Issue.FilterKey]);
+            switch (strategy.Kind)
+            {
+                case VisualRiskStrategyKind.FinalCompositeRealtime:
+                case VisualRiskStrategyKind.RetainTargetedFilterWithTargets:
+                case VisualRiskStrategyKind.RetainMaskDependencyClosure:
+                case VisualRiskStrategyKind.RetainDynamicImageSequence:
+                case VisualRiskStrategyKind.RetainParticleSystems:
+                    baked.ExceptWith(filterKeys);
+                    disabled.ExceptWith(filterKeys);
+                    retained.UnionWith(review.Issue.RelatedDecorationIndices ?? []);
+                    excluded.ExceptWith(review.Issue.RelatedDecorationIndices ?? []);
+                    break;
+                case VisualRiskStrategyKind.RetainAllMaskDependencyClosures:
+                    baked.ExceptWith(filterKeys);
+                    disabled.ExceptWith(filterKeys);
+                    var allMaskIndices = _riskReviews
+                        .Where(static item => item.Issue.Kind == VisualRiskKind.MaskComposition)
+                        .SelectMany(static item => item.Issue.RelatedDecorationIndices ?? [])
+                        .ToHashSet();
+                    retained.UnionWith(allMaskIndices);
+                    excluded.ExceptWith(allMaskIndices);
+                    break;
+                case VisualRiskStrategyKind.BakeBackgroundFilterChain:
+                case VisualRiskStrategyKind.BakeTargetedFilterWithTargets:
+                case VisualRiskStrategyKind.BakeMaskDependencyClosure:
+                case VisualRiskStrategyKind.BakeDynamicImageSequence:
+                case VisualRiskStrategyKind.BakeParticleSystems:
+                    baked.UnionWith(filterKeys);
+                    disabled.UnionWith(filterKeys);
+                    retained.ExceptWith(review.Issue.RelatedDecorationIndices ?? []);
+                    excluded.ExceptWith(review.Issue.RelatedDecorationIndices ?? []);
+                    break;
+                case VisualRiskStrategyKind.DisableFilterCompromise:
+                    baked.ExceptWith(filterKeys);
+                    disabled.UnionWith(filterKeys);
+                    break;
+                case VisualRiskStrategyKind.BakeBackgroundHistoryComposite:
+                    var historyBakeKeys = _filterChoices
+                        .Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal) &&
+                                       (item.Item.EventType == "HallOfMirrors" ||
+                                        item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase)))
+                        .Select(static item => item.Item.Key)
+                        .ToHashSet(StringComparer.Ordinal);
+                    var historyRealtimeKeys = filterKeys.Where(key => !historyBakeKeys.Contains(key)).ToArray();
+                    baked.UnionWith(historyBakeKeys);
+                    disabled.UnionWith(historyBakeKeys);
+                    baked.ExceptWith(historyRealtimeKeys);
+                    disabled.ExceptWith(historyRealtimeKeys);
+                    break;
+                case VisualRiskStrategyKind.BakeBackgroundAndGlobalKeepRealtimeFilters:
+                    var backgroundKeys = _filterChoices
+                        .Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal) &&
+                                       item.Item.Plane.Equals("Background", StringComparison.OrdinalIgnoreCase))
+                        .Select(static item => item.Item.Key)
+                        .ToHashSet(StringComparer.Ordinal);
+                    var foregroundKeys = _filterChoices
+                        .Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal) &&
+                                       item.Item.Plane.Equals("Foreground", StringComparison.OrdinalIgnoreCase))
+                        .Select(static item => item.Item.Key)
+                        .ToHashSet(StringComparer.Ordinal);
+                    var globalKeys = filterKeys
+                        .Where(key => !backgroundKeys.Contains(key) && !foregroundKeys.Contains(key))
+                        .ToHashSet(StringComparer.Ordinal);
+                    baked.UnionWith(backgroundKeys);
+                    baked.UnionWith(globalKeys);
+                    baked.ExceptWith(foregroundKeys);
+                    disabled.UnionWith(backgroundKeys);
+                    disabled.ExceptWith(globalKeys);
+                    disabled.ExceptWith(foregroundKeys);
+                    break;
+                case VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime:
+                case VisualRiskStrategyKind.BakeForegroundPlaneKeepBackgroundRealtime:
+                    var bakePlane = strategy.Kind == VisualRiskStrategyKind.BakeBackgroundPlaneKeepForegroundRealtime
+                        ? "Background"
+                        : "Foreground";
+                    var planeKeys = _filterChoices
+                        .Where(item => filterKeys.Contains(item.Item.Key, StringComparer.Ordinal) &&
+                                       item.Item.Plane.Equals(bakePlane, StringComparison.OrdinalIgnoreCase))
+                        .Select(static item => item.Item.Key)
+                        .ToHashSet(StringComparer.Ordinal);
+                    var realtimeKeys = filterKeys.Where(key => !planeKeys.Contains(key)).ToArray();
+                    baked.UnionWith(planeKeys);
+                    disabled.UnionWith(planeKeys);
+                    baked.ExceptWith(realtimeKeys);
+                    disabled.ExceptWith(realtimeKeys);
+                    break;
+            }
+        }
+        double? preRollSeconds = strategy.Kind == VisualRiskStrategyKind.PrewarmHistory &&
+                                 selectedReview?.Issue.TimeSeconds is { } riskTime
+            ? Math.Max(0d, riskTime + 0.001d)
+            : null;
+        var durationSeconds = preRollSeconds.HasValue
+            ? Math.Min(60d, preRollSeconds.Value + 10d)
+            : 10d;
+        return new VisualRiskDiagnosticOptions(
+            profile,
+            retained,
+            excluded,
+            baked,
+            disabled,
+            strategy.Kind.ToString(),
+            preRollSeconds,
+            durationSeconds);
+    }
+
+    private void ShowActiveRiskDiagnostic(VisualRiskReviewItem review)
+    {
+        RiskDiagnosticStatusText.Text = review.DiagnosticSummary;
+        RiskComparisonList.ItemsSource = review.ComparisonFrames;
+        RiskComparisonList.SelectedIndex = review.ComparisonFrames.Count > 0 ? 0 : -1;
+        GenerateRiskComparisonButton.IsEnabled = review.Issue.RequiresComparison &&
+                                                 review.Issue.TimeSeconds.HasValue &&
+                                                 review.ActiveStrategy != VisualRiskStrategyKind.VideoProFallback;
+        if (review.ComparisonFrames.Count != 0) return;
+        RiskReferenceImage.Source = null;
+        RiskCandidateImage.Source = null;
+    }
+
+    private void RiskComparisonList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (RiskComparisonList.SelectedItem is not VisualRiskComparisonViewItem selected) return;
+        RiskReferenceImage.Source = selected.ReferenceImage;
+        RiskCandidateImage.Source = selected.CandidateImage;
+    }
+
+    private void ConfirmRiskNormal_Click(object sender, RoutedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem selected) return;
+        if (selected.Issue.RequiresComparison && !selected.HasComparison)
+        {
+            DarkDialog.Show(this, "这个风险项必须先生成原版／拆层闭环对照，不能空点“正常”。", "尚未对照");
+            return;
+        }
+        if (selected.AppliedStrategy != selected.ActiveStrategy)
+        {
+            DarkDialog.Show(
+                this,
+                "当前看到的是候选对照，但这个候选尚未应用到正式渲染配置。请先点击“应用此候选”，再确认正常。",
+                "候选尚未应用");
+            return;
+        }
+        selected.Status = VisualRiskReviewStatus.ConfirmedNormal;
+        RiskDiagnosticStatusText.Text = "已由用户确认此处画面正常。";
+    }
+
+    private void MarkRiskNeedsAdjustment_Click(object sender, RoutedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem selected) return;
+        selected.Status = VisualRiskReviewStatus.NeedsAdjustment;
+        RiskDiagnosticStatusText.Text = "已标记为需要调整；正式拆层渲染会继续被阻止。";
+        if (!string.IsNullOrWhiteSpace(selected.Issue.FilterKey))
+        {
+            FilterOwnershipGrid.SelectedItem = _filterChoices.FirstOrDefault(item =>
+                item.Item.Key.Equals(selected.Issue.FilterKey, StringComparison.Ordinal));
+            VisualEditorTabs.SelectedItem = FilterEditorTab;
+        }
+        else if (selected.Issue.DecorationIndex is { } decorationIndex)
+        {
+            DecorationRetentionList.SelectedItem = _decorationChoices.FirstOrDefault(item =>
+                item.Item.Index == decorationIndex);
+            VisualEditorTabs.SelectedItem = DecorationEditorTab;
+        }
+    }
+
+    private void AcceptRisk_Click(object sender, RoutedEventArgs e)
+    {
+        if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem selected) return;
+        selected.Status = VisualRiskReviewStatus.AcceptedRisk;
+        RiskDiagnosticStatusText.Text = "已明确接受此风险；记录不会伪装成画面正常。";
+    }
+
     private void RefreshPreRenderCacheStatus()
     {
         if (PreRenderCacheStatusText is null) return;
@@ -724,6 +1634,7 @@ public partial class MainWindow : Window
         OutputList.ItemsSource = null;
         SummaryText.Text = "选择已改变，请重新生成批量渲染计划。";
         RefreshContentChoices();
+        InvalidateRiskComparisons();
     }
 
     private void UseProfileContent_Click(object sender, RoutedEventArgs e) => RefreshContentChoices();
@@ -959,6 +1870,25 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("输出版本、分辨率和 FPS 都至少选择一个。");
             }
 
+            if (!_exitWhenQueueFinishes)
+            {
+                var hasSplitProfile = profiles.Any(static profile => profile != OutputProfile.VideoPro);
+                var blockingRisks = _riskReviews.Where(item =>
+                        (item.Status is VisualRiskReviewStatus.Pending or VisualRiskReviewStatus.NeedsAdjustment) &&
+                        item.Issue.Severity != VisualRiskSeverity.Information &&
+                        (hasSplitProfile || item.Issue.AffectsVideoPro))
+                    .ToArray();
+                if (blockingRisks.Length > 0)
+                {
+                    MainTabs.SelectedIndex = 1;
+                    VisualEditorTabs.SelectedItem = RiskReviewTab;
+                    RiskReviewGrid.SelectedItem = blockingRisks[0];
+                    throw new InvalidOperationException(
+                        $"还有 {blockingRisks.Length:N0} 个相关风险尚未确认或仍需调整。" +
+                        "程序已经切到“风险确认”；请生成原版／拆层闭环对照后确认，或明确接受已知风险。");
+                }
+            }
+
             if (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var tailSeconds))
             {
                 throw new InvalidOperationException("结束延长秒数无效。");
@@ -1004,7 +1934,8 @@ public partial class MainWindow : Window
             var bakedFilterKeys = GetBakedFilterKeys();
             var disabledFilterKeys = GetDisabledFilterKeys();
             var unsupportedBake = _filterChoices
-                .Where(static item => item.Ownership == FilterOwnership.BakeIntoVideo && !item.Item.OfflineSupported)
+                .Where(static item => (item.Ownership is FilterOwnership.BakeIntoVideo or FilterOwnership.BakeAndRealtime) &&
+                                      !item.Item.OfflineSupported)
                 .Select(static item => item.DisplayName)
                 .ToArray();
             if (unsupportedBake.Length > 0)
@@ -1036,7 +1967,8 @@ public partial class MainWindow : Window
                     bakedFilterKeys,
                     disabledFilterKeys,
                     renderBackend,
-                    memoryLimitMb);
+                    memoryLimitMb,
+                    _finalCompositeVerificationMode);
                 _renderQueue.Enqueue(task);
                 _queueItems.Add(new RenderQueueDisplayItem(task));
             }
@@ -1099,7 +2031,8 @@ public partial class MainWindow : Window
             task.BakedFilterKeys,
             task.DisabledFilterKeys,
             task.RenderBackend,
-            task.MemoryLimitMb);
+            task.MemoryLimitMb,
+            task.FinalCompositeVerification);
         var current = _queueItems.IndexOf(displayItem) + 1;
         SummaryText.Text = $"队列任务 {current}/{_batchTotal}：{Path.GetFileName(task.Chart.Path)} · {task.Variant.DisplayName}\n" +
                            $"烤入滤镜 {task.BakedFilterKeys.Count:N0} 组；派生谱关闭 {task.DisabledFilterKeys.Count:N0} 组；" +
@@ -1281,7 +2214,8 @@ public partial class MainWindow : Window
         IReadOnlySet<string> BakedFilterKeys,
         IReadOnlySet<string> DisabledFilterKeys,
         RenderBackend RenderBackend,
-        int MemoryLimitMb);
+        int MemoryLimitMb,
+        bool FinalCompositeVerification);
 
     private sealed class RenderQueueDisplayItem : INotifyPropertyChanged
     {
@@ -1371,6 +2305,7 @@ public partial class MainWindow : Window
         [
             new("保留实时", FilterOwnership.Realtime),
             new("烤入视频", FilterOwnership.BakeIntoVideo),
+            new("烤入视频并保留实时", FilterOwnership.BakeAndRealtime),
             new("忽略/关闭", FilterOwnership.Ignore),
         ];
         private FilterOwnership _ownership = FilterOwnership.Realtime;
@@ -1392,7 +2327,9 @@ public partial class MainWindow : Window
         public int FirstFloor => Item.FirstFloor;
         public int InvocationCount => Item.InvocationCount;
         public string RiskHint => Item.RiskHint;
-        public string OfflineStatus => Item.OfflineSupported ? "可离线近似；建议对照确认" : "尚未实现，只能实时或忽略";
+        public string OfflineStatus => Item.OfflineSupported
+            ? "有独立实现；仍须实际对照"
+            : "当前无独立实现；实测最终合成、共层或完整压平";
         public IReadOnlyList<FilterOwnershipOption> OwnershipChoices => Options;
         public FilterOwnership Ownership
         {
@@ -1404,6 +2341,171 @@ public partial class MainWindow : Window
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Ownership)));
             }
         }
+    }
+
+    private enum VisualRiskReviewStatus
+    {
+        Pending,
+        ConfirmedNormal,
+        NeedsAdjustment,
+        AcceptedRisk,
+    }
+
+    private enum VisualRiskStrategyKind
+    {
+        Current,
+        FinalCompositeRealtime,
+        BakeBackgroundFilterChain,
+        BakeBackgroundPlaneKeepForegroundRealtime,
+        BakeBackgroundHistoryComposite,
+        BakeBackgroundAndGlobalKeepRealtimeFilters,
+        BakeForegroundPlaneKeepBackgroundRealtime,
+        BakeTargetedFilterWithTargets,
+        RetainTargetedFilterWithTargets,
+        BakeMaskDependencyClosure,
+        RetainMaskDependencyClosure,
+        RetainAllMaskDependencyClosures,
+        BakeDynamicImageSequence,
+        RetainDynamicImageSequence,
+        BakeParticleSystems,
+        RetainParticleSystems,
+        DisableFilterCompromise,
+        KeepCreatedObjectsRealtime,
+        ExtendParticleTail,
+        PreserveBackgroundVideo,
+        PrewarmHistory,
+        SwitchToVideo,
+        SwitchToVideoVfxPro,
+        VideoProFallback,
+    }
+
+    private sealed record VisualRiskStrategyOption(
+        VisualRiskStrategyKind Kind,
+        string Label,
+        string Description);
+
+    private sealed class VisualRiskReviewItem : INotifyPropertyChanged
+    {
+        private VisualRiskReviewStatus _status = VisualRiskReviewStatus.Pending;
+        private readonly Dictionary<VisualRiskStrategyKind, DiagnosticSnapshot> _diagnostics = [];
+        private readonly Dictionary<VisualRiskStrategyKind, string> _diagnosticFailures = [];
+        private VisualRiskStrategyKind _activeStrategy = VisualRiskStrategyKind.Current;
+        private VisualRiskStrategyKind? _appliedStrategy;
+
+        public VisualRiskReviewItem(VisualRiskIssue issue) => Issue = issue;
+        public event PropertyChangedEventHandler? PropertyChanged;
+        public VisualRiskIssue Issue { get; }
+        public string Title => Issue.Title;
+        public string FloorText => Issue.FirstFloor?.ToString(CultureInfo.InvariantCulture) ?? "—";
+        public string TimeText => Issue.TimeSeconds.HasValue ? $"{Issue.TimeSeconds.Value:0.###}s" : "—";
+        public VisualRiskStrategyKind ActiveStrategy => _activeStrategy;
+        public VisualRiskStrategyKind? AppliedStrategy => _appliedStrategy;
+        public bool HasComparison => _diagnostics.ContainsKey(_activeStrategy);
+        public IReadOnlyList<VisualRiskComparisonViewItem> ComparisonFrames =>
+            _diagnostics.TryGetValue(_activeStrategy, out var diagnostic) ? diagnostic.Frames : [];
+        public string StatusText => Status switch
+        {
+            VisualRiskReviewStatus.ConfirmedNormal => "已确认正常",
+            VisualRiskReviewStatus.NeedsAdjustment => "需要调整",
+            VisualRiskReviewStatus.AcceptedRisk => "已接受风险",
+            _ => "待确认",
+        };
+        public string DiagnosticSummary => HasComparison
+            ? _diagnostics[_activeStrategy].StructuralSimilarity.HasValue
+                ? $"“{_activeStrategy}”候选闭环对照已生成；整段 SSIM {_diagnostics[_activeStrategy].StructuralSimilarity!.Value:0.000000}。数值只用于候选排序与定位差异，不能自动宣布解决。"
+                : "闭环对照已生成；未取得 SSIM，仍可逐帧人工确认。"
+            : _diagnosticFailures.TryGetValue(_activeStrategy, out var failure)
+                ? "这个候选已实测失败：" + failure
+            : Issue.RequiresComparison
+                ? "尚未生成闭环对照。"
+                : "这是非画面对照项；修复后重新载入，或明确接受风险。";
+
+        public VisualRiskReviewStatus Status
+        {
+            get => _status;
+            set
+            {
+                if (_status == value) return;
+                _status = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StatusText)));
+            }
+        }
+
+        public void SelectStrategy(VisualRiskStrategyKind strategy)
+        {
+            if (_activeStrategy == strategy) return;
+            _activeStrategy = strategy;
+            if (Status != VisualRiskReviewStatus.AcceptedRisk) Status = VisualRiskReviewStatus.Pending;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ActiveStrategy)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasComparison)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ComparisonFrames)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DiagnosticSummary)));
+        }
+
+        public void SetDiagnostic(VisualRiskStrategyKind strategy, VisualRiskDiagnosticResult result)
+        {
+            _activeStrategy = strategy;
+            _diagnosticFailures.Remove(strategy);
+            _diagnostics[strategy] = new DiagnosticSnapshot(
+                result.Frames.Select(static pair => new VisualRiskComparisonViewItem(pair)).ToArray(),
+                result.StructuralSimilarity);
+            if (Status != VisualRiskReviewStatus.AcceptedRisk) Status = VisualRiskReviewStatus.Pending;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ActiveStrategy)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasComparison)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ComparisonFrames)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DiagnosticSummary)));
+        }
+
+        public void SetDiagnosticFailure(VisualRiskStrategyKind strategy, string error)
+        {
+            _diagnostics.Remove(strategy);
+            _diagnosticFailures[strategy] = error;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasComparison)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ComparisonFrames)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DiagnosticSummary)));
+        }
+
+        public void MarkStrategyApplied(VisualRiskStrategyKind strategy)
+        {
+            _appliedStrategy = strategy;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(AppliedStrategy)));
+        }
+
+        public void InvalidateComparison()
+        {
+            if (_diagnostics.Count == 0 &&
+                (Status is VisualRiskReviewStatus.Pending or VisualRiskReviewStatus.AcceptedRisk))
+                return;
+            _diagnostics.Clear();
+            _diagnosticFailures.Clear();
+            _activeStrategy = VisualRiskStrategyKind.Current;
+            _appliedStrategy = null;
+            if (Status != VisualRiskReviewStatus.AcceptedRisk) Status = VisualRiskReviewStatus.Pending;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ActiveStrategy)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasComparison)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ComparisonFrames)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DiagnosticSummary)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(AppliedStrategy)));
+        }
+
+        private sealed record DiagnosticSnapshot(
+            IReadOnlyList<VisualRiskComparisonViewItem> Frames,
+            double? StructuralSimilarity);
+    }
+
+    private sealed class VisualRiskComparisonViewItem
+    {
+        public VisualRiskComparisonViewItem(VisualRiskComparisonFilePair pair)
+        {
+            TimestampLabel = $"{pair.TimeSeconds:0.###} 秒";
+            ReferenceImage = LoadBitmap(pair.ReferencePath, 900);
+            CandidateImage = LoadBitmap(pair.CandidatePath, 900);
+        }
+
+        public string TimestampLabel { get; }
+        public BitmapSource? ReferenceImage { get; }
+        public BitmapSource? CandidateImage { get; }
     }
 
     private sealed class DecorationComparisonViewItem
