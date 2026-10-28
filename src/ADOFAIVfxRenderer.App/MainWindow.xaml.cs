@@ -41,6 +41,9 @@ public partial class MainWindow : Window
     private bool _exitWhenQueueFinishes;
     private bool _finalCompositeVerificationMode;
     private bool _suppressRiskInvalidation;
+    private bool _updatingRiskSideStrategies;
+    private bool _riskPairRendering;
+    private int _riskPairGeneration;
     private Exception? _lastQueueError;
 
     public MainWindow()
@@ -180,24 +183,47 @@ public partial class MainWindow : Window
                 {
                     DurationSeconds = riskDuration,
                 };
-                var result = await VisualRiskDiagnosticClient.GenerateAsync(
-                    _installation ?? throw new InvalidOperationException("游戏安装未载入。"),
-                    _chart ?? throw new InvalidOperationException("谱面未载入。"),
-                    risk.Issue,
-                    diagnosticOptions with
-                    {
-                        Profile = smokeProfile == OutputProfile.VideoPro
-                            ? OutputProfile.VideoVfx
-                            : diagnosticOptions.Profile,
-                        DiagnosticLabel = strategy.Kind + "-automation",
-                    },
-                    progress);
                 var resultPath = GetArgumentValue(arguments, "--risk-result");
-                if (!string.IsNullOrWhiteSpace(resultPath))
+                var automatedOptions = diagnosticOptions with
                 {
-                    File.WriteAllText(
-                        Path.GetFullPath(resultPath),
-                        JsonSerializer.Serialize(new
+                    Profile = smokeProfile == OutputProfile.VideoPro
+                        ? OutputProfile.VideoVfx
+                        : diagnosticOptions.Profile,
+                    DiagnosticLabel = strategy.Kind + "-automation",
+                };
+                if (arguments.Any(static argument =>
+                        argument.Equals("--risk-single-frame", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var frameResult = await VisualRiskDiagnosticClient.GenerateCandidateFrameAsync(
+                        _installation ?? throw new InvalidOperationException("游戏安装未载入。"),
+                        _chart ?? throw new InvalidOperationException("谱面未载入。"),
+                        risk.Issue,
+                        automatedOptions,
+                        progress);
+                    if (!string.IsNullOrWhiteSpace(resultPath))
+                        File.WriteAllText(
+                            Path.GetFullPath(resultPath),
+                            JsonSerializer.Serialize(new
+                            {
+                                risk = risk.Issue,
+                                strategy = strategy.Kind.ToString(),
+                                frameResult.TimeSeconds,
+                                frameResult.FramePath,
+                                frameResult.CandidateVideoPath,
+                            }, new JsonSerializerOptions { WriteIndented = true }));
+                }
+                else
+                {
+                    var result = await VisualRiskDiagnosticClient.GenerateAsync(
+                        _installation ?? throw new InvalidOperationException("游戏安装未载入。"),
+                        _chart ?? throw new InvalidOperationException("谱面未载入。"),
+                        risk.Issue,
+                        automatedOptions,
+                        progress);
+                    if (!string.IsNullOrWhiteSpace(resultPath))
+                        File.WriteAllText(
+                            Path.GetFullPath(resultPath),
+                            JsonSerializer.Serialize(new
                         {
                             risk = risk.Issue,
                             strategy = strategy.Kind.ToString(),
@@ -672,21 +698,18 @@ public partial class MainWindow : Window
     private void RefreshRiskReviewSummary()
     {
         if (RiskReviewSummaryText is null || RiskRenderGateText is null || VisualRiskSummaryText is null) return;
-        var pending = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.Pending);
-        var adjustment = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.NeedsAdjustment);
-        var normal = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.ConfirmedNormal);
-        var accepted = _riskReviews.Count(static item => item.Status == VisualRiskReviewStatus.AcceptedRisk);
+        var high = _riskReviews.Count(static item => item.Issue.Severity == VisualRiskSeverity.Error);
+        var warning = _riskReviews.Count(static item => item.Issue.Severity == VisualRiskSeverity.Warning);
+        var information = _riskReviews.Count(static item => item.Issue.Severity == VisualRiskSeverity.Information);
         RiskReviewSummaryText.Text = _riskReviews.Count == 0
             ? "未发现明显风险"
-            : $"待确认 {pending:N0} · 需调整 {adjustment:N0} · 正常 {normal:N0} · 已接受 {accepted:N0}";
+            : $"可能位置 {_riskReviews.Count:N0} · 高风险 {high:N0} · 警告 {warning:N0} · 信息 {information:N0}";
         RiskRenderGateText.Text = _riskReviews.Count == 0
-            ? "自动分析没有发现明显拆层风险；这不替代最终成片抽查。"
-            : pending + adjustment > 0
-                ? $"正式拆层渲染暂不可加入队列：还有 {pending:N0} 项待确认、{adjustment:N0} 项需要调整。"
-                : "所有自动发现的风险均已确认或明确接受；可以加入正式拆层渲染队列。";
+            ? "自动分析没有列出明显位置；这不替代最终成片抽查。"
+            : "风险对比是可选诊断，不会阻止加入渲染队列；只渲染你点开的项目，不要求逐项确认。";
         VisualRiskSummaryText.Text = _riskReviews.Count == 0
             ? "未发现明显拆层风险；仍建议抽查最终成片。"
-            : $"已自动定位 {_riskReviews.Count:N0} 个可能出问题的位置；请到“风险确认”逐项生成闭环对照。";
+            : $"已列出 {_riskReviews.Count:N0} 个可能出问题的位置；可到“风险对比”点开任意一项查看两种最终合成。";
     }
 
     private void RefreshBakedFilterRisks()
@@ -709,8 +732,8 @@ public partial class MainWindow : Window
             var filters = segment.ToArray();
             var names = string.Join("、", filters.Select(static item => item.DisplayName));
             var issue = new VisualRiskIssue(
-                "选择烤入的滤镜需要闭环确认",
-                $"格 {segment.Key} 的 {names} 将从派生谱实时层关闭，并改由视频层承担；必须确认没有改变遮挡与作用对象。",
+                "选择烤入的滤镜可能改变分层结果",
+                $"格 {segment.Key} 的 {names} 将从派生谱实时层关闭，并改由视频层承担；可在此位置对比遮挡与作用对象是否改变。",
                 segment.Key,
                 $"baked-filter-segment:{segment.Key}",
                 VisualRiskKind.SplitFilter,
@@ -718,7 +741,7 @@ public partial class MainWindow : Window
                 VisualRiskAnalyzer.TimeAtFloor(_chart.Path, segment.Key),
                 RequiresContinuousFrames: true,
                 FilterKey: filters[0].Item.Key,
-                SuggestedAction: "生成原版／拆层闭环对照；若不一致，把滤镜改回保留实时或调整相关装饰归属。");
+                SuggestedAction: "点开此位置自动生成左右最终合成；若不一致，把滤镜改回保留实时或调整相关装饰归属。");
             var review = new VisualRiskReviewItem(issue);
             review.PropertyChanged += (_, _) => RefreshRiskReviewSummary();
             _riskReviews.Add(review);
@@ -883,15 +906,205 @@ public partial class MainWindow : Window
             RiskReviewTitleText.Text = "从左侧选择风险项";
             RiskReviewDetailText.Text = "";
             RiskReviewActionText.Text = "";
+            RiskReferenceImage.Source = null;
+            RiskCandidateImage.Source = null;
             return;
         }
         RiskReviewTitleText.Text = selected.Title;
         RiskReviewDetailText.Text = selected.Issue.Detail;
         RiskReviewActionText.Text = "分析线索（未经实测不能当结论）：" + selected.Issue.SuggestedAction;
         var strategies = BuildRiskStrategies(selected);
-        RiskStrategyBox.ItemsSource = strategies;
-        RiskStrategyBox.SelectedItem = strategies.FirstOrDefault(item => item.Kind == selected.ActiveStrategy) ?? strategies[0];
-        ShowActiveRiskDiagnostic(selected);
+        var left = strategies.FirstOrDefault(static item => item.Kind.ToString().StartsWith("Bake", StringComparison.Ordinal))
+                   ?? strategies.FirstOrDefault(static item => item.Kind == VisualRiskStrategyKind.VideoProFallback)
+                   ?? strategies[0];
+        var right = strategies.FirstOrDefault(static item =>
+                        item.Kind.ToString().StartsWith("Retain", StringComparison.Ordinal) ||
+                        item.Kind is VisualRiskStrategyKind.FinalCompositeRealtime or
+                            VisualRiskStrategyKind.KeepCreatedObjectsRealtime or
+                            VisualRiskStrategyKind.PreserveBackgroundVideo)
+                    ?? strategies.FirstOrDefault(static item => item.Kind == VisualRiskStrategyKind.Current)
+                    ?? strategies[0];
+        _updatingRiskSideStrategies = true;
+        try
+        {
+            RiskLeftStrategyBox.ItemsSource = strategies;
+            RiskRightStrategyBox.ItemsSource = strategies;
+            RiskLeftStrategyBox.SelectedItem = left;
+            RiskRightStrategyBox.SelectedItem = right;
+        }
+        finally
+        {
+            _updatingRiskSideStrategies = false;
+        }
+        UpdateRiskPairLabels();
+        RequestRiskPairRender();
+    }
+
+    private void VisualEditorTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_viewReady || RiskReviewTab is null || VisualEditorTabs.SelectedItem != RiskReviewTab) return;
+        RequestRiskPairRender();
+    }
+
+    private void RiskSideStrategy_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_updatingRiskSideStrategies) return;
+        UpdateRiskPairLabels();
+        RequestRiskPairRender();
+    }
+
+    private void UpdateRiskPairLabels()
+    {
+        var left = RiskLeftStrategyBox.SelectedItem as VisualRiskStrategyOption;
+        var right = RiskRightStrategyBox.SelectedItem as VisualRiskStrategyOption;
+        RiskLeftTitleText.Text = left?.Label ?? "左侧方案";
+        RiskRightTitleText.Text = right?.Label ?? "右侧方案";
+        RiskStrategyDescriptionText.Text = left is null || right is null
+            ? ""
+            : $"左：{left.Description}\n右：{right.Description}";
+    }
+
+    private void RequestRiskPairRender()
+    {
+        if (!_viewReady || VisualEditorTabs.SelectedItem != RiskReviewTab) return;
+        _riskPairGeneration++;
+        _ = ProcessRiskPairRequestsAsync();
+    }
+
+    private async Task ProcessRiskPairRequestsAsync()
+    {
+        if (_riskPairRendering) return;
+        _riskPairRendering = true;
+        try
+        {
+            while (true)
+            {
+                var generation = _riskPairGeneration;
+                await RenderCurrentRiskPairAsync(generation);
+                if (generation == _riskPairGeneration) break;
+            }
+        }
+        finally
+        {
+            _riskPairRendering = false;
+        }
+    }
+
+    private async Task RenderCurrentRiskPairAsync(int generation)
+    {
+        if (_installation?.CanRender != true || _chart is null ||
+            RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review ||
+            RiskLeftStrategyBox.SelectedItem is not VisualRiskStrategyOption left ||
+            RiskRightStrategyBox.SelectedItem is not VisualRiskStrategyOption right)
+            return;
+        if (!review.Issue.TimeSeconds.HasValue)
+        {
+            RiskLeftStatusText.Text = "此项目没有可渲染时间点";
+            RiskRightStatusText.Text = "此项目没有可渲染时间点";
+            return;
+        }
+
+        RiskDiagnosticStatusText.Text = "正在按需生成当前项目的两种最终合成；完成一侧就会立即显示。";
+        var leftSucceeded = await RenderRiskSideAsync(review, left, isLeft: true, generation);
+        var rightSucceeded = await RenderRiskSideAsync(review, right, isLeft: false, generation);
+        if (generation == _riskPairGeneration)
+            RiskDiagnosticStatusText.Text = leftSucceeded && rightSucceeded
+                ? "当前左右方案均已生成。切换任一方案会自动生成对应画面；不需要确认整张列表。"
+                : "至少一侧生成失败；失败原因显示在对应画面下方。这不会阻止正式渲染。";
+    }
+
+    private async Task<bool> RenderRiskSideAsync(
+        VisualRiskReviewItem review,
+        VisualRiskStrategyOption strategy,
+        bool isLeft,
+        int generation)
+    {
+        if (review.TryGetCandidateFrame(strategy.Kind, out var cachedImage, out var cachedTime))
+        {
+            ShowRiskSideResult(review, strategy, isLeft, generation, cachedImage, cachedTime);
+            return true;
+        }
+
+        SetRiskSideStatus(isLeft, "正在生成最终合成……");
+        if (isLeft) RiskReferenceImage.Source = null;
+        else RiskCandidateImage.Source = null;
+        try
+        {
+            var options = BuildRiskDiagnosticOptions(strategy);
+            var unsupportedBake = _filterChoices
+                .Where(item => options.BakedFilterKeys.Contains(item.Item.Key) && !item.Item.OfflineSupported)
+                .Select(static item => item.DisplayName)
+                .ToArray();
+            if (unsupportedBake.Length > 0)
+                throw new InvalidOperationException("这些滤镜目前不能烤入：" + string.Join("、", unsupportedBake));
+            var progress = new Progress<string>(message =>
+            {
+                if (generation == _riskPairGeneration && ReferenceEquals(RiskReviewGrid.SelectedItem, review))
+                    SetRiskSideStatus(isLeft, message);
+            });
+            var result = await VisualRiskDiagnosticClient.GenerateCandidateFrameAsync(
+                _installation!,
+                _chart!,
+                review.Issue,
+                options,
+                progress);
+            review.SetCandidateFrame(strategy.Kind, result);
+            ShowRiskSideResult(
+                review,
+                strategy,
+                isLeft,
+                generation,
+                LoadBitmap(result.FramePath, 1100),
+                result.TimeSeconds);
+            RefreshPreRenderCacheStatus();
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            review.SetCandidateFrameFailure(strategy.Kind, exception.Message);
+            if (generation == _riskPairGeneration && ReferenceEquals(RiskReviewGrid.SelectedItem, review))
+                SetRiskSideStatus(isLeft, "生成失败：" + exception.Message);
+            return false;
+        }
+    }
+
+    private void ShowRiskSideResult(
+        VisualRiskReviewItem review,
+        VisualRiskStrategyOption strategy,
+        bool isLeft,
+        int generation,
+        BitmapSource? image,
+        double timeSeconds)
+    {
+        if (generation != _riskPairGeneration || !ReferenceEquals(RiskReviewGrid.SelectedItem, review)) return;
+        var selected = isLeft ? RiskLeftStrategyBox.SelectedItem : RiskRightStrategyBox.SelectedItem;
+        if (selected is not VisualRiskStrategyOption current || current.Kind != strategy.Kind) return;
+        if (isLeft) RiskReferenceImage.Source = image;
+        else RiskCandidateImage.Source = image;
+        SetRiskSideStatus(isLeft, $"最终合成 · {timeSeconds:0.###} 秒");
+    }
+
+    private void SetRiskSideStatus(bool isLeft, string text)
+    {
+        if (isLeft) RiskLeftStatusText.Text = text;
+        else RiskRightStatusText.Text = text;
+    }
+
+    private void ApplyLeftRiskStrategy_Click(object sender, RoutedEventArgs e) =>
+        ApplyRiskSideStrategy(RiskLeftStrategyBox.SelectedItem as VisualRiskStrategyOption);
+
+    private void ApplyRightRiskStrategy_Click(object sender, RoutedEventArgs e) =>
+        ApplyRiskSideStrategy(RiskRightStrategyBox.SelectedItem as VisualRiskStrategyOption);
+
+    private void ApplyRiskSideStrategy(VisualRiskStrategyOption? strategy)
+    {
+        if (strategy is null || RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review) return;
+        RiskStrategyBox.ItemsSource = BuildRiskStrategies(review);
+        RiskStrategyBox.SelectedItem = RiskStrategyBox.Items
+            .OfType<VisualRiskStrategyOption>()
+            .First(item => item.Kind == strategy.Kind);
+        ApplyRiskStrategy_Click(this, new RoutedEventArgs());
+        RequestRiskPairRender();
     }
 
     private async void GenerateRiskComparison_Click(object sender, RoutedEventArgs e)
@@ -1053,16 +1266,6 @@ public partial class MainWindow : Window
         if (RiskReviewGrid.SelectedItem is not VisualRiskReviewItem review ||
             RiskStrategyBox.SelectedItem is not VisualRiskStrategyOption strategy)
             return;
-        if (review.Issue.RequiresComparison &&
-            strategy.Kind != VisualRiskStrategyKind.VideoProFallback &&
-            !review.HasComparison)
-        {
-            DarkDialog.Show(
-                this,
-                "这个候选还没有在当前风险的实际时间点完成原版／拆层闭环对照，不能把猜测当作解决方案。请先生成对照，或点击“实测全部候选”。",
-                "候选尚未实测");
-            return;
-        }
         _suppressRiskInvalidation = true;
         try
         {
@@ -1167,12 +1370,11 @@ public partial class MainWindow : Window
         {
             _suppressRiskInvalidation = false;
         }
-        review.Status = VisualRiskReviewStatus.Pending;
         RefreshFilterOwnershipSummary();
         RefreshBakedFilterRisks();
         RefreshRetentionSummary();
         review.MarkStrategyApplied(strategy.Kind);
-        RiskDiagnosticStatusText.Text = "已应用经选择的候选：“" + strategy.Label + "”。请检查它在此风险位置生成的对应对照，再确认正常。";
+        RiskDiagnosticStatusText.Text = "已应用方案：“" + strategy.Label + "”。风险列表只是诊断导航，不要求逐项确认。";
     }
 
     private IReadOnlyList<VisualRiskStrategyOption> BuildRiskStrategies(VisualRiskReviewItem review)
@@ -1870,25 +2072,6 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("输出版本、分辨率和 FPS 都至少选择一个。");
             }
 
-            if (!_exitWhenQueueFinishes)
-            {
-                var hasSplitProfile = profiles.Any(static profile => profile != OutputProfile.VideoPro);
-                var blockingRisks = _riskReviews.Where(item =>
-                        (item.Status is VisualRiskReviewStatus.Pending or VisualRiskReviewStatus.NeedsAdjustment) &&
-                        item.Issue.Severity != VisualRiskSeverity.Information &&
-                        (hasSplitProfile || item.Issue.AffectsVideoPro))
-                    .ToArray();
-                if (blockingRisks.Length > 0)
-                {
-                    MainTabs.SelectedIndex = 1;
-                    VisualEditorTabs.SelectedItem = RiskReviewTab;
-                    RiskReviewGrid.SelectedItem = blockingRisks[0];
-                    throw new InvalidOperationException(
-                        $"还有 {blockingRisks.Length:N0} 个相关风险尚未确认或仍需调整。" +
-                        "程序已经切到“风险确认”；请生成原版／拆层闭环对照后确认，或明确接受已知风险。");
-                }
-            }
-
             if (!TryParseNonNegativeDecimal(TailSecondsBox.Text, out var tailSeconds))
             {
                 throw new InvalidOperationException("结束延长秒数无效。");
@@ -2389,6 +2572,8 @@ public partial class MainWindow : Window
         private VisualRiskReviewStatus _status = VisualRiskReviewStatus.Pending;
         private readonly Dictionary<VisualRiskStrategyKind, DiagnosticSnapshot> _diagnostics = [];
         private readonly Dictionary<VisualRiskStrategyKind, string> _diagnosticFailures = [];
+        private readonly Dictionary<VisualRiskStrategyKind, CandidateFrameSnapshot> _candidateFrames = [];
+        private readonly Dictionary<VisualRiskStrategyKind, string> _candidateFrameFailures = [];
         private VisualRiskStrategyKind _activeStrategy = VisualRiskStrategyKind.Current;
         private VisualRiskStrategyKind? _appliedStrategy;
 
@@ -2398,6 +2583,12 @@ public partial class MainWindow : Window
         public string Title => Issue.Title;
         public string FloorText => Issue.FirstFloor?.ToString(CultureInfo.InvariantCulture) ?? "—";
         public string TimeText => Issue.TimeSeconds.HasValue ? $"{Issue.TimeSeconds.Value:0.###}s" : "—";
+        public string SeverityText => Issue.Severity switch
+        {
+            VisualRiskSeverity.Error => "高风险",
+            VisualRiskSeverity.Warning => "可能",
+            _ => "信息",
+        };
         public VisualRiskStrategyKind ActiveStrategy => _activeStrategy;
         public VisualRiskStrategyKind? AppliedStrategy => _appliedStrategy;
         public bool HasComparison => _diagnostics.ContainsKey(_activeStrategy);
@@ -2472,13 +2663,45 @@ public partial class MainWindow : Window
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(AppliedStrategy)));
         }
 
+        public bool TryGetCandidateFrame(
+            VisualRiskStrategyKind strategy,
+            out BitmapSource? image,
+            out double timeSeconds)
+        {
+            if (_candidateFrames.TryGetValue(strategy, out var snapshot))
+            {
+                image = snapshot.Image;
+                timeSeconds = snapshot.TimeSeconds;
+                return true;
+            }
+            image = null;
+            timeSeconds = 0d;
+            return false;
+        }
+
+        public void SetCandidateFrame(VisualRiskStrategyKind strategy, VisualRiskCandidateFrameResult result)
+        {
+            _candidateFrameFailures.Remove(strategy);
+            _candidateFrames[strategy] = new CandidateFrameSnapshot(
+                result.TimeSeconds,
+                LoadBitmap(result.FramePath, 1100));
+        }
+
+        public void SetCandidateFrameFailure(VisualRiskStrategyKind strategy, string error)
+        {
+            _candidateFrames.Remove(strategy);
+            _candidateFrameFailures[strategy] = error;
+        }
+
         public void InvalidateComparison()
         {
-            if (_diagnostics.Count == 0 &&
+            if (_diagnostics.Count == 0 && _candidateFrames.Count == 0 &&
                 (Status is VisualRiskReviewStatus.Pending or VisualRiskReviewStatus.AcceptedRisk))
                 return;
             _diagnostics.Clear();
             _diagnosticFailures.Clear();
+            _candidateFrames.Clear();
+            _candidateFrameFailures.Clear();
             _activeStrategy = VisualRiskStrategyKind.Current;
             _appliedStrategy = null;
             if (Status != VisualRiskReviewStatus.AcceptedRisk) Status = VisualRiskReviewStatus.Pending;
@@ -2492,6 +2715,8 @@ public partial class MainWindow : Window
         private sealed record DiagnosticSnapshot(
             IReadOnlyList<VisualRiskComparisonViewItem> Frames,
             double? StructuralSimilarity);
+
+        private sealed record CandidateFrameSnapshot(double TimeSeconds, BitmapSource? Image);
     }
 
     private sealed class VisualRiskComparisonViewItem

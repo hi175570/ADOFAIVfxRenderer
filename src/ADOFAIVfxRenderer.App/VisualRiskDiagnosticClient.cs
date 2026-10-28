@@ -28,12 +28,147 @@ internal sealed record VisualRiskDiagnosticResult(
     string CandidateVideoPath,
     double? StructuralSimilarity);
 
+internal sealed record VisualRiskCandidateFrameResult(
+    double TimeSeconds,
+    string FramePath,
+    string CandidateVideoPath);
+
 internal static partial class VisualRiskDiagnosticClient
 {
     private const int Width = 640;
     private const int Height = 360;
     private const int FramesPerSecond = 30;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    public static async Task<VisualRiskCandidateFrameResult> GenerateCandidateFrameAsync(
+        GameInstallation installation,
+        ChartMetadata chart,
+        VisualRiskIssue issue,
+        VisualRiskDiagnosticOptions options,
+        IProgress<string>? progress = null)
+    {
+        if (!installation.CanRender || installation.RootDirectory is null || installation.DataDirectory is null)
+            throw new InvalidOperationException("请先选择并验证游戏安装目录。");
+        if (!issue.TimeSeconds.HasValue)
+            throw new InvalidOperationException("这个位置没有可渲染的谱面时间点。");
+        if (Process.GetProcessesByName("ADOFAI VFX Worker").Length > 0)
+            throw new InvalidOperationException("已有渲染任务正在运行，请完成或取消后再生成风险对照。");
+
+        var baseWorker = RenderWorkerClient.FindStandaloneWorker()
+                         ?? throw new FileNotFoundException("找不到独立 Unity Worker。");
+        RenderWorkerClient.ValidateStandaloneWorker(baseWorker, installation.RootDirectory);
+        var installedWorker = RenderWorkerClient.EnsureGameResourceWorker(
+            baseWorker,
+            installation.DataDirectory,
+            placeholderMaximumSide: 0);
+
+        var chartDirectory = Path.GetDirectoryName(chart.Path)!;
+        var safeKey = InvalidFileName().Replace(issue.Key + "-" + options.DiagnosticLabel, "-").Trim('-');
+        if (safeKey.Length == 0) safeKey = "visual-risk";
+        if (safeKey.Length > 80) safeKey = safeKey[..80];
+        var diagnosticRoot = Path.Combine(
+            chartDirectory,
+            "ADOFAIVfxRenderer Diagnostics",
+            $"{DateTime.Now:yyyyMMdd-HHmmss-fff}-risk-frame-{safeKey}");
+        Directory.CreateDirectory(diagnosticRoot);
+        PreRenderCacheRegistry.Register(diagnosticRoot);
+
+        var firstPlayableFloorSeconds = (double)DerivedChartExporter.CalculateRecommendedRenderStartSeconds(chart.Path);
+        var sampleTime = issue.TimeSeconds.Value + (issue.RequiresContinuousFrames ? 3d : 0.001d);
+        var startTime = issue.Kind == VisualRiskKind.HistoryFeedback
+            ? Math.Max(0d, firstPlayableFloorSeconds)
+            : Math.Max(0d, issue.TimeSeconds.Value - (issue.RequiresContinuousFrames ? 3d : 0.25d));
+        if (options.PreRollSeconds.HasValue)
+            startTime = Math.Max(0d, issue.TimeSeconds.Value - options.PreRollSeconds.Value);
+        var durationSeconds = Math.Max(1d, sampleTime - startTime + 0.25d);
+        var backgroundDirectory = Path.Combine(diagnosticRoot, "candidate-background");
+        var candidateDirectory = Path.Combine(diagnosticRoot, "candidate-final");
+        var framePath = Path.Combine(candidateDirectory, "candidate-frame.jpg");
+        var temporaryDerivedChart = Path.Combine(
+            chartDirectory,
+            $".ADOFAIVfxRenderer-risk-{Guid.NewGuid():N}.adofai");
+
+        try
+        {
+            WorkerRunResult candidate;
+            if (options.DiagnosticLabel.Equals("VideoProFallback", StringComparison.Ordinal))
+            {
+                progress?.Report("正在用原版完整合成生成这一帧……");
+                candidate = await RunWorkerAsync(
+                    installedWorker,
+                    installation,
+                    chart.Path,
+                    candidateDirectory,
+                    startTime,
+                    durationSeconds,
+                    installedRuntime: true,
+                    profile: OutputProfile.VideoPro,
+                    content: OutputProfiles.Get(OutputProfile.VideoPro).VideoContent,
+                    retainedDecorationIndices: new HashSet<int>(),
+                    excludedDecorationIndices: new HashSet<int>(),
+                    bakedFilterKeys: new HashSet<string>(StringComparer.Ordinal));
+            }
+            else
+            {
+                progress?.Report($"正在渲染 {OutputProfiles.Get(options.Profile).DisplayName} 视频层……");
+                var content = OutputProfiles.Get(options.Profile).VideoContent;
+                var background = await RunWorkerAsync(
+                    installedWorker,
+                    installation,
+                    chart.Path,
+                    backgroundDirectory,
+                    startTime,
+                    durationSeconds,
+                    installedRuntime: false,
+                    profile: options.Profile,
+                    content: content,
+                    retainedDecorationIndices: options.RetainedDecorationIndices,
+                    excludedDecorationIndices: options.ExcludedDecorationIndices,
+                    bakedFilterKeys: options.BakedFilterKeys,
+                    diagnoseRenderFrame: Math.Max(
+                        0,
+                        (int)Math.Round((sampleTime - startTime) * FramesPerSecond, MidpointRounding.AwayFromZero)));
+
+                var retained = new HashSet<int>(options.RetainedDecorationIndices);
+                retained.UnionWith(background.UnbakedDecorationIndices);
+                var renderStartAfterFirstPlayableFloor =
+                    (decimal)startTime - (decimal)firstPlayableFloorSeconds;
+                DerivedChartExporter.Export(
+                    chart.Path,
+                    background.VideoPath,
+                    options.Profile,
+                    renderStartAfterFirstPlayableFloor,
+                    retained,
+                    options.ExcludedDecorationIndices,
+                    options.DisabledFilterKeys,
+                    temporaryDerivedChart);
+
+                progress?.Report("正在用原版运行时合成视频、轨道和保留层……");
+                candidate = await RunWorkerAsync(
+                    installedWorker,
+                    installation,
+                    temporaryDerivedChart,
+                    candidateDirectory,
+                    startTime,
+                    durationSeconds,
+                    installedRuntime: true,
+                    profile: OutputProfile.VideoPro,
+                    content: OutputProfiles.Get(OutputProfile.VideoPro).VideoContent,
+                    retainedDecorationIndices: new HashSet<int>(),
+                    excludedDecorationIndices: new HashSet<int>(),
+                    bakedFilterKeys: new HashSet<string>(StringComparer.Ordinal));
+            }
+
+            progress?.Report("正在提取最终合成画面……");
+            var ffmpeg = Path.Combine(installation.RootDirectory, "ffmpeg", "ffmpeg.exe");
+            await ExtractSingleFrameAsync(ffmpeg, candidate.VideoPath, framePath, sampleTime - startTime);
+            return new VisualRiskCandidateFrameResult(sampleTime, framePath, candidate.VideoPath);
+        }
+        finally
+        {
+            if (File.Exists(temporaryDerivedChart)) File.Delete(temporaryDerivedChart);
+        }
+    }
 
     public static async Task<VisualRiskDiagnosticResult> GenerateAsync(
         GameInstallation installation,
@@ -319,6 +454,35 @@ internal static partial class VisualRiskDiagnosticClient
                             ?? throw new InvalidOperationException("无法启动 FFmpeg 来提取风险对照图。");
         await process.WaitForExitAsync();
         if (process.ExitCode != 0)
+            throw new InvalidOperationException($"FFmpeg 提取风险对照图失败，退出代码 {process.ExitCode}。");
+    }
+
+    private static async Task ExtractSingleFrameAsync(
+        string ffmpeg,
+        string videoPath,
+        string outputPath,
+        double offsetSeconds)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = ffmpeg,
+            WorkingDirectory = Path.GetDirectoryName(outputPath),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+        };
+        foreach (var argument in new[]
+                 {
+                     "-hide_banner", "-loglevel", "error", "-y",
+                     "-ss", Math.Max(0d, offsetSeconds).ToString("0.#########", CultureInfo.InvariantCulture),
+                     "-i", videoPath,
+                     "-frames:v", "1", "-c:v", "mjpeg", outputPath,
+                 })
+            startInfo.ArgumentList.Add(argument);
+        using var process = Process.Start(startInfo)
+                            ?? throw new InvalidOperationException("无法启动 FFmpeg 来提取风险对照图。");
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0 || !File.Exists(outputPath))
             throw new InvalidOperationException($"FFmpeg 提取风险对照图失败，退出代码 {process.ExitCode}。");
     }
 
