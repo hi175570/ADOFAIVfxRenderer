@@ -484,7 +484,13 @@ internal sealed class RenderWorkerClient : IDisposable
         Directory.CreateDirectory(cacheRoot);
         var preparedDirectory = Path.Combine(cacheRoot, cacheKey);
         var preparedExecutable = Path.Combine(preparedDirectory, Path.GetFileName(workerExecutable));
-        if (File.Exists(preparedExecutable)) return preparedExecutable;
+        WorkerCacheRetention.Prune(cacheRoot, cacheKey);
+        if (File.Exists(preparedExecutable))
+        {
+            WorkerCacheRetention.Touch(preparedDirectory);
+            WorkerCacheRetention.Prune(cacheRoot, cacheKey);
+            return preparedExecutable;
+        }
 
         var temporaryDirectory = Path.Combine(cacheRoot, cacheKey + ".tmp-" + Guid.NewGuid().ToString("N"));
         try
@@ -541,6 +547,8 @@ internal sealed class RenderWorkerClient : IDisposable
             {
                 TryDeleteDirectory(temporaryDirectory);
             }
+            WorkerCacheRetention.Touch(preparedDirectory);
+            WorkerCacheRetention.Prune(cacheRoot, cacheKey);
             return preparedExecutable;
         }
         catch

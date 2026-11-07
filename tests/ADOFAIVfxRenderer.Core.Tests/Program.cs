@@ -41,6 +41,7 @@ var tests = new (string Name, Action Run)[]
     ("Canonical render output layout", CanonicalRenderOutputLayout),
     ("Derived chart replaces canonical profile output", DerivedChartReplacesCanonicalOutput),
     ("Derived chart supports isolated diagnostic output", DerivedChartSupportsDiagnosticOutput),
+    ("Worker cache prunes old entries and stale temporary directories", WorkerCachePrunesOldEntries),
 };
 
 var failures = new List<string>();
@@ -66,6 +67,51 @@ if (failures.Count > 0)
 }
 
 return;
+
+static void WorkerCachePrunesOldEntries()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"adofai-vfx-worker-cache-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var keys = Enumerable.Range(1, 6).Select(value => value.ToString("X20")).ToArray();
+        for (var index = 0; index < keys.Length; index++)
+        {
+            var directory = Path.Combine(root, keys[index]);
+            Directory.CreateDirectory(directory);
+            File.WriteAllBytes(Path.Combine(directory, "payload.bin"), new byte[10]);
+            Directory.SetLastWriteTimeUtc(directory, DateTime.UtcNow.AddDays(index - 10));
+        }
+        var staleTemporary = Path.Combine(root, keys[0] + ".tmp-ABCDEF");
+        var recentTemporary = Path.Combine(root, keys[1] + ".tmp-ABCDEF");
+        Directory.CreateDirectory(staleTemporary);
+        Directory.CreateDirectory(recentTemporary);
+        Directory.SetLastWriteTimeUtc(staleTemporary, DateTime.UtcNow.AddDays(-2));
+        Directory.SetLastWriteTimeUtc(recentTemporary, DateTime.UtcNow);
+
+        var result = WorkerCacheRetention.Prune(
+            root,
+            preserveKey: keys[0],
+            maximumEntries: 3,
+            maximumLogicalBytes: 30,
+            temporaryMaximumAge: TimeSpan.FromDays(1));
+
+        Equal(6, result.EntriesBefore);
+        Equal(3, result.EntriesAfter);
+        Equal(3, result.DeletedEntries);
+        Equal(1, result.DeletedTemporaryDirectories);
+        True(Directory.Exists(Path.Combine(root, keys[0])));
+        True(Directory.Exists(Path.Combine(root, keys[4])));
+        True(Directory.Exists(Path.Combine(root, keys[5])));
+        False(Directory.Exists(Path.Combine(root, keys[1])));
+        False(Directory.Exists(staleTemporary));
+        True(Directory.Exists(recentTemporary));
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
 
 static void ResolutionPresets()
 {
@@ -223,6 +269,14 @@ static void CurrentLocalGameProbe()
     }
 
     var installation = GameInstallationProbe.Inspect(path);
+    if (installation.Status == GameInstallationStatus.CompatibleButUnverified)
+    {
+        Console.WriteLine("      SKIP: current local installation has compatible capabilities but unregistered binary hashes.");
+        False(installation.CanRender);
+        True(installation.Capabilities.HasRequiredRuntime);
+        Equal(276, installation.Capabilities.CameraFilterComponentCount);
+        return;
+    }
     Equal(GameInstallationStatus.Supported, installation.Status);
     True(installation.CanRender);
     Equal(19, installation.Adapter?.MaximumChartVersion);
